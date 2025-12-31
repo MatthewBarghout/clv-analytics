@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "CLV Analytics DB",
+      "Group": "Local Development",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "clv_analytics",
+      "Username": "clv_user",
+      "SSLMode": "prefer",
+      "PassFile": "/tmp/pgpassfile"
+    }
+  }
+}
