@@ -1,7 +1,7 @@
 """FastAPI backend for CLV analytics dashboard."""
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from dotenv import load_dotenv
@@ -15,8 +15,10 @@ from src.api.schemas import (
     BookmakerStats,
     CLVHistoryPoint,
     CLVStats,
+    ClosingLineResponse,
     GameWithCLV,
     HealthResponse,
+    OddsSnapshotResponse,
 )
 from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Team
 
@@ -160,6 +162,7 @@ async def get_clv_stats():
 async def get_games(limit: int = 50):
     """Get list of games with CLV data."""
     db = get_db()
+    calc = CLVCalculator()
 
     try:
         # Get games with snapshot and closing line counts
@@ -188,6 +191,42 @@ async def get_games(limit: int = 50):
             # Get away team name
             away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
 
+            # Calculate CLV for this game
+            avg_game_clv = None
+            if closing_lines_count > 0:
+                # Get all snapshots with closing lines for this game
+                clv_stmt = (
+                    select(OddsSnapshot, ClosingLine)
+                    .join(
+                        ClosingLine,
+                        (ClosingLine.game_id == OddsSnapshot.game_id)
+                        & (ClosingLine.bookmaker_id == OddsSnapshot.bookmaker_id)
+                        & (ClosingLine.market_type == OddsSnapshot.market_type),
+                    )
+                    .where(OddsSnapshot.game_id == game.id)
+                )
+
+                clv_results = db.execute(clv_stmt).all()
+                game_clv_values = []
+
+                for snapshot, closing_line in clv_results:
+                    for outcome in snapshot.outcomes:
+                        team_name = outcome.get("name")
+                        entry_odds = calc._extract_odds_for_team(snapshot.outcomes, team_name)
+                        closing_odds = calc._extract_odds_for_team(
+                            closing_line.outcomes, team_name
+                        )
+
+                        if entry_odds and closing_odds:
+                            clv = calc.calculate_clv(entry_odds, closing_odds)
+                            game_clv_values.append(clv)
+
+                avg_game_clv = (
+                    sum(game_clv_values) / len(game_clv_values)
+                    if game_clv_values
+                    else None
+                )
+
             games_with_clv.append(
                 GameWithCLV(
                     game_id=game.id,
@@ -197,7 +236,7 @@ async def get_games(limit: int = 50):
                     completed=game.completed,
                     snapshots_count=snapshots_count,
                     closing_lines_count=closing_lines_count,
-                    avg_clv=None,  # TODO: Calculate actual CLV
+                    avg_clv=avg_game_clv,
                 )
             )
 
@@ -211,13 +250,27 @@ async def get_games(limit: int = 50):
 
 
 @app.get("/api/clv-history", response_model=List[CLVHistoryPoint])
-async def get_clv_history(days: int = 30):
-    """Get CLV trend over time."""
+async def get_clv_history(time_range: str = "30d"):
+    """Get CLV trend over time.
+
+    Args:
+        time_range: Time range filter - "7d", "30d", "90d", or "all"
+    """
     db = get_db()
     calc = CLVCalculator()
 
     try:
-        # Get snapshots with closing lines, grouped by date
+        # Map time_range to days
+        range_map = {
+            "7d": 7,
+            "30d": 30,
+            "90d": 90,
+            "all": None,
+        }
+
+        days_limit = range_map.get(time_range, 30)
+
+        # Build base query
         stmt = (
             select(
                 func.date(OddsSnapshot.timestamp).label("date"),
@@ -230,9 +283,14 @@ async def get_clv_history(days: int = 30):
                 & (ClosingLine.bookmaker_id == OddsSnapshot.bookmaker_id)
                 & (ClosingLine.market_type == OddsSnapshot.market_type),
             )
-            .order_by(func.date(OddsSnapshot.timestamp).desc())
-            .limit(1000)
         )
+
+        # Add date filter if not "all"
+        if days_limit:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_limit)
+            stmt = stmt.where(OddsSnapshot.timestamp >= cutoff_date)
+
+        stmt = stmt.order_by(func.date(OddsSnapshot.timestamp).desc()).limit(1000)
 
         results = db.execute(stmt).all()
 
@@ -257,7 +315,7 @@ async def get_clv_history(days: int = 30):
 
         # Create history points
         history = []
-        for date_str in sorted(by_date.keys(), reverse=True)[:days]:
+        for date_str in sorted(by_date.keys()):
             clv_values = by_date[date_str]
             history.append(
                 CLVHistoryPoint(
@@ -335,6 +393,78 @@ async def get_bookmaker_stats():
 
     except Exception as e:
         logger.error(f"Error fetching bookmaker stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/games/{game_id}/snapshots", response_model=List[OddsSnapshotResponse])
+async def get_game_snapshots(game_id: int):
+    """Get all odds snapshots for a specific game."""
+    db = get_db()
+
+    try:
+        # Get all snapshots for this game with bookmaker info
+        stmt = (
+            select(OddsSnapshot, Bookmaker)
+            .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
+            .where(OddsSnapshot.game_id == game_id)
+            .order_by(OddsSnapshot.timestamp.asc())
+        )
+
+        results = db.execute(stmt).all()
+
+        snapshots = []
+        for snapshot, bookmaker in results:
+            snapshots.append(
+                OddsSnapshotResponse(
+                    id=snapshot.id,
+                    timestamp=snapshot.timestamp,
+                    bookmaker_name=bookmaker.name,
+                    market_type=snapshot.market_type,
+                    outcomes=snapshot.outcomes,
+                )
+            )
+
+        return snapshots
+
+    except Exception as e:
+        logger.error(f"Error fetching game snapshots: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/games/{game_id}/closing-lines", response_model=List[ClosingLineResponse])
+async def get_game_closing_lines(game_id: int):
+    """Get all closing lines for a specific game."""
+    db = get_db()
+
+    try:
+        # Get all closing lines for this game with bookmaker info
+        stmt = (
+            select(ClosingLine, Bookmaker)
+            .join(Bookmaker, Bookmaker.id == ClosingLine.bookmaker_id)
+            .where(ClosingLine.game_id == game_id)
+        )
+
+        results = db.execute(stmt).all()
+
+        closing_lines = []
+        for closing_line, bookmaker in results:
+            closing_lines.append(
+                ClosingLineResponse(
+                    id=closing_line.id,
+                    bookmaker_name=bookmaker.name,
+                    market_type=closing_line.market_type,
+                    outcomes=closing_line.outcomes,
+                )
+            )
+
+        return closing_lines
+
+    except Exception as e:
+        logger.error(f"Error fetching closing lines: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

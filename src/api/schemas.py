@@ -62,3 +62,26 @@ class CLVHistoryPoint(BaseModel):
     date: str
     avg_clv: Optional[float]
     count: int
+
+
+class OddsSnapshotResponse(BaseModel):
+    """Odds snapshot response."""
+
+    id: int
+    timestamp: datetime
+    bookmaker_name: str
+    market_type: str
+    outcomes: list
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ClosingLineResponse(BaseModel):
+    """Closing line response."""
+
+    id: int
+    bookmaker_name: str
+    market_type: str
+    outcomes: list
+
+    model_config = ConfigDict(from_attributes=True)
