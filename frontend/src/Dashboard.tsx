@@ -16,6 +16,7 @@ import { GlassCard } from './components/GlassCard';
 import { AnimatedCounter } from './components/AnimatedCounter';
 import { TimeRangeSelector } from './components/TimeRangeSelector';
 import { GameDetailsModal } from './components/GameDetailsModal';
+import { GameAnalysis } from './components/GameAnalysis';
 
 interface CLVStats {
   mean_clv: number | null;
@@ -62,10 +63,19 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
+  const [gamesView, setGamesView] = useState<'recent' | 'history'>('recent');
+  const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
+  const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
 
   useEffect(() => {
     fetchData();
   }, [timeRange]);
+
+  useEffect(() => {
+    if (gamesView === 'history') {
+      fetchHistoryGames();
+    }
+  }, [gamesView]);
 
   const fetchData = async () => {
     try {
@@ -97,6 +107,21 @@ export default function Dashboard() {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchHistoryGames = async () => {
+    try {
+      // Fetch more games for history view (limit 100)
+      const res = await fetch(`${API_BASE}/games?limit=100`);
+      if (res.ok) {
+        const data = await res.json();
+        // Filter only completed games with CLV data
+        const completedWithCLV = data.filter((g: GameWithCLV) => g.completed && g.avg_clv !== null);
+        setHistoryGames(completedWithCLV);
+      }
+    } catch (err) {
+      console.error('Error fetching history:', err);
     }
   };
 
@@ -394,14 +419,38 @@ export default function Dashboard() {
           </div>
         </GlassCard>
 
-        {/* Enhanced Recent Games Table */}
+        {/* Games Table with History */}
         <GlassCard>
-          <div className="flex items-center justify-between mb-6">
-            <h2 className="text-2xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-              Recent Games
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
+            <h2 className="text-2xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent mb-4 md:mb-0">
+              Games
             </h2>
-            <div className="text-sm text-gray-400">
-              💡 Click any game to view detailed betting lines
+            <div className="flex items-center gap-4">
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setGamesView('recent')}
+                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                    gamesView === 'recent'
+                      ? 'bg-white/20 text-white border border-white/30'
+                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  Recent
+                </button>
+                <button
+                  onClick={() => setGamesView('history')}
+                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                    gamesView === 'history'
+                      ? 'bg-white/20 text-white border border-white/30'
+                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  History ({historyGames.length})
+                </button>
+              </div>
+              <div className="text-sm text-gray-400">
+                💡 Click any game to view detailed betting lines
+              </div>
             </div>
           </div>
           <div className="overflow-x-auto">
@@ -429,14 +478,20 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {games.map((game, index) => (
-                  <tr
-                    key={game.game_id}
-                    onClick={() => handleGameClick(game)}
-                    className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200 cursor-pointer"
-                    style={{ animationDelay: `${index * 30}ms` }}
-                    title="Click to view detailed betting lines"
-                  >
+                {(gamesView === 'recent' ? games : historyGames).map((game, index) => (
+                  <React.Fragment key={game.game_id}>
+                    <tr
+                      onClick={() => {
+                        if (gamesView === 'history') {
+                          setExpandedGameId(expandedGameId === game.game_id ? null : game.game_id);
+                        } else {
+                          handleGameClick(game);
+                        }
+                      }}
+                      className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200 cursor-pointer"
+                      style={{ animationDelay: `${index * 30}ms` }}
+                      title={gamesView === 'history' ? 'Click to view analysis' : 'Click to view detailed betting lines'}
+                    >
                     <td className="py-4 px-4">
                       <span className="font-medium text-white">
                         {game.away_team} @ {game.home_team}
@@ -486,9 +541,23 @@ export default function Dashboard() {
                       </span>
                     </td>
                   </tr>
+                  {gamesView === 'history' && expandedGameId === game.game_id && (
+                    <tr className="bg-gray-800/50">
+                      <td colSpan={6} className="p-6">
+                        <GameAnalysis gameId={game.game_id} />
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
                 ))}
               </tbody>
             </table>
+            {gamesView === 'history' && historyGames.length === 0 && (
+              <div className="text-center py-12 text-gray-400">
+                <p className="text-lg mb-2">No completed games with CLV data yet</p>
+                <p className="text-sm">Games will appear here once they're completed and have closing line data</p>
+              </div>
+            )}
           </div>
         </GlassCard>
 

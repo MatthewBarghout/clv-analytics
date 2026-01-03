@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.analyzers.clv_calculator import CLVCalculator
+from src.collectors.odds_api_client import OddsAPIClient
 from src.api.schemas import (
     BookmakerStats,
     CLVHistoryPoint,
@@ -20,7 +21,7 @@ from src.api.schemas import (
     HealthResponse,
     OddsSnapshotResponse,
 )
-from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Team
+from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Sport, Team
 
 # Load environment variables
 load_dotenv()
@@ -227,13 +228,17 @@ async def get_games(limit: int = 50):
                     else None
                 )
 
+            # Determine if game is completed based on commence time
+            now = datetime.now(timezone.utc)
+            is_completed = game.commence_time < now
+
             games_with_clv.append(
                 GameWithCLV(
                     game_id=game.id,
                     home_team=home_team_name,
                     away_team=away_team.name if away_team else "Unknown",
                     commence_time=game.commence_time,
-                    completed=game.completed,
+                    completed=is_completed,
                     snapshots_count=snapshots_count,
                     closing_lines_count=closing_lines_count,
                     avg_clv=avg_game_clv,
@@ -465,6 +470,218 @@ async def get_game_closing_lines(game_id: int):
 
     except Exception as e:
         logger.error(f"Error fetching closing lines: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/games/{game_id}/analysis")
+async def get_game_analysis(game_id: int):
+    """Get detailed CLV analysis for a completed game."""
+    db = get_db()
+    calc = CLVCalculator()
+
+    try:
+        # Get all snapshots with closing lines for this game
+        stmt = (
+            select(OddsSnapshot, ClosingLine, Bookmaker.name)
+            .join(
+                ClosingLine,
+                (ClosingLine.game_id == OddsSnapshot.game_id)
+                & (ClosingLine.bookmaker_id == OddsSnapshot.bookmaker_id)
+                & (ClosingLine.market_type == OddsSnapshot.market_type),
+            )
+            .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
+            .where(OddsSnapshot.game_id == game_id)
+        )
+
+        results = db.execute(stmt).all()
+
+        if not results:
+            return {
+                "game_id": game_id,
+                "total_opportunities": 0,
+                "by_market": {},
+                "by_bookmaker": {},
+                "best_opportunities": [],
+            }
+
+        # Calculate CLV for each snapshot/outcome combination
+        opportunities = []
+        by_market = {}
+        by_bookmaker = {}
+
+        for snapshot, closing_line, bookmaker_name in results:
+            market_type = snapshot.market_type
+
+            for outcome in snapshot.outcomes:
+                team_name = outcome.get("name")
+                entry_odds = calc._extract_odds_for_team(snapshot.outcomes, team_name)
+                closing_odds = calc._extract_odds_for_team(
+                    closing_line.outcomes, team_name
+                )
+
+                if entry_odds and closing_odds:
+                    clv = calc.calculate_clv(entry_odds, closing_odds)
+
+                    # Store opportunity
+                    opportunities.append(
+                        {
+                            "bookmaker": bookmaker_name,
+                            "market_type": market_type,
+                            "outcome": team_name,
+                            "entry_odds": entry_odds,
+                            "closing_odds": closing_odds,
+                            "clv": clv,
+                            "timestamp": snapshot.timestamp.isoformat(),
+                        }
+                    )
+
+                    # Aggregate by market type
+                    if market_type not in by_market:
+                        by_market[market_type] = {"clv_values": [], "count": 0}
+                    by_market[market_type]["clv_values"].append(clv)
+                    by_market[market_type]["count"] += 1
+
+                    # Aggregate by bookmaker
+                    if bookmaker_name not in by_bookmaker:
+                        by_bookmaker[bookmaker_name] = {"clv_values": [], "count": 0}
+                    by_bookmaker[bookmaker_name]["clv_values"].append(clv)
+                    by_bookmaker[bookmaker_name]["count"] += 1
+
+        # Calculate averages
+        for market in by_market.values():
+            market["avg_clv"] = sum(market["clv_values"]) / len(market["clv_values"])
+            del market["clv_values"]
+
+        for bookmaker in by_bookmaker.values():
+            bookmaker["avg_clv"] = sum(bookmaker["clv_values"]) / len(
+                bookmaker["clv_values"]
+            )
+            del bookmaker["clv_values"]
+
+        # Get top 5 best opportunities (highest CLV)
+        best_opportunities = sorted(opportunities, key=lambda x: x["clv"], reverse=True)[
+            :5
+        ]
+
+        return {
+            "game_id": game_id,
+            "total_opportunities": len(opportunities),
+            "avg_clv": sum(o["clv"] for o in opportunities) / len(opportunities),
+            "by_market": by_market,
+            "by_bookmaker": by_bookmaker,
+            "best_opportunities": best_opportunities,
+            "positive_clv_count": sum(1 for o in opportunities if o["clv"] > 0),
+            "positive_clv_percentage": (
+                sum(1 for o in opportunities if o["clv"] > 0) / len(opportunities) * 100
+            ),
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing game {game_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/games/{game_id}/score")
+async def get_game_score(game_id: int):
+    """Get the final score for a completed game."""
+    db = get_db()
+
+    try:
+        # Get game details
+        stmt = (
+            select(Game, Team, Sport)
+            .join(Team, Team.id == Game.home_team_id)
+            .join(Sport, Sport.id == Game.sport_id)
+            .where(Game.id == game_id)
+        )
+        result = db.execute(stmt).first()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Game not found")
+
+        game, home_team, sport = result
+
+        # Get away team
+        away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+
+        # Fetch scores from Odds API
+        api_key = os.getenv("ODDS_API_KEY")
+        if not api_key:
+            logger.warning("No ODDS_API_KEY found - cannot fetch scores")
+            return {
+                "game_id": game_id,
+                "has_score": False,
+                "message": "Score data unavailable - API key not configured",
+            }
+
+        client = OddsAPIClient(api_key)
+
+        try:
+            # Fetch recent scores (typically last 3 days)
+            scores_data = client.get_scores(sport.key)
+            scores = scores_data.get("data", [])
+
+            logger.info(f"Looking for game: {away_team.name} @ {home_team.name}")
+            logger.info(f"Game commenced at: {game.commence_time}")
+            logger.info(f"Found {len(scores)} recent games with scores from API")
+
+            # Find matching game by team names (case-insensitive partial match)
+            for score in scores:
+                home_name = score.get("home_team")
+                away_name = score.get("away_team")
+
+                logger.info(f"Checking: {away_name} @ {home_name} (completed: {score.get('completed')})")
+
+                # Case-insensitive partial matching
+                home_match = (
+                    home_name and home_team.name and
+                    (home_name.lower() in home_team.name.lower() or home_team.name.lower() in home_name.lower())
+                )
+                away_match = (
+                    away_name and away_team.name and
+                    (away_name.lower() in away_team.name.lower() or away_team.name.lower() in away_name.lower())
+                )
+
+                if home_match and away_match:
+                    final_scores = score.get("scores")
+                    # Check if game has actual scores (means it's completed)
+                    if final_scores and len(final_scores) > 0:
+                        logger.info(f"Found matching game with scores!")
+                        return {
+                            "game_id": game_id,
+                            "has_score": True,
+                            "home_team": home_name,
+                            "away_team": away_name,
+                            "home_score": next(
+                                (s["score"] for s in final_scores if s["name"] == home_name),
+                                None,
+                            ),
+                            "away_score": next(
+                                (s["score"] for s in final_scores if s["name"] == away_name),
+                                None,
+                            ),
+                            "completed": True,
+                        }
+
+            return {
+                "game_id": game_id,
+                "has_score": False,
+                "message": "Score not available yet - game may not be completed",
+            }
+
+        except Exception as api_error:
+            logger.error(f"Error fetching scores from API: {api_error}")
+            return {
+                "game_id": game_id,
+                "has_score": False,
+                "message": f"Error fetching score: {str(api_error)}",
+            }
+
+    except Exception as e:
+        logger.error(f"Error getting score for game {game_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

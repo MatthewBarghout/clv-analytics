@@ -219,3 +219,22 @@ class OddsAPIClient:
                 f"CRITICAL: Only {remaining} API requests remaining! "
                 "Rate limit will reset at the start of next month."
             )
+
+    def get_scores(self, sport_key: str) -> dict:
+        """
+        Get scores for completed games.
+
+        Args:
+            sport_key: Sport identifier (e.g., 'basketball_nba')
+
+        Returns:
+            Dictionary with 'data' (list of games with scores) and 'remaining_requests'
+
+        Note:
+            The scores endpoint returns recent completed games (typically last 3 days)
+        """
+        endpoint = f"/v4/sports/{sport_key}/scores/"
+        params = {
+            "apiKey": self.api_key,
+        }
+        return self._make_request(endpoint, params)
