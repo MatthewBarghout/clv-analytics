@@ -21,6 +21,7 @@ from src.api.schemas import (
     HealthResponse,
     OddsSnapshotResponse,
 )
+from src.api.ml_endpoints import router as ml_router
 from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Sport, Team
 
 # Load environment variables
@@ -45,6 +46,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include routers
+app.include_router(ml_router)
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")

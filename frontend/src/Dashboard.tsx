@@ -52,6 +52,21 @@ interface GameWithCLV {
   avg_clv: number | null;
 }
 
+interface MLModelStats {
+  is_trained: boolean;
+  mae: number | null;
+  rmse: number | null;
+  r2_score: number | null;
+  directional_accuracy: number | null;
+  training_records: number | null;
+  last_trained: string | null;
+}
+
+interface FeatureImportance {
+  feature_name: string;
+  importance: number;
+}
+
 const API_BASE = 'http://localhost:8000/api';
 
 export default function Dashboard() {
@@ -66,6 +81,8 @@ export default function Dashboard() {
   const [gamesView, setGamesView] = useState<'recent' | 'history'>('recent');
   const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
+  const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
+  const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
 
   useEffect(() => {
     fetchData();
@@ -80,28 +97,34 @@ export default function Dashboard() {
   const fetchData = async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, gamesRes] = await Promise.all([
+      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes] = await Promise.all([
         fetch(`${API_BASE}/stats`),
         fetch(`${API_BASE}/bookmakers`),
         fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
         fetch(`${API_BASE}/games?limit=20`),
+        fetch(`${API_BASE}/ml/stats`),
+        fetch(`${API_BASE}/ml/feature-importance`),
       ]);
 
       if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok || !gamesRes.ok) {
         throw new Error('Failed to fetch data');
       }
 
-      const [statsData, bookmakersData, historyData, gamesData] = await Promise.all([
+      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData] = await Promise.all([
         statsRes.json(),
         bookmakersRes.json(),
         historyRes.json(),
         gamesRes.json(),
+        mlStatsRes.ok ? mlStatsRes.json() : null,
+        featureImportanceRes.ok ? featureImportanceRes.json() : [],
       ]);
 
       setStats(statsData);
       setBookmakers(bookmakersData);
       setHistory(historyData);
       setGames(gamesData);
+      setMlStats(mlStatsData);
+      setFeatureImportance(featureImportanceData);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -233,6 +256,137 @@ export default function Dashboard() {
           </GlassCard>
         </div>
 
+        {/* ML Model Performance */}
+        {mlStats?.is_trained && (
+          <GlassCard className="mb-8">
+            <h2 className="text-2xl font-bold mb-6 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
+              ML Model Performance
+            </h2>
+
+            {/* Model Metrics Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  R² Score
+                </h3>
+                <AnimatedCounter
+                  value={(mlStats.r2_score || 0) * 100}
+                  decimals={2}
+                  suffix="%"
+                  className="text-2xl font-bold text-blue-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">Model accuracy</p>
+              </div>
+
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  Mean Absolute Error
+                </h3>
+                <AnimatedCounter
+                  value={mlStats.mae || 0}
+                  decimals={4}
+                  className="text-2xl font-bold text-purple-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">Average error in odds</p>
+              </div>
+
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  Directional Accuracy
+                </h3>
+                <AnimatedCounter
+                  value={mlStats.directional_accuracy || 0}
+                  decimals={1}
+                  suffix="%"
+                  className="text-2xl font-bold text-green-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">Correct movement prediction</p>
+              </div>
+
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  Training Records
+                </h3>
+                <AnimatedCounter
+                  value={mlStats.training_records || 0}
+                  className="text-2xl font-bold text-orange-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">Total data points</p>
+              </div>
+            </div>
+
+            {/* Feature Importance Chart */}
+            {featureImportance.length > 0 && (
+              <div className="mt-6">
+                <h3 className="text-lg font-semibold mb-4 text-gray-300">
+                  Feature Importance
+                </h3>
+                <ResponsiveContainer width="100%" height={300}>
+                  <BarChart
+                    data={featureImportance.slice(0, 7)}
+                    layout="vertical"
+                    margin={{ top: 5, right: 30, left: 100, bottom: 5 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
+                    <XAxis
+                      type="number"
+                      stroke="#9CA3AF"
+                      tick={{ fill: '#9CA3AF' }}
+                    />
+                    <YAxis
+                      type="category"
+                      dataKey="feature_name"
+                      stroke="#9CA3AF"
+                      tick={{ fill: '#9CA3AF' }}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#1F2937',
+                        border: '1px solid #374151',
+                        borderRadius: '8px',
+                        backdropFilter: 'blur(10px)',
+                      }}
+                      labelStyle={{ color: '#F3F4F6' }}
+                      itemStyle={{ color: '#9CA3AF' }}
+                      formatter={(value: number | undefined) => [(value ? (value * 100).toFixed(2) : '0') + '%', 'Importance']}
+                    />
+                    <Bar
+                      dataKey="importance"
+                      fill="#3b82f6"
+                      radius={[0, 4, 4, 0]}
+                      isAnimationActive={true}
+                      animationDuration={800}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+
+            {/* Model Info */}
+            {mlStats.last_trained && (
+              <div className="mt-4 text-xs text-gray-500 text-center">
+                Last trained: {new Date(mlStats.last_trained).toLocaleString()}
+              </div>
+            )}
+          </GlassCard>
+        )}
+
+        {!mlStats?.is_trained && (
+          <GlassCard className="mb-8 border-yellow-500/30 bg-yellow-500/5">
+            <div className="flex items-center gap-4">
+              <div className="text-4xl">⚠️</div>
+              <div>
+                <h3 className="text-lg font-semibold text-yellow-400 mb-1">
+                  ML Model Not Trained
+                </h3>
+                <p className="text-sm text-gray-400">
+                  Run <code className="px-2 py-1 bg-gray-800 rounded text-yellow-400">poetry run python scripts/train_model.py</code> to train the closing line prediction model.
+                </p>
+              </div>
+            </div>
+          </GlassCard>
+        )}
+
         {/* Market Type Breakdown */}
         {stats?.by_market_type && Object.keys(stats.by_market_type).length > 0 && (
           <GlassCard className="mb-8">
@@ -273,8 +427,8 @@ export default function Dashboard() {
                   }}
                   labelStyle={{ color: '#F3F4F6' }}
                   itemStyle={{ color: '#9CA3AF' }}
-                  formatter={(value: number, _name: string, props: any) => [
-                    `${value.toFixed(2)}% (${props.payload.count} bets)`,
+                  formatter={(value: number | undefined, _name: string | undefined, props: any) => [
+                    `${value ? value.toFixed(2) : '0'}% (${props.payload.count} bets)`,
                     'Avg CLV',
                   ]}
                 />

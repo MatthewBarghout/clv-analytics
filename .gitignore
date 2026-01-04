@@ -80,6 +80,9 @@ dmypy.json
 # Alembic
 migrations/versions/*.pyc
 
+# ML Models (regenerate with scripts/train_model.py)
+models/
+
 # Frontend build
 frontend/dist/
 frontend/.vite/
