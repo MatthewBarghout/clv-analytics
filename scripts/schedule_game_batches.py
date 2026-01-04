@@ -67,6 +67,7 @@ def schedule_batch(game_time: datetime, game_id: int):
 
     # Convert to local time for 'at' command
     batch_time_local = batch_time.astimezone()
+    game_time_local = game_time.astimezone()
 
     # Check if batch time is in the past
     now = datetime.now(timezone.utc)
@@ -77,12 +78,12 @@ def schedule_batch(game_time: datetime, game_id: int):
     # Format time for 'at' command (HH:MM)
     at_time = batch_time_local.strftime("%H:%M")
 
-    # Path to collection script
+    # Path to collection script wrapper
     project_dir = Path(__file__).parent.parent
-    collect_script = project_dir / "scripts" / "collect_odds.py"
+    run_script = project_dir / "scripts" / "run_collection.sh"
 
-    # Create the command to run
-    command = f"cd {project_dir} && /usr/bin/python3 -m scripts.collect_odds"
+    # Create the command to run using the Poetry wrapper
+    command = f"cd {project_dir} && {run_script}"
 
     try:
         # Schedule with 'at' command

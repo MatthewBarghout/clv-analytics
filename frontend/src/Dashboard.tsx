@@ -54,17 +54,36 @@ interface GameWithCLV {
 
 interface MLModelStats {
   is_trained: boolean;
-  mae: number | null;
-  rmse: number | null;
-  r2_score: number | null;
+  movement_mae: number | null;
+  movement_rmse: number | null;
+  movement_r2: number | null;
   directional_accuracy: number | null;
+  directional_precision: number | null;
+  directional_recall: number | null;
   training_records: number | null;
   last_trained: string | null;
+  baseline_mae: number | null;
+  improvement_vs_baseline: number | null;
 }
 
 interface FeatureImportance {
   feature_name: string;
   importance: number;
+}
+
+interface EVOpportunity {
+  game_id: number;
+  home_team: string;
+  away_team: string;
+  commence_time: string;
+  bookmaker_name: string;
+  market_type: string;
+  outcome_name: string;
+  current_line: string;
+  predicted_movement: number;
+  predicted_direction: string;
+  confidence: number;
+  ev_score: number;
 }
 
 const API_BASE = 'http://localhost:8000/api';
@@ -78,11 +97,12 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
-  const [gamesView, setGamesView] = useState<'recent' | 'history'>('recent');
+  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev'>('recent');
   const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
   const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
   const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
+  const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
 
   useEffect(() => {
     fetchData();
@@ -97,26 +117,28 @@ export default function Dashboard() {
   const fetchData = async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes] = await Promise.all([
+      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes] = await Promise.all([
         fetch(`${API_BASE}/stats`),
         fetch(`${API_BASE}/bookmakers`),
         fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
         fetch(`${API_BASE}/games?limit=20`),
         fetch(`${API_BASE}/ml/stats`),
         fetch(`${API_BASE}/ml/feature-importance`),
+        fetch(`${API_BASE}/ml/best-opportunities?limit=50&min_ev_score=0`),
       ]);
 
       if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok || !gamesRes.ok) {
         throw new Error('Failed to fetch data');
       }
 
-      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData] = await Promise.all([
+      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData] = await Promise.all([
         statsRes.json(),
         bookmakersRes.json(),
         historyRes.json(),
         gamesRes.json(),
         mlStatsRes.ok ? mlStatsRes.json() : null,
         featureImportanceRes.ok ? featureImportanceRes.json() : [],
+        opportunitiesRes.ok ? opportunitiesRes.json() : [],
       ]);
 
       setStats(statsData);
@@ -125,6 +147,7 @@ export default function Dashboard() {
       setGames(gamesData);
       setMlStats(mlStatsData);
       setFeatureImportance(featureImportanceData);
+      setBestOpportunities(opportunitiesData);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -264,30 +287,17 @@ export default function Dashboard() {
             </h2>
 
             {/* Model Metrics Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
               <div className="bg-white/5 rounded-lg p-4 border border-white/10">
                 <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  R² Score
+                  Movement MAE
                 </h3>
                 <AnimatedCounter
-                  value={(mlStats.r2_score || 0) * 100}
-                  decimals={2}
-                  suffix="%"
-                  className="text-2xl font-bold text-blue-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">Model accuracy</p>
-              </div>
-
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Mean Absolute Error
-                </h3>
-                <AnimatedCounter
-                  value={mlStats.mae || 0}
+                  value={mlStats.movement_mae || 0}
                   decimals={4}
                   className="text-2xl font-bold text-purple-400"
                 />
-                <p className="text-xs text-gray-500 mt-1">Average error in odds</p>
+                <p className="text-xs text-gray-500 mt-1">Avg prediction error</p>
               </div>
 
               <div className="bg-white/5 rounded-lg p-4 border border-white/10">
@@ -295,12 +305,38 @@ export default function Dashboard() {
                   Directional Accuracy
                 </h3>
                 <AnimatedCounter
-                  value={mlStats.directional_accuracy || 0}
+                  value={(mlStats.directional_accuracy || 0) * 100}
                   decimals={1}
                   suffix="%"
                   className="text-2xl font-bold text-green-400"
                 />
-                <p className="text-xs text-gray-500 mt-1">Correct movement prediction</p>
+                <p className="text-xs text-gray-500 mt-1">Correct direction</p>
+              </div>
+
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  Improvement
+                </h3>
+                <AnimatedCounter
+                  value={mlStats.improvement_vs_baseline || 0}
+                  decimals={1}
+                  suffix="%"
+                  className="text-2xl font-bold text-blue-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">vs baseline</p>
+              </div>
+
+              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
+                  Precision
+                </h3>
+                <AnimatedCounter
+                  value={(mlStats.directional_precision || 0) * 100}
+                  decimals={1}
+                  suffix="%"
+                  className="text-2xl font-bold text-cyan-400"
+                />
+                <p className="text-xs text-gray-500 mt-1">Direction precision</p>
               </div>
 
               <div className="bg-white/5 rounded-lg p-4 border border-white/10">
@@ -311,7 +347,7 @@ export default function Dashboard() {
                   value={mlStats.training_records || 0}
                   className="text-2xl font-bold text-orange-400"
                 />
-                <p className="text-xs text-gray-500 mt-1">Total data points</p>
+                <p className="text-xs text-gray-500 mt-1">Data points</p>
               </div>
             </div>
 
@@ -601,38 +637,152 @@ export default function Dashboard() {
                 >
                   History ({historyGames.length})
                 </button>
+                {mlStats?.is_trained && bestOpportunities.length > 0 && (
+                  <button
+                    onClick={() => setGamesView('best-ev')}
+                    className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                      gamesView === 'best-ev'
+                        ? 'bg-gradient-to-r from-green-500/30 to-emerald-500/30 text-white border border-green-500/50'
+                        : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                    }`}
+                  >
+                    Best +EV ({bestOpportunities.length})
+                  </button>
+                )}
               </div>
-              <div className="text-sm text-gray-400">
-                💡 Click any game to view detailed betting lines
-              </div>
+              {gamesView !== 'best-ev' && (
+                <div className="text-sm text-gray-400">
+                  💡 Click any game to view detailed betting lines
+                </div>
+              )}
             </div>
           </div>
           <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-gray-700/50">
-                  <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Game
-                  </th>
-                  <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Time
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Avg CLV
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Snapshots
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Closing Lines
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Status
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {(gamesView === 'recent' ? games : historyGames).map((game, index) => (
+            {gamesView === 'best-ev' ? (
+              // Best +EV Opportunities Table
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-700/50">
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Game
+                    </th>
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Market
+                    </th>
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Outcome
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Current Line
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Predicted Movement
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Direction
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Confidence
+                    </th>
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Bookmaker
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      EV Score
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bestOpportunities.map((opp, index) => (
+                    <tr
+                      key={index}
+                      className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200"
+                      style={{ animationDelay: `${index * 30}ms` }}
+                    >
+                      <td className="py-4 px-4">
+                        <span className="font-medium text-white text-sm">
+                          {opp.away_team} @ {opp.home_team}
+                        </span>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {new Date(opp.commence_time).toLocaleString('en-US', {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                          })}
+                        </div>
+                      </td>
+                      <td className="py-4 px-4">
+                        <span className="px-2 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                          {opp.market_type}
+                        </span>
+                      </td>
+                      <td className="py-4 px-4">
+                        <span className="text-sm font-medium text-white">{opp.outcome_name}</span>
+                      </td>
+                      <td className="text-center py-4 px-4">
+                        <span className="text-sm font-mono text-blue-400">{opp.current_line}</span>
+                      </td>
+                      <td className="text-center py-4 px-4">
+                        <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
+                        </span>
+                      </td>
+                      <td className="text-center py-4 px-4">
+                        <span className={`px-2 py-1 rounded text-xs font-medium border ${
+                          opp.predicted_direction === 'UP'
+                            ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                            : opp.predicted_direction === 'DOWN'
+                            ? 'bg-red-500/20 text-red-400 border-red-500/30'
+                            : 'bg-gray-500/20 text-gray-400 border-gray-500/30'
+                        }`}>
+                          {opp.predicted_direction}
+                        </span>
+                      </td>
+                      <td className="text-center py-4 px-4">
+                        <span className="text-sm font-medium text-cyan-400">
+                          {(opp.confidence * 100).toFixed(0)}%
+                        </span>
+                      </td>
+                      <td className="py-4 px-4">
+                        <span className="text-sm text-gray-300">{opp.bookmaker_name}</span>
+                      </td>
+                      <td className="text-center py-4 px-4">
+                        <span className="px-2 py-1 rounded text-sm font-bold bg-green-500/20 text-green-400 border border-green-500/30">
+                          {opp.ev_score.toFixed(2)}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              // Regular Games Table
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-700/50">
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Game
+                    </th>
+                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Time
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Avg CLV
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Snapshots
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Closing Lines
+                    </th>
+                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
+                      Status
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(gamesView === 'recent' ? games : historyGames).map((game, index) => (
                   <React.Fragment key={game.game_id}>
                     <tr
                       onClick={() => {
@@ -703,13 +853,20 @@ export default function Dashboard() {
                     </tr>
                   )}
                 </React.Fragment>
-                ))}
-              </tbody>
-            </table>
+                  ))}
+                </tbody>
+              </table>
+            )}
             {gamesView === 'history' && historyGames.length === 0 && (
               <div className="text-center py-12 text-gray-400">
                 <p className="text-lg mb-2">No completed games with CLV data yet</p>
                 <p className="text-sm">Games will appear here once they're completed and have closing line data</p>
+              </div>
+            )}
+            {gamesView === 'best-ev' && bestOpportunities.length === 0 && (
+              <div className="text-center py-12 text-gray-400">
+                <p className="text-lg mb-2">No +EV opportunities available</p>
+                <p className="text-sm">Opportunities will appear here when the ML model predicts favorable betting conditions</p>
               </div>
             )}
           </div>

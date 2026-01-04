@@ -7,9 +7,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>-m</string>
-        <string>scripts.schedule_game_batches</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/matthewbarghout/clv-analytics && /Library/Frameworks/Python.framework/Versions/3.10/bin/poetry run python scripts/schedule_game_batches.py</string>
     </array>
 
     <key>WorkingDirectory</key>
