@@ -84,6 +84,7 @@ interface EVOpportunity {
   predicted_direction: string;
   confidence: number;
   ev_score: number;
+  was_constrained: boolean;
 }
 
 const API_BASE = 'http://localhost:8000/api';
@@ -724,9 +725,19 @@ export default function Dashboard() {
                         <span className="text-sm font-mono text-blue-400">{opp.current_line}</span>
                       </td>
                       <td className="text-center py-4 px-4">
-                        <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
-                        </span>
+                        <div className="flex items-center justify-center gap-1">
+                          <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
+                          </span>
+                          {opp.was_constrained && (
+                            <span
+                              className="text-yellow-400 text-xs"
+                              title="Prediction capped to realistic range based on historical data"
+                            >
+                              ⚠️
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="text-center py-4 px-4">
                         <span className={`px-2 py-1 rounded text-xs font-medium border ${

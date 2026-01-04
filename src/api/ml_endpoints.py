@@ -111,6 +111,8 @@ class MovementPrediction(BaseModel):
     actual_closing_price: Optional[float] = None
     actual_closing_point: Optional[float] = None
     movement_error: Optional[float] = None
+    was_constrained: bool = False
+    unconstrained_movement: Optional[float] = None
 
 
 class SnapshotMovementPrediction(BaseModel):
@@ -145,6 +147,7 @@ class EVOpportunity(BaseModel):
     predicted_direction: str
     confidence: float
     ev_score: float
+    was_constrained: bool = False
 
 
 class RetrainingStatus(BaseModel):
@@ -368,6 +371,8 @@ async def get_game_predictions(game_id: int):
                     actual_closing_price=actual_closing_price,
                     actual_closing_point=actual_closing_point,
                     movement_error=movement_error,
+                    was_constrained=bool(movement_pred["was_constrained"][0]),
+                    unconstrained_movement=float(movement_pred["unconstrained_delta"][0]),
                 ))
 
             # Get bookmaker name
@@ -476,6 +481,7 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
                 predicted_delta = float(movement_pred["predicted_delta"][0])
                 confidence = float(movement_pred["confidence"][0])
                 direction = movement_pred["predicted_direction"][0]
+                was_constrained = bool(movement_pred["was_constrained"][0])
 
                 # Only include high-confidence predictions of unfavorable movement
                 if confidence < min_confidence:
@@ -516,6 +522,7 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
                     predicted_direction=direction,
                     confidence=confidence,
                     ev_score=ev_score,
+                    was_constrained=was_constrained,
                 ))
 
         # Sort by EV score

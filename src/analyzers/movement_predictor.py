@@ -1,8 +1,9 @@
 """Line movement predictor using XGBoost models."""
+import json
 import logging
 import pickle
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -104,6 +105,78 @@ class LineMovementPredictor:
             "is_outlier",
         ]
 
+        # Load movement statistics for prediction capping
+        self.movement_stats = self._load_movement_statistics()
+
+    def _load_movement_statistics(self) -> Dict[str, float]:
+        """
+        Load historical movement statistics for prediction capping.
+
+        Returns:
+            Dictionary of 95th percentile caps by market type
+        """
+        stats_path = Path("models/movement_statistics.json")
+
+        if not stats_path.exists():
+            logger.warning(
+                "Movement statistics not found. Using conservative default caps. "
+                "Run scripts/analyze_movement_patterns.py to generate statistics."
+            )
+            return {
+                'h2h': 0.10,
+                'spreads': 0.05,
+                'totals': 0.05,
+            }
+
+        try:
+            with open(stats_path, 'r') as f:
+                all_stats = json.load(f)
+
+            # Extract 95th percentile caps
+            caps = {}
+            for market_type, stats in all_stats.items():
+                caps[market_type] = stats['p95']
+
+            logger.info(f"Loaded movement caps: {caps}")
+            return caps
+
+        except Exception as e:
+            logger.error(f"Error loading movement statistics: {e}")
+            return {
+                'h2h': 0.10,
+                'spreads': 0.05,
+                'totals': 0.05,
+            }
+
+    def _constrain_prediction(
+        self,
+        predicted_movement: float,
+        market_type: str
+    ) -> tuple[float, bool]:
+        """
+        Constrain prediction to realistic range based on historical data.
+
+        Args:
+            predicted_movement: Raw model prediction
+            market_type: Market type (h2h, spreads, totals)
+
+        Returns:
+            Tuple of (constrained_movement, was_constrained)
+        """
+        # Get cap for this market type
+        cap = self.movement_stats.get(market_type, 0.10)
+
+        # Check if capping is needed
+        if abs(predicted_movement) > cap:
+            constrained = np.sign(predicted_movement) * cap
+            logger.debug(
+                f"Constrained {market_type} prediction from {predicted_movement:.4f} "
+                f"to {constrained:.4f} (cap: ±{cap:.4f})"
+            )
+            return constrained, True
+
+        return predicted_movement, False
+
     def _create_preprocessor(self) -> ColumnTransformer:
         """
         Create preprocessing pipeline with encoding and scaling.
@@ -167,21 +240,35 @@ class LineMovementPredictor:
 
     def predict_movement(self, X: pd.DataFrame) -> dict:
         """
-        Predict line movement for given features.
+        Predict line movement for given features with realistic constraints.
 
         Args:
             X: Features DataFrame (single row or multiple rows)
 
         Returns:
-            Dictionary with predicted_delta, predicted_direction, confidence, predicted_closing
+            Dictionary with predicted_delta, predicted_direction, confidence,
+            predicted_closing, was_constrained, unconstrained_delta
         """
         if self.preprocessor is None or self.label_encoder is None:
             raise ValueError("Model must be trained before making predictions")
 
         X_processed = self.preprocessor.transform(X)
 
-        # Predict movement magnitude
-        predicted_delta = self.regression_model.predict(X_processed)
+        # Predict movement magnitude (unconstrained)
+        unconstrained_delta = self.regression_model.predict(X_processed)
+
+        # Constrain predictions to realistic ranges
+        constrained_deltas = []
+        was_constrained = []
+
+        for i, raw_delta in enumerate(unconstrained_delta):
+            market_type = X.iloc[i]["market_type"]
+            constrained, is_capped = self._constrain_prediction(raw_delta, market_type)
+            constrained_deltas.append(constrained)
+            was_constrained.append(is_capped)
+
+        predicted_delta = np.array(constrained_deltas)
+        was_constrained = np.array(was_constrained)
 
         # Predict movement direction with probability
         direction_encoded = self.classification_model.predict(X_processed)
@@ -191,7 +278,7 @@ class LineMovementPredictor:
         # Get confidence (max probability)
         confidence = np.max(direction_proba, axis=1)
 
-        # Calculate predicted closing price
+        # Calculate predicted closing price using constrained delta
         opening_price = X["opening_price"].values
         predicted_closing = opening_price + predicted_delta
 
@@ -200,6 +287,8 @@ class LineMovementPredictor:
             "predicted_direction": predicted_direction,
             "confidence": confidence,
             "predicted_closing": predicted_closing,
+            "was_constrained": was_constrained,
+            "unconstrained_delta": unconstrained_delta,
         }
 
     def evaluate_regression(
