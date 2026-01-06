@@ -210,14 +210,14 @@ async def get_model_stats():
 
             # Calculate baseline
             baseline_mae = y_reg_test["price_movement"].abs().mean()
-            improvement = ((baseline_mae - regression_metrics["mae"]) / baseline_mae) * 100
+            improvement = ((baseline_mae - regression_metrics["ensemble_mae"]) / baseline_mae) * 100
 
             return MovementModelStats(
                 is_trained=True,
-                movement_mae=regression_metrics["mae"],
-                movement_rmse=regression_metrics["rmse"],
-                movement_r2=regression_metrics["r2"],
-                directional_accuracy=classification_metrics["accuracy"],
+                movement_mae=regression_metrics["ensemble_mae"],
+                movement_rmse=regression_metrics["ensemble_rmse"],
+                movement_r2=regression_metrics["ensemble_r2"],
+                directional_accuracy=classification_metrics["ensemble_accuracy"],
                 directional_precision=classification_metrics["precision"],
                 directional_recall=classification_metrics["recall"],
                 training_records=len(df),

@@ -128,12 +128,12 @@ def main():
 
         # Calculate baseline (predict no movement)
         baseline_mae = np.abs(y_reg_test["price_movement"]).mean()
-        improvement = ((baseline_mae - regression_metrics["mae"]) / baseline_mae) * 100
+        improvement = ((baseline_mae - regression_metrics["ensemble_mae"]) / baseline_mae) * 100
 
         logger.info(f"\nBaseline Comparison:")
         logger.info(f"  Baseline MAE (predict no movement): {baseline_mae:.4f}")
-        logger.info(f"  Model MAE: {regression_metrics['mae']:.4f}")
-        logger.info(f"  Improvement: {improvement:.1f}%")
+        logger.info(f"  Ensemble MAE: {regression_metrics['ensemble_mae']:.4f}")
+        logger.info(f"  Improvement vs baseline: {improvement:.1f}%")
 
         # Step 6: Evaluate classification model
         logger.info("\n" + "=" * 80)
@@ -146,8 +146,8 @@ def main():
         baseline_accuracy = y_class_train.value_counts().max() / len(y_class_train)
         logger.info(f"\nBaseline Comparison:")
         logger.info(f"  Baseline accuracy (predict most frequent): {baseline_accuracy:.4f}")
-        logger.info(f"  Model accuracy: {classification_metrics['accuracy']:.4f}")
-        logger.info(f"  Improvement: {(classification_metrics['accuracy'] - baseline_accuracy):.4f}")
+        logger.info(f"  Ensemble accuracy: {classification_metrics['ensemble_accuracy']:.4f}")
+        logger.info(f"  Improvement vs baseline: {(classification_metrics['ensemble_accuracy'] - baseline_accuracy):.4f}")
 
         # Step 7: Feature importance
         logger.info("\n" + "=" * 80)
@@ -173,12 +173,12 @@ def main():
         logger.info("=" * 80)
         logger.info(f"Training records: {len(X_train)}")
         logger.info(f"Test records: {len(X_test)}")
-        logger.info(f"\nRegression Performance:")
-        logger.info(f"  MAE: {regression_metrics['mae']:.4f}")
-        logger.info(f"  RMSE: {regression_metrics['rmse']:.4f}")
-        logger.info(f"  R²: {regression_metrics['r2']:.4f}")
-        logger.info(f"\nClassification Performance:")
-        logger.info(f"  Accuracy: {classification_metrics['accuracy']:.4f}")
+        logger.info(f"\nEnsemble Regression Performance:")
+        logger.info(f"  MAE: {regression_metrics['ensemble_mae']:.4f}")
+        logger.info(f"  RMSE: {regression_metrics['ensemble_rmse']:.4f}")
+        logger.info(f"  R²: {regression_metrics['ensemble_r2']:.4f}")
+        logger.info(f"\nEnsemble Classification Performance:")
+        logger.info(f"  Accuracy: {classification_metrics['ensemble_accuracy']:.4f}")
         logger.info(f"  Precision: {classification_metrics['precision']:.4f}")
         logger.info(f"  Recall: {classification_metrics['recall']:.4f}")
         logger.info(f"\nModel saved to: {MODEL_PATH}")

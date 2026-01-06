@@ -1,4 +1,4 @@
-"""Line movement predictor using XGBoost models."""
+"""Line movement predictor using ensemble of XGBoost and Random Forest models."""
 import json
 import logging
 import pickle
@@ -8,6 +8,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class LineMovementPredictor:
-    """Dual-model predictor for line movement (regression + classification)."""
+    """Ensemble predictor for line movement using XGBoost + Random Forest."""
 
     def __init__(
         self,
@@ -37,19 +38,23 @@ class LineMovementPredictor:
         min_child_weight: int = 3,
         subsample: float = 0.8,
         colsample_bytree: float = 0.8,
+        xgb_weight: float = 0.5,
+        rf_weight: float = 0.5,
     ):
         """
-        Initialize movement predictor with regularized XGBoost models.
+        Initialize ensemble movement predictor with XGBoost and Random Forest.
 
         Args:
-            n_estimators: Number of boosting rounds
-            max_depth: Maximum tree depth (reduced to 4 for more conservative predictions)
-            learning_rate: Learning rate for gradient boosting (reduced to 0.05)
-            reg_alpha: L1 regularization term on weights
-            reg_lambda: L2 regularization term on weights
-            min_child_weight: Minimum sum of instance weight needed in a child
-            subsample: Subsample ratio of training instances
-            colsample_bytree: Subsample ratio of columns when constructing each tree
+            n_estimators: Number of estimators for both XGBoost and Random Forest
+            max_depth: Maximum tree depth for both models
+            learning_rate: Learning rate for XGBoost
+            reg_alpha: L1 regularization for XGBoost
+            reg_lambda: L2 regularization for XGBoost
+            min_child_weight: Minimum child weight for XGBoost
+            subsample: Subsample ratio for XGBoost
+            colsample_bytree: Column subsample ratio for XGBoost
+            xgb_weight: Weight for XGBoost predictions in ensemble (default 0.5)
+            rf_weight: Weight for Random Forest predictions in ensemble (default 0.5)
         """
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -59,9 +64,11 @@ class LineMovementPredictor:
         self.min_child_weight = min_child_weight
         self.subsample = subsample
         self.colsample_bytree = colsample_bytree
+        self.xgb_weight = xgb_weight
+        self.rf_weight = rf_weight
 
-        # Regression model for movement magnitude
-        self.regression_model = XGBRegressor(
+        # XGBoost regression model for movement magnitude
+        self.xgb_regression = XGBRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -74,8 +81,8 @@ class LineMovementPredictor:
             n_jobs=-1,
         )
 
-        # Classification model for movement direction
-        self.classification_model = XGBClassifier(
+        # XGBoost classification model for movement direction
+        self.xgb_classification = XGBClassifier(
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -84,6 +91,28 @@ class LineMovementPredictor:
             min_child_weight=min_child_weight,
             subsample=subsample,
             colsample_bytree=colsample_bytree,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        # Random Forest regression model for movement magnitude
+        self.rf_regression = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            max_features='sqrt',
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        # Random Forest classification model for movement direction
+        self.rf_classification = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            max_features='sqrt',
             random_state=42,
             n_jobs=-1,
         )
@@ -206,14 +235,15 @@ class LineMovementPredictor:
         y_class_train: pd.Series,
     ) -> None:
         """
-        Train both regression and classification models.
+        Train ensemble models (XGBoost + Random Forest).
 
         Args:
             X_train: Training features
             y_reg_train: Regression targets (price_movement, point_movement)
             y_class_train: Classification target (UP/DOWN/STAY)
         """
-        logger.info("Training line movement predictor...")
+        logger.info("Training ensemble movement predictor...")
+        logger.info(f"Ensemble weights: XGBoost={self.xgb_weight}, RF={self.rf_weight}")
 
         # Store feature names
         self.feature_names = list(X_train.columns)
@@ -222,25 +252,33 @@ class LineMovementPredictor:
         self.preprocessor = self._create_preprocessor()
         X_train_processed = self.preprocessor.fit_transform(X_train)
 
-        # Train regression model (price movement only for now)
-        logger.info("Training regression model for price movement...")
-        self.regression_model.fit(X_train_processed, y_reg_train["price_movement"])
+        # Train XGBoost regression model
+        logger.info("Training XGBoost regression model...")
+        self.xgb_regression.fit(X_train_processed, y_reg_train["price_movement"])
+
+        # Train Random Forest regression model
+        logger.info("Training Random Forest regression model...")
+        self.rf_regression.fit(X_train_processed, y_reg_train["price_movement"])
 
         # Encode classification labels
         self.label_encoder = LabelEncoder()
         y_class_encoded = self.label_encoder.fit_transform(y_class_train)
 
-        # Train classification model
-        logger.info("Training classification model for movement direction...")
-        self.classification_model.fit(X_train_processed, y_class_encoded)
+        # Train XGBoost classification model
+        logger.info("Training XGBoost classification model...")
+        self.xgb_classification.fit(X_train_processed, y_class_encoded)
 
-        logger.info("Model training completed")
+        # Train Random Forest classification model
+        logger.info("Training Random Forest classification model...")
+        self.rf_classification.fit(X_train_processed, y_class_encoded)
+
+        logger.info("Ensemble training completed")
         logger.info(f"Number of features after preprocessing: {X_train_processed.shape[1]}")
         logger.info(f"Direction classes: {self.label_encoder.classes_}")
 
     def predict_movement(self, X: pd.DataFrame) -> dict:
         """
-        Predict line movement for given features with realistic constraints.
+        Predict line movement using ensemble (XGBoost + Random Forest average).
 
         Args:
             X: Features DataFrame (single row or multiple rows)
@@ -254,8 +292,12 @@ class LineMovementPredictor:
 
         X_processed = self.preprocessor.transform(X)
 
-        # Predict movement magnitude (unconstrained)
-        unconstrained_delta = self.regression_model.predict(X_processed)
+        # Get predictions from both regression models
+        xgb_pred = self.xgb_regression.predict(X_processed)
+        rf_pred = self.rf_regression.predict(X_processed)
+
+        # Ensemble regression predictions (weighted average)
+        unconstrained_delta = (xgb_pred * self.xgb_weight) + (rf_pred * self.rf_weight)
 
         # Constrain predictions to realistic ranges
         constrained_deltas = []
@@ -270,13 +312,22 @@ class LineMovementPredictor:
         predicted_delta = np.array(constrained_deltas)
         was_constrained = np.array(was_constrained)
 
-        # Predict movement direction with probability
-        direction_encoded = self.classification_model.predict(X_processed)
-        direction_proba = self.classification_model.predict_proba(X_processed)
+        # Get predictions from both classification models
+        xgb_direction_encoded = self.xgb_classification.predict(X_processed)
+        xgb_direction_proba = self.xgb_classification.predict_proba(X_processed)
+
+        rf_direction_encoded = self.rf_classification.predict(X_processed)
+        rf_direction_proba = self.rf_classification.predict_proba(X_processed)
+
+        # Ensemble classification predictions (weighted average of probabilities)
+        ensemble_proba = (xgb_direction_proba * self.xgb_weight) + (rf_direction_proba * self.rf_weight)
+
+        # Get final direction from ensemble probabilities
+        direction_encoded = np.argmax(ensemble_proba, axis=1)
         predicted_direction = self.label_encoder.inverse_transform(direction_encoded)
 
-        # Get confidence (max probability)
-        confidence = np.max(direction_proba, axis=1)
+        # Get confidence (max probability from ensemble)
+        confidence = np.max(ensemble_proba, axis=1)
 
         # Calculate predicted closing price using constrained delta
         opening_price = X["opening_price"].values
@@ -295,91 +346,143 @@ class LineMovementPredictor:
         self, X_test: pd.DataFrame, y_test: pd.DataFrame
     ) -> dict[str, float]:
         """
-        Evaluate regression model performance.
+        Evaluate regression model performance for both models and ensemble.
 
         Args:
             X_test: Test features
             y_test: True movement values
 
         Returns:
-            Dictionary with MAE, RMSE, R² metrics
+            Dictionary with MAE, RMSE, R² metrics for XGBoost, RF, and Ensemble
         """
         X_test_processed = self.preprocessor.transform(X_test)
-        predictions = self.regression_model.predict(X_test_processed)
-
         y_true = y_test["price_movement"].values
 
-        mae = mean_absolute_error(y_true, predictions)
-        rmse = np.sqrt(mean_squared_error(y_true, predictions))
-        r2 = r2_score(y_true, predictions)
+        # Get individual model predictions
+        xgb_pred = self.xgb_regression.predict(X_test_processed)
+        rf_pred = self.rf_regression.predict(X_test_processed)
 
-        # Calculate metrics for significant movements only
+        # Calculate ensemble predictions
+        ensemble_pred = (xgb_pred * self.xgb_weight) + (rf_pred * self.rf_weight)
+
+        # Evaluate XGBoost
+        xgb_mae = mean_absolute_error(y_true, xgb_pred)
+        xgb_rmse = np.sqrt(mean_squared_error(y_true, xgb_pred))
+        xgb_r2 = r2_score(y_true, xgb_pred)
+
+        # Evaluate Random Forest
+        rf_mae = mean_absolute_error(y_true, rf_pred)
+        rf_rmse = np.sqrt(mean_squared_error(y_true, rf_pred))
+        rf_r2 = r2_score(y_true, rf_pred)
+
+        # Evaluate Ensemble
+        ensemble_mae = mean_absolute_error(y_true, ensemble_pred)
+        ensemble_rmse = np.sqrt(mean_squared_error(y_true, ensemble_pred))
+        ensemble_r2 = r2_score(y_true, ensemble_pred)
+
+        # Calculate metrics for significant movements
         significant_mask = np.abs(y_true) > 0.02
         if significant_mask.any():
-            mae_significant = mean_absolute_error(
-                y_true[significant_mask], predictions[significant_mask]
+            ensemble_mae_sig = mean_absolute_error(
+                y_true[significant_mask], ensemble_pred[significant_mask]
             )
-            rmse_significant = np.sqrt(
-                mean_squared_error(y_true[significant_mask], predictions[significant_mask])
+            ensemble_rmse_sig = np.sqrt(
+                mean_squared_error(y_true[significant_mask], ensemble_pred[significant_mask])
             )
         else:
-            mae_significant = mae
-            rmse_significant = rmse
+            ensemble_mae_sig = ensemble_mae
+            ensemble_rmse_sig = ensemble_rmse
 
-        logger.info("Regression Model Evaluation:")
-        logger.info(f"  MAE (all): {mae:.4f}")
-        logger.info(f"  RMSE (all): {rmse:.4f}")
-        logger.info(f"  R² (all): {r2:.4f}")
-        logger.info(f"  MAE (significant movements >0.02): {mae_significant:.4f}")
-        logger.info(f"  RMSE (significant movements >0.02): {rmse_significant:.4f}")
+        logger.info("=" * 70)
+        logger.info("REGRESSION MODEL EVALUATION")
+        logger.info("=" * 70)
+        logger.info(f"XGBoost:      MAE={xgb_mae:.4f}  RMSE={xgb_rmse:.4f}  R²={xgb_r2:.4f}")
+        logger.info(f"Random Forest: MAE={rf_mae:.4f}  RMSE={rf_rmse:.4f}  R²={rf_r2:.4f}")
+        logger.info(f"Ensemble:     MAE={ensemble_mae:.4f}  RMSE={ensemble_rmse:.4f}  R²={ensemble_r2:.4f}")
+        logger.info(f"Ensemble (significant movements >0.02): MAE={ensemble_mae_sig:.4f}  RMSE={ensemble_rmse_sig:.4f}")
+
+        # Calculate improvement
+        best_individual = min(xgb_mae, rf_mae)
+        improvement = ((best_individual - ensemble_mae) / best_individual) * 100
+        logger.info(f"Ensemble improvement over best individual: {improvement:+.1f}%")
 
         return {
-            "mae": mae,
-            "rmse": rmse,
-            "r2": r2,
-            "mae_significant": mae_significant,
-            "rmse_significant": rmse_significant,
+            "xgb_mae": xgb_mae,
+            "xgb_rmse": xgb_rmse,
+            "xgb_r2": xgb_r2,
+            "rf_mae": rf_mae,
+            "rf_rmse": rf_rmse,
+            "rf_r2": rf_r2,
+            "ensemble_mae": ensemble_mae,
+            "ensemble_rmse": ensemble_rmse,
+            "ensemble_r2": ensemble_r2,
+            "ensemble_mae_significant": ensemble_mae_sig,
+            "ensemble_rmse_significant": ensemble_rmse_sig,
         }
 
     def evaluate_classification(
         self, X_test: pd.DataFrame, y_test: pd.Series
     ) -> dict[str, any]:
         """
-        Evaluate classification model performance.
+        Evaluate classification model performance for both models and ensemble.
 
         Args:
             X_test: Test features
             y_test: True directional movement
 
         Returns:
-            Dictionary with accuracy, precision, recall, confusion matrix
+            Dictionary with accuracy, precision, recall for XGBoost, RF, and Ensemble
         """
         X_test_processed = self.preprocessor.transform(X_test)
-
-        # Predict direction
         y_test_encoded = self.label_encoder.transform(y_test)
-        predictions_encoded = self.classification_model.predict(X_test_processed)
 
-        # Calculate metrics
-        accuracy = accuracy_score(y_test_encoded, predictions_encoded)
+        # XGBoost predictions
+        xgb_pred = self.xgb_classification.predict(X_test_processed)
+        xgb_proba = self.xgb_classification.predict_proba(X_test_processed)
+
+        # Random Forest predictions
+        rf_pred = self.rf_classification.predict(X_test_processed)
+        rf_proba = self.rf_classification.predict_proba(X_test_processed)
+
+        # Ensemble predictions (weighted average of probabilities)
+        ensemble_proba = (xgb_proba * self.xgb_weight) + (rf_proba * self.rf_weight)
+        ensemble_pred = np.argmax(ensemble_proba, axis=1)
+
+        # Calculate metrics for each model
+        xgb_accuracy = accuracy_score(y_test_encoded, xgb_pred)
+        rf_accuracy = accuracy_score(y_test_encoded, rf_pred)
+        ensemble_accuracy = accuracy_score(y_test_encoded, ensemble_pred)
+
+        # Ensemble confusion matrix
+        cm = confusion_matrix(y_test_encoded, ensemble_pred)
+
+        # Ensemble precision/recall
         precision, recall, f1, support = precision_recall_fscore_support(
-            y_test_encoded, predictions_encoded, average="weighted", zero_division=0
+            y_test_encoded, ensemble_pred, average="weighted", zero_division=0
         )
 
-        # Confusion matrix
-        cm = confusion_matrix(y_test_encoded, predictions_encoded)
-
-        logger.info("Classification Model Evaluation:")
-        logger.info(f"  Accuracy: {accuracy:.4f}")
-        logger.info(f"  Precision (weighted): {precision:.4f}")
-        logger.info(f"  Recall (weighted): {recall:.4f}")
-        logger.info(f"  F1 Score (weighted): {f1:.4f}")
-        logger.info(f"  Confusion Matrix:")
-        logger.info(f"    Classes: {self.label_encoder.classes_}")
+        logger.info("=" * 70)
+        logger.info("CLASSIFICATION MODEL EVALUATION")
+        logger.info("=" * 70)
+        logger.info(f"XGBoost:       Accuracy={xgb_accuracy:.4f} ({xgb_accuracy*100:.1f}%)")
+        logger.info(f"Random Forest: Accuracy={rf_accuracy:.4f} ({rf_accuracy*100:.1f}%)")
+        logger.info(f"Ensemble:      Accuracy={ensemble_accuracy:.4f} ({ensemble_accuracy*100:.1f}%)")
+        logger.info(f"Ensemble Precision: {precision:.4f}")
+        logger.info(f"Ensemble Recall: {recall:.4f}")
+        logger.info(f"Ensemble F1 Score: {f1:.4f}")
+        logger.info(f"Confusion Matrix:")
+        logger.info(f"  Classes: {self.label_encoder.classes_}")
         logger.info(f"{cm}")
 
+        # Calculate improvement
+        best_individual = max(xgb_accuracy, rf_accuracy)
+        improvement = ((ensemble_accuracy - best_individual) / best_individual) * 100
+        logger.info(f"Ensemble improvement over best individual: {improvement:+.1f}%")
+
         return {
-            "accuracy": accuracy,
+            "xgb_accuracy": xgb_accuracy,
+            "rf_accuracy": rf_accuracy,
+            "ensemble_accuracy": ensemble_accuracy,
             "precision": precision,
             "recall": recall,
             "f1_score": f1,
@@ -389,10 +492,10 @@ class LineMovementPredictor:
 
     def get_feature_importance(self) -> dict[str, float]:
         """
-        Get feature importance from regression model.
+        Get average feature importance from both regression models.
 
         Returns:
-            Dictionary mapping feature names to importance scores
+            Dictionary mapping feature names to averaged importance scores
         """
         if self.preprocessor is None or self.feature_names is None:
             raise ValueError("Model must be trained before getting feature importance")
@@ -405,11 +508,15 @@ class LineMovementPredictor:
 
         all_features = cat_features + self.numerical_features
 
-        # Get importances from regression model
-        importances = self.regression_model.feature_importances_
+        # Get importances from both regression models
+        xgb_importances = self.xgb_regression.feature_importances_
+        rf_importances = self.rf_regression.feature_importances_
+
+        # Average the importances (weighted by ensemble weights)
+        avg_importances = (xgb_importances * self.xgb_weight) + (rf_importances * self.rf_weight)
 
         # Create dictionary
-        importance_dict = dict(zip(all_features, importances))
+        importance_dict = dict(zip(all_features, avg_importances))
 
         # Sort by importance
         importance_dict = dict(
@@ -420,20 +527,24 @@ class LineMovementPredictor:
 
     def save_model(self, filepath: str) -> None:
         """
-        Save trained model to file.
+        Save trained ensemble models to file.
 
         Args:
             filepath: Path to save model file
         """
         model_data = {
-            "regression_model": self.regression_model,
-            "classification_model": self.classification_model,
+            "xgb_regression": self.xgb_regression,
+            "xgb_classification": self.xgb_classification,
+            "rf_regression": self.rf_regression,
+            "rf_classification": self.rf_classification,
             "preprocessor": self.preprocessor,
             "label_encoder": self.label_encoder,
             "feature_names": self.feature_names,
             "n_estimators": self.n_estimators,
             "max_depth": self.max_depth,
             "learning_rate": self.learning_rate,
+            "xgb_weight": self.xgb_weight,
+            "rf_weight": self.rf_weight,
         }
 
         # Create directory if it doesn't exist
@@ -442,11 +553,11 @@ class LineMovementPredictor:
         with open(filepath, "wb") as f:
             pickle.dump(model_data, f)
 
-        logger.info(f"Model saved to {filepath}")
+        logger.info(f"Ensemble model saved to {filepath}")
 
     def load_model(self, filepath: str) -> None:
         """
-        Load trained model from file.
+        Load trained ensemble models from file.
 
         Args:
             filepath: Path to model file
@@ -454,13 +565,17 @@ class LineMovementPredictor:
         with open(filepath, "rb") as f:
             model_data = pickle.load(f)
 
-        self.regression_model = model_data["regression_model"]
-        self.classification_model = model_data["classification_model"]
+        self.xgb_regression = model_data["xgb_regression"]
+        self.xgb_classification = model_data["xgb_classification"]
+        self.rf_regression = model_data["rf_regression"]
+        self.rf_classification = model_data["rf_classification"]
         self.preprocessor = model_data["preprocessor"]
         self.label_encoder = model_data["label_encoder"]
         self.feature_names = model_data["feature_names"]
         self.n_estimators = model_data["n_estimators"]
         self.max_depth = model_data["max_depth"]
         self.learning_rate = model_data["learning_rate"]
+        self.xgb_weight = model_data.get("xgb_weight", 0.5)
+        self.rf_weight = model_data.get("rf_weight", 0.5)
 
-        logger.info(f"Model loaded from {filepath}")
+        logger.info(f"Ensemble model loaded from {filepath}")
