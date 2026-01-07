@@ -85,3 +85,23 @@ class ClosingLineResponse(BaseModel):
     outcomes: list
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DailyCLVReportResponse(BaseModel):
+    """Daily CLV report response."""
+
+    id: int
+    report_date: datetime
+    games_analyzed: int
+    total_opportunities: int
+    avg_clv: Optional[float]
+    median_clv: Optional[float]
+    positive_clv_count: int
+    positive_clv_percentage: Optional[float]
+    best_opportunities: Optional[dict]
+    by_bookmaker: Optional[dict]
+    by_market: Optional[dict]
+    game_summaries: Optional[dict]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

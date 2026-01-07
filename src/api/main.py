@@ -17,12 +17,13 @@ from src.api.schemas import (
     CLVHistoryPoint,
     CLVStats,
     ClosingLineResponse,
+    DailyCLVReportResponse,
     GameWithCLV,
     HealthResponse,
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Sport, Team
+from src.models.database import Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, Sport, Team
 
 # Load environment variables
 load_dotenv()
@@ -583,6 +584,57 @@ async def get_game_analysis(game_id: int):
         }
     except Exception as e:
         logger.error(f"Error analyzing game {game_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/daily-reports", response_model=List[DailyCLVReportResponse])
+async def get_daily_reports(limit: int = 30):
+    """Get daily CLV reports, most recent first."""
+    db = get_db()
+
+    try:
+        stmt = (
+            select(DailyCLVReport)
+            .order_by(DailyCLVReport.report_date.desc())
+            .limit(limit)
+        )
+
+        reports = db.execute(stmt).scalars().all()
+        return reports
+
+    except Exception as e:
+        logger.error(f"Error fetching daily reports: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/daily-reports/{report_date}", response_model=DailyCLVReportResponse)
+async def get_daily_report(report_date: str):
+    """Get daily CLV report for a specific date (YYYY-MM-DD)."""
+    db = get_db()
+
+    try:
+        # Parse date
+        date = datetime.strptime(report_date, "%Y-%m-%d")
+        date = date.replace(tzinfo=timezone.utc)
+
+        stmt = select(DailyCLVReport).where(DailyCLVReport.report_date == date)
+        report = db.execute(stmt).scalar_one_or_none()
+
+        if not report:
+            raise HTTPException(status_code=404, detail=f"No report found for {report_date}")
+
+        return report
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching daily report: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

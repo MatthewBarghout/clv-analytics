@@ -4,6 +4,7 @@ Dynamic Game Batch Scheduler
 
 Runs daily at 8am to schedule odds collection batches based on actual game times.
 Creates a batch 30 minutes before each game starts to capture closing lines.
+Uses launchd to schedule individual batches.
 """
 import logging
 import os
@@ -35,15 +36,14 @@ def get_todays_games():
     session = Session()
 
     try:
-        # Get today's date range (midnight to midnight local time)
+        # Get games in the next 24 hours (from now)
         now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start + timedelta(days=1)
+        tomorrow = now + timedelta(hours=24)
 
-        # Query games for today
+        # Query games starting in the next 24 hours
         stmt = select(Game).where(
-            Game.commence_time >= today_start,
-            Game.commence_time < today_end
+            Game.commence_time >= now,
+            Game.commence_time < tomorrow
         ).order_by(Game.commence_time)
 
         games = session.execute(stmt).scalars().all()
@@ -54,18 +54,19 @@ def get_todays_games():
     finally:
         session.close()
 
-def schedule_batch(game_time: datetime, game_id: int):
+def schedule_batch(game_time: datetime, game_id: int, batch_index: int):
     """
-    Schedule a batch collection 30 minutes before game time using 'at' command.
+    Schedule a batch collection 30 minutes before game time using launchd.
 
     Args:
         game_time: When the game starts
         game_id: Database ID of the game
+        batch_index: Unique index for this batch (to create unique plist name)
     """
     # Calculate batch time (30 minutes before game)
     batch_time = game_time - timedelta(minutes=30)
 
-    # Convert to local time for 'at' command
+    # Convert to local time
     batch_time_local = batch_time.astimezone()
     game_time_local = game_time.astimezone()
 
@@ -75,45 +76,121 @@ def schedule_batch(game_time: datetime, game_id: int):
         logger.warning(f"Game {game_id} batch time {batch_time_local} is in the past, skipping")
         return False
 
-    # Format time for 'at' command (HH:MM)
-    at_time = batch_time_local.strftime("%H:%M")
-
     # Path to collection script wrapper
     project_dir = Path(__file__).parent.parent
     run_script = project_dir / "scripts" / "run_collection.sh"
 
-    # Create the command to run using the Poetry wrapper
-    command = f"cd {project_dir} && {run_script}"
+    # Create unique label for this batch
+    label = f"com.clvanalytics.batch.{batch_time_local.strftime('%Y%m%d_%H%M')}.{batch_index}"
+
+    # Plist file path
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+    # Create plist content
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd {project_dir} && {run_script} --closing-only</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{project_dir}</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Year</key>
+        <integer>{batch_time_local.year}</integer>
+        <key>Month</key>
+        <integer>{batch_time_local.month}</integer>
+        <key>Day</key>
+        <integer>{batch_time_local.day}</integer>
+        <key>Hour</key>
+        <integer>{batch_time_local.hour}</integer>
+        <key>Minute</key>
+        <integer>{batch_time_local.minute}</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/clv-batch-{label}.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/clv-batch-{label}-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
+"""
 
     try:
-        # Schedule with 'at' command
-        # Use 'at' to run the command at the specified time
-        process = subprocess.Popen(
-            ['at', at_time],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        # Write plist file
+        plist_path.write_text(plist_content)
+        logger.info(f"Created plist: {plist_path}")
+
+        # Load the plist
+        result = subprocess.run(
+            ['launchctl', 'load', str(plist_path)],
+            capture_output=True,
             text=True
         )
 
-        stdout, stderr = process.communicate(input=command)
-
-        if process.returncode == 0:
-            logger.info(f"✓ Scheduled batch at {at_time} for game {game_id} (starts {game_time_local.strftime('%H:%M')})")
+        if result.returncode == 0:
+            logger.info(f"✓ Scheduled batch at {batch_time_local.strftime('%H:%M')} for game {game_id} (starts {game_time_local.strftime('%H:%M')})")
             return True
         else:
-            logger.error(f"Failed to schedule batch: {stderr}")
+            logger.error(f"Failed to load plist: {result.stderr}")
+            plist_path.unlink(missing_ok=True)
             return False
 
     except Exception as e:
         logger.error(f"Error scheduling batch: {e}")
+        plist_path.unlink(missing_ok=True)
         return False
+
+def cleanup_old_batches():
+    """Remove old batch plists that have already run."""
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    cleaned_count = 0
+
+    # Find all batch plists
+    for plist_file in launch_agents_dir.glob("com.clvanalytics.batch.*.plist"):
+        try:
+            # Unload the plist
+            subprocess.run(
+                ['launchctl', 'unload', str(plist_file)],
+                capture_output=True,
+                text=True,
+                check=False  # Don't raise if already unloaded
+            )
+            # Remove the file
+            plist_file.unlink()
+            cleaned_count += 1
+            logger.info(f"Cleaned up old batch: {plist_file.name}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up {plist_file.name}: {e}")
+
+    if cleaned_count > 0:
+        logger.info(f"Cleaned up {cleaned_count} old batch plists")
 
 def main():
     """Main scheduler function."""
     logger.info("=" * 60)
     logger.info("Starting dynamic game batch scheduler")
     logger.info("=" * 60)
+
+    # Clean up old batch plists from previous runs
+    cleanup_old_batches()
 
     # Get today's games
     games = get_todays_games()
@@ -137,14 +214,14 @@ def main():
 
     # Schedule one batch per unique time
     scheduled_count = 0
-    for batch_time_str, games_at_time in batch_times.items():
+    for batch_index, (batch_time_str, games_at_time) in enumerate(batch_times.items()):
         # Log all games for this batch time
         game_ids = [g.id for g in games_at_time]
         logger.info(f"Batch time {batch_time_str}: {len(games_at_time)} games (IDs: {game_ids})")
 
         # Schedule using the first game's time (they're all the same batch time)
         first_game = games_at_time[0]
-        if schedule_batch(first_game.commence_time, first_game.id):
+        if schedule_batch(first_game.commence_time, first_game.id, batch_index):
             scheduled_count += 1
 
     logger.info("=" * 60)

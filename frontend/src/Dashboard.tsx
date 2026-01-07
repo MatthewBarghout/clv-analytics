@@ -87,6 +87,28 @@ interface EVOpportunity {
   was_constrained: boolean;
 }
 
+interface DailyCLVReport {
+  id: number;
+  report_date: string;
+  games_analyzed: number;
+  total_opportunities: number;
+  avg_clv: number;
+  median_clv: number;
+  positive_clv_count: number;
+  positive_clv_percentage: number;
+  best_opportunities: Array<{
+    game_id: number;
+    bookmaker: string;
+    market_type: string;
+    outcome: string;
+    clv: number;
+    entry_odds: number;
+    closing_odds: number;
+  }>;
+  by_bookmaker: Record<string, { avg_clv: number; count: number; positive_count: number }>;
+  by_market: Record<string, { avg_clv: number; count: number; positive_count: number }>;
+}
+
 const API_BASE = 'http://localhost:8000/api';
 
 export default function Dashboard() {
@@ -98,12 +120,13 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
-  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev'>('recent');
+  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev' | 'daily-reports'>('recent');
   const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
   const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
   const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
   const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
+  const [dailyReports, setDailyReports] = useState<DailyCLVReport[]>([]);
 
   useEffect(() => {
     fetchData();
@@ -112,8 +135,22 @@ export default function Dashboard() {
   useEffect(() => {
     if (gamesView === 'history') {
       fetchHistoryGames();
+    } else if (gamesView === 'daily-reports') {
+      fetchDailyReports();
     }
   }, [gamesView]);
+
+  const fetchDailyReports = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/daily-reports?limit=14`);
+      if (res.ok) {
+        const data = await res.json();
+        setDailyReports(data);
+      }
+    } catch (err) {
+      console.error('Error fetching daily reports:', err);
+    }
+  };
 
   const fetchData = async () => {
     try {
@@ -650,6 +687,16 @@ export default function Dashboard() {
                     Best +EV ({bestOpportunities.length})
                   </button>
                 )}
+                <button
+                  onClick={() => setGamesView('daily-reports')}
+                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                    gamesView === 'daily-reports'
+                      ? 'bg-gradient-to-r from-blue-500/30 to-cyan-500/30 text-white border border-blue-500/50'
+                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  Daily Reports
+                </button>
               </div>
               {gamesView !== 'best-ev' && (
                 <div className="text-sm text-gray-400">
@@ -659,7 +706,119 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="overflow-x-auto">
-            {gamesView === 'best-ev' ? (
+            {gamesView === 'daily-reports' ? (
+              // Daily Reports View
+              <div className="space-y-6">
+                {dailyReports.map((report, index) => (
+                  <div
+                    key={report.id}
+                    className="bg-white/5 rounded-lg p-6 border border-white/10 hover:bg-white/8 transition-all duration-200"
+                    style={{ animationDelay: `${index * 50}ms` }}
+                  >
+                    <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-4">
+                      <div>
+                        <h3 className="text-xl font-bold text-white mb-1">
+                          {new Date(report.report_date).toLocaleDateString('en-US', {
+                            weekday: 'long',
+                            year: 'numeric',
+                            month: 'long',
+                            day: 'numeric',
+                          })}
+                        </h3>
+                        <p className="text-sm text-gray-400">
+                          {report.games_analyzed} games • {report.total_opportunities} betting opportunities
+                        </p>
+                      </div>
+                      <div className="flex gap-4 mt-4 md:mt-0">
+                        <div className="text-center">
+                          <div className="text-sm text-gray-400 mb-1">Avg CLV</div>
+                          <div className={`text-2xl font-bold ${report.avg_clv > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {report.avg_clv > 0 ? '+' : ''}{report.avg_clv.toFixed(2)}%
+                          </div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-sm text-gray-400 mb-1">Positive CLV</div>
+                          <div className="text-2xl font-bold text-green-400">
+                            {report.positive_clv_percentage.toFixed(0)}%
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Top 3 Best Opportunities */}
+                    <div className="mt-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wider">
+                        Top 3 Best Opportunities
+                      </h4>
+                      <div className="space-y-2">
+                        {report.best_opportunities.slice(0, 3).map((opp, oppIndex) => (
+                          <div
+                            key={oppIndex}
+                            className="flex items-center justify-between bg-white/5 rounded-lg p-3 border border-white/5"
+                          >
+                            <div className="flex items-center gap-3">
+                              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-yellow-500/30 to-orange-500/30 border border-yellow-500/50 flex items-center justify-center">
+                                <span className="text-yellow-400 font-bold text-sm">#{oppIndex + 1}</span>
+                              </div>
+                              <div>
+                                <div className="text-sm font-medium text-white">
+                                  {opp.bookmaker} • {opp.market_type}
+                                </div>
+                                <div className="text-xs text-gray-400">{opp.outcome}</div>
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <div className="text-lg font-bold text-green-400">
+                                +{opp.clv.toFixed(2)}%
+                              </div>
+                              <div className="text-xs text-gray-500">
+                                {opp.entry_odds > 0 ? '+' : ''}{opp.entry_odds} → {opp.closing_odds > 0 ? '+' : ''}{opp.closing_odds}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Quick Stats */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-white/10">
+                      <div className="text-center">
+                        <div className="text-xs text-gray-400 mb-1">Best Book</div>
+                        <div className="text-sm font-medium text-blue-400">
+                          {Object.entries(report.by_bookmaker)
+                            .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0]?.[0] || 'N/A'}
+                        </div>
+                      </div>
+                      <div className="text-center">
+                        <div className="text-xs text-gray-400 mb-1">Best Market</div>
+                        <div className="text-sm font-medium text-purple-400">
+                          {Object.entries(report.by_market)
+                            .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0]?.[0] || 'N/A'}
+                        </div>
+                      </div>
+                      <div className="text-center">
+                        <div className="text-xs text-gray-400 mb-1">Median CLV</div>
+                        <div className={`text-sm font-medium ${report.median_clv > 0 ? 'text-green-400' : 'text-gray-400'}`}>
+                          {report.median_clv > 0 ? '+' : ''}{report.median_clv.toFixed(2)}%
+                        </div>
+                      </div>
+                      <div className="text-center">
+                        <div className="text-xs text-gray-400 mb-1">Hit Rate</div>
+                        <div className="text-sm font-medium text-cyan-400">
+                          {report.positive_clv_count}/{report.total_opportunities}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {dailyReports.length === 0 && (
+                  <div className="text-center py-12 text-gray-400">
+                    <p className="text-lg mb-2">No daily reports yet</p>
+                    <p className="text-sm">Reports are generated daily at 9:00 AM for completed games</p>
+                  </div>
+                )}
+              </div>
+            ) : gamesView === 'best-ev' ? (
               // Best +EV Opportunities Table
               <table className="w-full">
                 <thead>
