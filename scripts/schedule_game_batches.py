@@ -226,8 +226,8 @@ def main():
             scheduled_count += 1
 
         # Schedule BACKUP batch (25 min before game, 5 min after primary)
-        # Offset commence_time by 5 minutes to create backup batch
-        backup_commence_time = first_game.commence_time - timedelta(minutes=5)
+        # Offset commence_time by +5 minutes so batch runs 5 min after primary
+        backup_commence_time = first_game.commence_time + timedelta(minutes=5)
         if schedule_batch(backup_commence_time, first_game.id, batch_index * 2 + 1):
             scheduled_count += 1
             logger.info(f"  ↳ Backup batch scheduled 5 minutes after primary")

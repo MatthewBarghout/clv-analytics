@@ -98,10 +98,10 @@ class DailyCLVReportResponse(BaseModel):
     median_clv: Optional[float]
     positive_clv_count: int
     positive_clv_percentage: Optional[float]
-    best_opportunities: Optional[dict]
+    best_opportunities: Optional[list]
     by_bookmaker: Optional[dict]
     by_market: Optional[dict]
-    game_summaries: Optional[dict]
+    game_summaries: Optional[list]
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
