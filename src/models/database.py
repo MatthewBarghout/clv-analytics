@@ -267,3 +267,57 @@ class ClosingLine(Base):
             f"bookmaker_id={self.bookmaker_id}, market_type='{self.market_type}', "
             f"closed_at={self.closed_at})>"
         )
+
+
+class DailyCLVReport(Base):
+    """
+    Stores daily CLV analysis results for completed games.
+
+    This table aggregates CLV data for all games that completed on a given day,
+    providing historical tracking of betting performance and opportunity identification.
+    """
+
+    __tablename__ = "daily_clv_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    report_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, unique=True, index=True
+    )
+
+    # Overall statistics
+    games_analyzed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_opportunities: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_clv: Mapped[float] = mapped_column(nullable=True)
+    median_clv: Mapped[float] = mapped_column(nullable=True)
+    positive_clv_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    positive_clv_percentage: Mapped[float] = mapped_column(nullable=True)
+
+    # Best opportunities (JSONB array of top CLV opportunities)
+    # Format: [{"game_id": 1, "bookmaker": "Pinnacle", "market": "h2h", "outcome": "Lakers", "clv": 5.2, ...}]
+    best_opportunities: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    # Breakdown by bookmaker (JSONB object)
+    # Format: {"Pinnacle": {"avg_clv": 2.1, "count": 45}, "FanDuel": {...}}
+    by_bookmaker: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    # Breakdown by market type (JSONB object)
+    # Format: {"h2h": {"avg_clv": 1.8, "count": 30}, "spreads": {...}}
+    by_market: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    # Individual game summaries (JSONB array)
+    # Format: [{"game_id": 1, "home": "Lakers", "away": "Celtics", "avg_clv": 2.5, ...}]
+    game_summaries: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_daily_clv_reports_date", "report_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DailyCLVReport(id={self.id}, report_date={self.report_date}, "
+            f"games_analyzed={self.games_analyzed}, avg_clv={self.avg_clv})>"
+        )

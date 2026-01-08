@@ -212,20 +212,28 @@ def main():
 
     logger.info(f"Found {len(games)} games resulting in {len(batch_times)} unique batch times")
 
-    # Schedule one batch per unique time
+    # Schedule PRIMARY and BACKUP batch per unique time
+    # Backup runs 5 minutes later as failsafe for network issues
     scheduled_count = 0
     for batch_index, (batch_time_str, games_at_time) in enumerate(batch_times.items()):
         # Log all games for this batch time
         game_ids = [g.id for g in games_at_time]
         logger.info(f"Batch time {batch_time_str}: {len(games_at_time)} games (IDs: {game_ids})")
 
-        # Schedule using the first game's time (they're all the same batch time)
+        # Schedule PRIMARY batch (30 min before game)
         first_game = games_at_time[0]
-        if schedule_batch(first_game.commence_time, first_game.id, batch_index):
+        if schedule_batch(first_game.commence_time, first_game.id, batch_index * 2):
             scheduled_count += 1
 
+        # Schedule BACKUP batch (25 min before game, 5 min after primary)
+        # Offset commence_time by 5 minutes to create backup batch
+        backup_commence_time = first_game.commence_time - timedelta(minutes=5)
+        if schedule_batch(backup_commence_time, first_game.id, batch_index * 2 + 1):
+            scheduled_count += 1
+            logger.info(f"  ↳ Backup batch scheduled 5 minutes after primary")
+
     logger.info("=" * 60)
-    logger.info(f"Scheduled {scheduled_count} batches for {len(games)} games")
+    logger.info(f"Scheduled {scheduled_count} batches ({scheduled_count // 2} primary + {scheduled_count // 2} backup) for {len(games)} games")
     logger.info("=" * 60)
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src.collectors.odds_api_client import OddsAPIClient
 from src.collectors.odds_proccessor import OddsDataProcessor
+from src.utils.notifications import EmailNotifier
 
 # Setup logging
 logging.basicConfig(
@@ -214,11 +215,41 @@ def main():
     )
 
     args = parser.parse_args()
+    notifier = EmailNotifier()
 
     try:
         collect_nba_odds(closing_only=args.closing_only)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
+        # Send failure notification if this was a closing-only batch
+        if args.closing_only:
+            batch_time = datetime.now().strftime('%I:%M %p')
+            error_msg = str(e)
+
+            # Try to estimate games affected by checking database
+            try:
+                load_dotenv()
+                engine = create_engine(os.getenv("DATABASE_URL"))
+                Session = sessionmaker(bind=engine)
+                session = Session()
+
+                from src.models.database import Game
+                now = datetime.now(timezone.utc)
+                games_count = session.query(Game).filter(
+                    Game.commence_time >= now,
+                    Game.commence_time <= now + timedelta(hours=2)
+                ).count()
+                session.close()
+            except:
+                games_count = 0
+
+            notifier.send_collection_failure(
+                error_message=error_msg,
+                batch_time=batch_time,
+                games_affected=games_count
+            )
+
         sys.exit(1)
 
 

@@ -1,9 +1,11 @@
 import logging
+import time
 from typing import List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from requests.exceptions import ConnectionError, Timeout, RequestException
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +38,20 @@ class OddsAPIClient:
         Setup requests session with retry logic.
 
         Implements exponential backoff for transient failures:
-        - 3 retries total
-        - Backoff factor of 0.5 (0.5s, 1s, 2s)
+        - 5 retries total (increased from 3)
+        - Backoff factor of 1 (1s, 2s, 4s, 8s, 16s)
         - Retry on 500, 502, 503, 504 status codes
+        - Retry on connection and DNS errors
         """
         session = requests.Session()
 
-        # Configure retry strategy
+        # Configure retry strategy with connection error handling
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
+            total=5,  # More retries for network issues
+            backoff_factor=1,  # Longer waits (1s, 2s, 4s, 8s, 16s)
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET"],
+            raise_on_status=False,  # Don't raise on HTTP errors immediately
         )
 
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -153,6 +157,8 @@ class OddsAPIClient:
         """
         Make API request with error handling and rate limit checking.
 
+        Includes manual retry logic for connection/DNS errors that urllib3 doesn't handle.
+
         Args:
             endpoint: API endpoint path
             params: Query parameters
@@ -162,45 +168,78 @@ class OddsAPIClient:
 
         Raises:
             requests.exceptions.HTTPError: For 4xx/5xx responses
-            requests.exceptions.RequestException: For network errors
+            requests.exceptions.RequestException: For network errors after all retries
         """
         url = f"{self.base_url}{endpoint}"
+        max_retries = 5
+        base_delay = 2  # Start with 2 seconds
 
-        try:
-            logger.info(f"Making request to {endpoint}")
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Making request to {endpoint} (attempt {attempt + 1}/{max_retries})")
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
 
-            # Check rate limit from headers
-            remaining = response.headers.get("x-requests-remaining")
-            if remaining:
-                remaining_int = int(remaining)
-                self._check_rate_limit(remaining_int)
-                logger.info(f"API requests remaining: {remaining_int}")
+                # Check rate limit from headers
+                remaining = response.headers.get("x-requests-remaining")
+                if remaining:
+                    remaining_int = int(remaining)
+                    self._check_rate_limit(remaining_int)
+                    logger.info(f"API requests remaining: {remaining_int}")
 
-            # Wrap response in consistent format
-            # The Odds API returns JSON directly (list or object depending on endpoint)
-            # We wrap it with metadata for consistent access to rate limit info
-            return {
-                "data": response.json(),
-                "remaining_requests": int(remaining) if remaining else None,
-            }
+                # Wrap response in consistent format
+                # The Odds API returns JSON directly (list or object depending on endpoint)
+                # We wrap it with metadata for consistent access to rate limit info
+                return {
+                    "data": response.json(),
+                    "remaining_requests": int(remaining) if remaining else None,
+                }
 
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error for {endpoint}: {e}")
-            if e.response.status_code == 401:
-                logger.error("Invalid API key - check your ODDS_API_KEY in .env")
-            elif e.response.status_code == 429:
-                logger.error("Rate limit exceeded - wait before making more requests")
-            raise
+            except requests.exceptions.HTTPError as e:
+                # Don't retry client errors (4xx)
+                logger.error(f"HTTP error for {endpoint}: {e}")
+                if e.response.status_code == 401:
+                    logger.error("Invalid API key - check your ODDS_API_KEY in .env")
+                elif e.response.status_code == 429:
+                    logger.error("Rate limit exceeded - wait before making more requests")
+                raise
 
-        except requests.exceptions.Timeout:
-            logger.error(f"Request timeout for {endpoint}")
-            raise
+            except (ConnectionError, Timeout) as e:
+                # Retry on connection/DNS/timeout errors
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s, 16s, 32s
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed for {endpoint}: {e}")
-            raise
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Connection error for {endpoint}: {e}. "
+                        f"Retrying in {delay}s... (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(
+                        f"Connection error for {endpoint} after {max_retries} attempts: {e}"
+                    )
+                    raise
+
+            except RequestException as e:
+                # Other request errors - retry with backoff
+                delay = base_delay * (2 ** attempt)
+
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Request error for {endpoint}: {e}. "
+                        f"Retrying in {delay}s... (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(
+                        f"Request failed for {endpoint} after {max_retries} attempts: {e}"
+                    )
+                    raise
+
+        # Should never reach here, but just in case
+        raise RequestException(f"Failed to make request to {endpoint} after {max_retries} attempts")
 
     def _check_rate_limit(self, remaining: int) -> None:
         """
