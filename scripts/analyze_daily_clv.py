@@ -16,6 +16,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, select
@@ -123,12 +124,20 @@ class DailyCLVAnalyzer:
 
     def analyze_date(self, report_date: datetime) -> DailyCLVReport:
         """Analyze all games for a specific date and create a report."""
-        # Define date range (games that commenced on this day)
-        start_date = report_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = start_date + timedelta(days=1)
+        # Define date range using EST (games that commenced on this day in Eastern time)
+        # NBA games are primarily in EST/PST, so use EST as the canonical "game date"
+        eastern = ZoneInfo("America/New_York")
+
+        # Get midnight EST for this date
+        start_date_local = datetime.combine(report_date.date(), datetime.min.time())
+        start_date_local = start_date_local.replace(tzinfo=eastern)
+
+        # Convert to UTC for database query
+        start_date = start_date_local.astimezone(timezone.utc)
+        end_date = (start_date_local + timedelta(days=1)).astimezone(timezone.utc)
 
         logger.info("=" * 80)
-        logger.info(f"ANALYZING CLV FOR {start_date.date()}")
+        logger.info(f"ANALYZING CLV FOR {start_date_local.date()} (Eastern Time)")
         logger.info("=" * 80)
 
         # Get completed games
@@ -208,8 +217,9 @@ class DailyCLVAnalyzer:
         best_opportunities = sorted(all_opportunities, key=lambda x: x["clv"], reverse=True)[:10]
 
         # Create report
+        # Store report_date as midnight EST converted to UTC for consistency
         report = DailyCLVReport(
-            report_date=start_date,
+            report_date=start_date_local.replace(hour=0, minute=0, second=0, microsecond=0),
             games_analyzed=len(games),
             total_opportunities=total,
             avg_clv=sum(clv_values) / total,

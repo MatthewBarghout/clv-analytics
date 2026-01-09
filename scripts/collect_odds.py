@@ -143,12 +143,24 @@ def collect_nba_odds(closing_only: bool = False):
                     # Get the game from database
                     from sqlalchemy import select
 
-                    from src.models.database import Bookmaker, Game
+                    from src.models.database import Bookmaker, Game, Team
 
-                    # Find the game we just created/updated
+                    # Find teams by name to get correct game (multiple games can start at same time)
+                    home_team_obj = session.execute(
+                        select(Team).where(Team.name == home_team)
+                    ).scalar_one_or_none()
+                    away_team_obj = session.execute(
+                        select(Team).where(Team.name == away_team)
+                    ).scalar_one_or_none()
+
+                    # Find the game matching teams and time
                     stmt = (
                         select(Game)
-                        .where(Game.commence_time == commence_time)
+                        .where(
+                            Game.commence_time == commence_time,
+                            Game.home_team_id == home_team_obj.id if home_team_obj else None,
+                            Game.away_team_id == away_team_obj.id if away_team_obj else None,
+                        )
                         .order_by(Game.id.desc())
                         .limit(1)
                     )
