@@ -54,6 +54,9 @@ class GameWithCLV(BaseModel):
     snapshots_count: int
     closing_lines_count: int
     avg_clv: Optional[float]
+    home_score: Optional[int] = None
+    away_score: Optional[int] = None
+    winner: Optional[str] = None
 
 
 class CLVHistoryPoint(BaseModel):
@@ -102,6 +105,16 @@ class DailyCLVReportResponse(BaseModel):
     by_bookmaker: Optional[dict]
     by_market: Optional[dict]
     game_summaries: Optional[list]
+
+    # Performance tracking
+    settled_count: Optional[int]
+    win_count: Optional[int]
+    loss_count: Optional[int]
+    push_count: Optional[int]
+    hypothetical_profit: Optional[float]
+    win_rate: Optional[float]
+    roi: Optional[float]
+
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

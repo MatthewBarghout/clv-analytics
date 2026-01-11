@@ -23,7 +23,7 @@ from src.api.schemas import (
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, Sport, Team
+from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, Sport, Team
 
 # Load environment variables
 load_dotenv()
@@ -197,6 +197,9 @@ async def get_games(limit: int = 50):
             # Get away team name
             away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
 
+            # Get betting outcome (score) if available
+            betting_outcome = db.query(BettingOutcome).filter(BettingOutcome.game_id == game.id).first()
+
             # Calculate CLV for this game
             avg_game_clv = None
             if closing_lines_count > 0:
@@ -247,6 +250,9 @@ async def get_games(limit: int = 50):
                     snapshots_count=snapshots_count,
                     closing_lines_count=closing_lines_count,
                     avg_clv=avg_game_clv,
+                    home_score=betting_outcome.home_score if betting_outcome else None,
+                    away_score=betting_outcome.away_score if betting_outcome else None,
+                    winner=betting_outcome.winner if betting_outcome else None,
                 )
             )
 

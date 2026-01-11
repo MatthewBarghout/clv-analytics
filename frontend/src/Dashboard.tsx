@@ -50,6 +50,9 @@ interface GameWithCLV {
   snapshots_count: number;
   closing_lines_count: number;
   avg_clv: number | null;
+  home_score?: number | null;
+  away_score?: number | null;
+  winner?: string | null;
 }
 
 interface MLModelStats {
@@ -96,6 +99,14 @@ interface DailyCLVReport {
   median_clv: number;
   positive_clv_count: number;
   positive_clv_percentage: number;
+  // Performance tracking
+  settled_count?: number;
+  win_count?: number;
+  loss_count?: number;
+  push_count?: number;
+  hypothetical_profit?: number;
+  win_rate?: number;
+  roi?: number;
   best_opportunities: Array<{
     game_id: number;
     bookmaker: string;
@@ -745,6 +756,58 @@ export default function Dashboard() {
                       </div>
                     </div>
 
+                    {/* Profit Tracking Stats - Only show if we have settled bets */}
+                    {report.settled_count !== undefined && report.settled_count > 0 && (
+                      <div className="mt-4 p-4 bg-gradient-to-r from-purple-500/10 to-blue-500/10 rounded-lg border border-purple-500/20">
+                        <h4 className="text-sm font-semibold text-purple-300 mb-3 uppercase tracking-wider flex items-center gap-2">
+                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M8.433 7.418c.155-.103.346-.196.567-.267v1.698a2.305 2.305 0 01-.567-.267C8.07 8.34 8 8.114 8 8c0-.114.07-.34.433-.582zM11 12.849v-1.698c.22.071.412.164.567.267.364.243.433.468.433.582 0 .114-.07.34-.433.582a2.305 2.305 0 01-.567.267z" />
+                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v.092a4.535 4.535 0 00-1.676.662C6.602 6.234 6 7.009 6 8c0 .99.602 1.765 1.324 2.246.48.32 1.054.545 1.676.662v1.941c-.391-.127-.68-.317-.843-.504a1 1 0 10-1.51 1.31c.562.649 1.413 1.076 2.353 1.253V15a1 1 0 102 0v-.092a4.535 4.535 0 001.676-.662C13.398 13.766 14 12.991 14 12c0-.99-.602-1.765-1.324-2.246A4.535 4.535 0 0011 9.092V7.151c.391.127.68.317.843.504a1 1 0 101.511-1.31c-.563-.649-1.413-1.076-2.354-1.253V5z" clipRule="evenodd" />
+                          </svg>
+                          Hypothetical Performance ($100 per bet)
+                        </h4>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400 mb-1">Win Rate</div>
+                            <div className="text-xl font-bold text-white">
+                              {report.win_rate?.toFixed(1)}%
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1">
+                              {report.win_count}W-{report.loss_count}L
+                              {report.push_count! > 0 && `-${report.push_count}P`}
+                            </div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400 mb-1">Settled</div>
+                            <div className="text-xl font-bold text-white">
+                              {report.settled_count}/{report.total_opportunities}
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1">
+                              {((report.settled_count / report.total_opportunities) * 100).toFixed(0)}% complete
+                            </div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400 mb-1">Profit/Loss</div>
+                            <div className={`text-xl font-bold ${(report.hypothetical_profit || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {(report.hypothetical_profit || 0) >= 0 ? '+' : ''}${report.hypothetical_profit?.toFixed(2)}
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1">
+                              ${(report.settled_count * 100).toLocaleString()} wagered
+                            </div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400 mb-1">ROI</div>
+                            <div className={`text-xl font-bold ${(report.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {(report.roi || 0) >= 0 ? '+' : ''}{report.roi?.toFixed(2)}%
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1">
+                              return on investment
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Top 3 Best Opportunities */}
                     <div className="mt-4">
                       <h4 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wider">
@@ -967,9 +1030,21 @@ export default function Dashboard() {
                       title={gamesView === 'history' ? 'Click to view analysis' : 'Click to view detailed betting lines'}
                     >
                     <td className="py-4 px-4">
-                      <span className="font-medium text-white">
-                        {game.away_team} @ {game.home_team}
-                      </span>
+                      <div className="font-medium text-white">
+                        <div>{game.away_team} @ {game.home_team}</div>
+                        {game.home_score !== null && game.away_score !== null && (
+                          <div className="text-sm mt-1">
+                            <span className="text-gray-400">Final: </span>
+                            <span className={`font-bold ${game.winner === 'away' ? 'text-green-400' : 'text-gray-300'}`}>
+                              {game.away_score}
+                            </span>
+                            <span className="text-gray-500"> - </span>
+                            <span className={`font-bold ${game.winner === 'home' ? 'text-green-400' : 'text-gray-300'}`}>
+                              {game.home_score}
+                            </span>
+                          </div>
+                        )}
+                      </div>
                     </td>
                     <td className="py-4 px-4 text-gray-300 text-sm">
                       {new Date(game.commence_time).toLocaleString('en-US', {
