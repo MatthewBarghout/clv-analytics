@@ -105,6 +105,7 @@ class DailyCLVReportResponse(BaseModel):
     by_bookmaker: Optional[dict]
     by_market: Optional[dict]
     game_summaries: Optional[list]
+    ev_opportunities: Optional[list]
 
     # Performance tracking
     settled_count: Optional[int]

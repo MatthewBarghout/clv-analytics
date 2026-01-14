@@ -170,15 +170,37 @@ launchd/            # macOS scheduling configs
 start.sh            # Launch backend + frontend
 ```
 
+## Automated Daily Reporting
+
+The system generates comprehensive daily reports at 9 AM showing previous day's performance with complete ROI tracking.
+
+**Daily Report Includes:**
+- CLV analysis for all completed games
+- Top 10 best betting opportunities by CLV percentage
+- Detailed bet tracking with win/loss results and profit calculations
+- Performance metrics: win rate, total profit, ROI percentage
+- Breakdown by bookmaker and market type
+- ML-predicted +EV opportunities for upcoming games
+
+**Automation Schedule:**
+- 2:00 AM - Fetch final game scores
+- 3:00 AM - Calculate ROI on tracked bets
+- 9:00 AM - Generate daily report with full performance breakdown
+- 9:30 AM - Track new opportunities from report
+- 10:30 AM - Schedule closing line collection batches
+
+The workflow eliminates manual tracking and provides immediate performance feedback on yesterday's betting opportunities.
+
 ## Roadmap
 
-- [x] ML model to predict line movement ✅
-- [ ] Bet tracking + P&L analysis
+- [x] ML model to predict line movement
+- [x] Automated daily CLV reports with ROI tracking
+- [x] Bet performance tracking and settlement
+- [ ] Direct book scraping (Kalshi, Polymarket) for higher frequency data
 - [ ] Arbitrage opportunity detection
 - [ ] Kelly Criterion position sizing
-- [ ] Live odds monitoring
-- [ ] Enhanced ML features (weather, injuries, news sentiment)
-- [ ] Real-time prediction updates as lines move
+- [ ] Enhanced ML model tuning
+- [ ] Live odds monitoring with real-time alerts
 
 ## Results
 
