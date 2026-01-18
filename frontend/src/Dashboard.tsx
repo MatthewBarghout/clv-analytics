@@ -120,6 +120,26 @@ interface DailyCLVReport {
   by_market: Record<string, { avg_clv: number; count: number; positive_count: number }>;
 }
 
+interface TrackedOpportunity {
+  id: number;
+  game_id: number;
+  home_team: string;
+  away_team: string;
+  home_score: number | null;
+  away_score: number | null;
+  bookmaker: string;
+  market_type: string;
+  outcome_name: string;
+  point_line: number | null;  // Spread or total line
+  entry_odds: number;
+  closing_odds: number;
+  clv_percentage: number;
+  bet_amount: number;
+  result: 'win' | 'loss' | 'push' | 'pending';
+  profit_loss: number | null;
+  settled_at: string | null;
+}
+
 const API_BASE = 'http://localhost:8000/api';
 
 export default function Dashboard() {
@@ -138,6 +158,9 @@ export default function Dashboard() {
   const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
   const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
   const [dailyReports, setDailyReports] = useState<DailyCLVReport[]>([]);
+  const [expandedReportId, setExpandedReportId] = useState<number | null>(null);
+  const [trackedOpportunities, setTrackedOpportunities] = useState<TrackedOpportunity[]>([]);
+  const [loadingOpportunities, setLoadingOpportunities] = useState(false);
 
   useEffect(() => {
     fetchData();
@@ -160,6 +183,32 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error('Error fetching daily reports:', err);
+    }
+  };
+
+  const fetchTrackedOpportunities = async (reportId: number) => {
+    try {
+      setLoadingOpportunities(true);
+      const res = await fetch(`${API_BASE}/daily-reports/${reportId}/opportunities`);
+      if (res.ok) {
+        const data = await res.json();
+        setTrackedOpportunities(data.opportunities || []);
+      }
+    } catch (err) {
+      console.error('Error fetching tracked opportunities:', err);
+      setTrackedOpportunities([]);
+    } finally {
+      setLoadingOpportunities(false);
+    }
+  };
+
+  const toggleReportExpanded = (reportId: number) => {
+    if (expandedReportId === reportId) {
+      setExpandedReportId(null);
+      setTrackedOpportunities([]);
+    } else {
+      setExpandedReportId(reportId);
+      fetchTrackedOpportunities(reportId);
     }
   };
 
@@ -872,6 +921,127 @@ export default function Dashboard() {
                         </div>
                       </div>
                     </div>
+
+                    {/* View Tracked Bets Button */}
+                    {report.settled_count !== undefined && report.settled_count > 0 && (
+                      <div className="mt-4 pt-4 border-t border-white/10">
+                        <button
+                          onClick={() => toggleReportExpanded(report.id)}
+                          className={`w-full px-4 py-3 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 ${
+                            expandedReportId === report.id
+                              ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50'
+                              : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+                          }`}
+                        >
+                          <svg
+                            className={`w-4 h-4 transition-transform duration-200 ${expandedReportId === report.id ? 'rotate-180' : ''}`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                          {expandedReportId === report.id ? 'Hide Tracked Bets' : `View ${report.settled_count} Tracked Bets`}
+                        </button>
+
+                        {/* Expanded Tracked Opportunities */}
+                        {expandedReportId === report.id && (
+                          <div className="mt-4">
+                            {loadingOpportunities ? (
+                              <div className="text-center py-8">
+                                <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-purple-500 mx-auto"></div>
+                                <p className="text-gray-400 mt-2 text-sm">Loading tracked bets...</p>
+                              </div>
+                            ) : trackedOpportunities.length > 0 ? (
+                              <div className="space-y-2">
+                                <h4 className="text-sm font-semibold text-purple-300 mb-3 uppercase tracking-wider">
+                                  Tracked Bet Results
+                                </h4>
+                                {trackedOpportunities.map((opp) => (
+                                  <div
+                                    key={opp.id}
+                                    className={`flex items-center justify-between rounded-lg p-3 border ${
+                                      opp.result === 'win'
+                                        ? 'bg-green-500/10 border-green-500/30'
+                                        : opp.result === 'loss'
+                                        ? 'bg-red-500/10 border-red-500/30'
+                                        : opp.result === 'push'
+                                        ? 'bg-gray-500/10 border-gray-500/30'
+                                        : 'bg-white/5 border-white/10'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-3">
+                                      {/* Result Icon */}
+                                      <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
+                                        opp.result === 'win'
+                                          ? 'bg-green-500/30 border border-green-500/50'
+                                          : opp.result === 'loss'
+                                          ? 'bg-red-500/30 border border-red-500/50'
+                                          : opp.result === 'push'
+                                          ? 'bg-gray-500/30 border border-gray-500/50'
+                                          : 'bg-yellow-500/30 border border-yellow-500/50'
+                                      }`}>
+                                        {opp.result === 'win' ? (
+                                          <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 20 20">
+                                            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                                          </svg>
+                                        ) : opp.result === 'loss' ? (
+                                          <svg className="w-4 h-4 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                                            <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                                          </svg>
+                                        ) : opp.result === 'push' ? (
+                                          <span className="text-gray-400 font-bold text-sm">=</span>
+                                        ) : (
+                                          <span className="text-yellow-400 font-bold text-sm">?</span>
+                                        )}
+                                      </div>
+                                      <div>
+                                        <div className="text-sm font-medium text-white">
+                                          {opp.away_team} @ {opp.home_team}
+                                          {opp.home_score !== null && opp.away_score !== null && (
+                                            <span className="text-gray-400 ml-2">
+                                              ({opp.away_score} - {opp.home_score})
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-xs text-gray-400">
+                                          {opp.bookmaker} • {opp.market_type} • {opp.outcome_name}
+                                          {opp.point_line !== null && (
+                                            <span className="text-blue-400 ml-1">
+                                              {opp.market_type === 'spreads'
+                                                ? `(${opp.point_line > 0 ? '+' : ''}${opp.point_line})`
+                                                : `(${opp.point_line})`}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <div className="text-right">
+                                      <div className={`text-lg font-bold ${
+                                        opp.profit_loss !== null && opp.profit_loss >= 0 ? 'text-green-400' : 'text-red-400'
+                                      }`}>
+                                        {opp.profit_loss !== null ? (
+                                          `${opp.profit_loss >= 0 ? '+' : ''}$${opp.profit_loss.toFixed(2)}`
+                                        ) : (
+                                          'Pending'
+                                        )}
+                                      </div>
+                                      <div className="text-xs text-gray-500">
+                                        CLV: +{opp.clv_percentage.toFixed(2)}% | {opp.entry_odds > 0 ? '+' : ''}{opp.entry_odds}
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-center py-8 text-gray-400">
+                                <p>No tracked opportunities found for this report</p>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
                 {dailyReports.length === 0 && (

@@ -114,6 +114,7 @@ class DailyCLVAnalyzer:
             # Calculate CLV for each outcome
             for outcome in snapshot.outcomes:
                 team_name = outcome.get("name")
+                point_line = outcome.get("point")  # Spread or total line (e.g., -5.5, 220.5)
                 entry_odds = self.calc._extract_odds_for_team(snapshot.outcomes, team_name)
                 closing_odds = self.calc._extract_odds_for_team(closing_line.outcomes, team_name)
 
@@ -128,6 +129,7 @@ class DailyCLVAnalyzer:
                         "entry_odds": entry_odds,
                         "closing_odds": closing_odds,
                         "clv": clv,
+                        "point_line": point_line,  # For spreads/totals settlement
                         "timestamp": snapshot.timestamp.isoformat(),
                     })
 

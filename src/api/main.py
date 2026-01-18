@@ -23,7 +23,7 @@ from src.api.schemas import (
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, Sport, Team
+from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team
 
 # Load environment variables
 load_dotenv()
@@ -641,6 +641,72 @@ async def get_daily_report(report_date: str):
         raise
     except Exception as e:
         logger.error(f"Error fetching daily report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/daily-reports/{report_id}/opportunities")
+async def get_report_opportunities(report_id: int):
+    """Get tracked opportunities with their results for a specific daily report."""
+    db = get_db()
+
+    try:
+        # Get the report
+        report = db.get(DailyCLVReport, report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+
+        # Get all tracked opportunities for this report
+        stmt = (
+            select(OpportunityPerformance, Game)
+            .join(Game, Game.id == OpportunityPerformance.game_id)
+            .where(OpportunityPerformance.report_id == report_id)
+            .order_by(OpportunityPerformance.clv_percentage.desc())
+        )
+
+        results = db.execute(stmt).all()
+
+        opportunities = []
+        for opp, game in results:
+            # Get team names
+            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
+            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+
+            # Get betting outcome for final score
+            outcome = db.query(BettingOutcome).filter(BettingOutcome.game_id == game.id).first()
+
+            opportunities.append({
+                "id": opp.id,
+                "game_id": opp.game_id,
+                "home_team": home_team.name if home_team else "Unknown",
+                "away_team": away_team.name if away_team else "Unknown",
+                "home_score": outcome.home_score if outcome else None,
+                "away_score": outcome.away_score if outcome else None,
+                "bookmaker": opp.bookmaker,
+                "market_type": opp.market_type,
+                "outcome_name": opp.outcome_name,
+                "point_line": opp.point_line,  # Spread/total line
+                "entry_odds": opp.entry_odds,
+                "closing_odds": opp.closing_odds,
+                "clv_percentage": opp.clv_percentage,
+                "bet_amount": opp.bet_amount,
+                "result": opp.result,
+                "profit_loss": opp.profit_loss,
+                "settled_at": opp.settled_at.isoformat() if opp.settled_at else None,
+            })
+
+        return {
+            "report_id": report_id,
+            "report_date": report.report_date.isoformat(),
+            "total_opportunities": len(opportunities),
+            "opportunities": opportunities,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching report opportunities: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
