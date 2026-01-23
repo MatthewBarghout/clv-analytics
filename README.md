@@ -31,7 +31,7 @@ The goal: prove you can identify +EV opportunities before the market corrects.
 - SQLAlchemy 2.0 - ORM with proper indexing for time-series queries
 - PostgreSQL - JSONB for flexible odds storage
 - Alembic - Database migrations
-- scikit-learn - Machine learning for closing line prediction
+- XGBoost + scikit-learn - Ensemble ML for line movement prediction
 
 **Frontend:**
 - React + TypeScript - Type-safe component architecture
@@ -57,7 +57,7 @@ cp .env.example .env
 poetry install
 
 # Train ML model (optional, enables predictions)
-poetry run python scripts/train_model.py
+poetry run python -m scripts.train_movement_model
 
 # Start backend + frontend
 ./start.sh
@@ -69,18 +69,26 @@ API Docs: http://localhost:8000/docs
 ## Key Features
 
 ### Automated Data Collection
-Scheduled jobs collect NBA odds from 4 major sportsbooks (Pinnacle, FanDuel, DraftKings, ESPNbet) at opening and closing. Handles rate limiting, retries, and stores 3 market types (moneyline, spreads, totals).
+Scheduled jobs collect NBA odds from 4 major sportsbooks (Pinnacle, FanDuel, DraftKings, theScore Bet) at opening and closing. Dynamic scheduler creates launchd batches 30 minutes before each game to capture closing lines. Handles rate limiting, retries, and stores 3 market types (moneyline, spreads, totals).
 
 ### CLV Calculation Engine
 Converts decimal odds to implied probabilities, compares entry vs closing, outputs percentage edge. Aggregates by bookmaker and market type to identify the sharpest books.
 
 ### Machine Learning Predictions
-Random Forest model predicts closing line odds from opening snapshots. Trained on historical data to forecast line movement before games start.
+Ensemble model (XGBoost + Random Forest) predicts line movement direction and magnitude. Identifies +EV opportunities by forecasting which lines will move favorably before games start.
 
 **Model Performance:**
-- R² Score: 0.9936 (99.36% accuracy)
-- MAE: 0.0167 (average error < 2%)
-- Feature Importance: Opening odds (95.5%), hours-to-game (3.8%), time factors (0.7%)
+- Direction Accuracy: 65.1% (vs 40.7% baseline)
+- MAE: 0.0496 (price movement prediction)
+- R² Score: 0.58
+- Improvement vs Baseline: 22.9%
+
+**Top Features:**
+- Consensus line (13.9%)
+- Opening price (12.1%)
+- Line spread (8.4%)
+- Distance from consensus (6.2%)
+- Hours to game (4.7%)
 
 **API Endpoints:**
 - `GET /api/ml/stats` - Model performance metrics
@@ -88,7 +96,7 @@ Random Forest model predicts closing line odds from opening snapshots. Trained o
 - `POST /api/ml/retrain` - Retrain with latest data
 - `GET /api/ml/feature-importance` - Feature importance rankings
 
-Use predictions to identify opportunities where current odds differ significantly from projected closing lines.
+Use predictions to identify +EV opportunities where the model predicts favorable line movement.
 
 ### Performance Dashboard
 - **Mean CLV** - Overall edge across all analyzed bets
@@ -114,16 +122,15 @@ calc = CLVCalculator()
 clv = calc.calculate_clv(entry_odds=2.1, closing_odds=1.95)
 # Returns: +3.66%
 
-# Predict closing line from opening odds
-from src.analyzers.ml_predictor import ClosingLinePredictor
-from src.analyzers.features import FeatureEngineer
+# Predict line movement direction
+from src.analyzers.movement_predictor import LineMovementPredictor
 
-predictor = ClosingLinePredictor()
-predictor.load_model("models/closing_line_predictor.pkl")
+predictor = LineMovementPredictor()
+predictor.load_model("models/line_movement_predictor.pkl")
 
-# Get prediction for a new snapshot
-predicted_closing = predictor.predict_closing_line(snapshot, game)
-# Returns: -108 (predicted closing odds)
+# Get prediction for current odds
+direction, magnitude, confidence = predictor.predict(features)
+# Returns: ("UP", 0.15, 0.73) - line moving up 15% with 73% confidence
 ```
 
 ## Why This Matters
@@ -133,7 +140,7 @@ Most retail bettors chase wins. Sharp bettors chase CLV.
 This system proves I understand:
 - **Market efficiency** - Closing lines are the best estimate of true odds
 - **Edge detection** - Consistent +CLV = long-term profit
-- **Machine learning** - Predictive models for market movement (99.36% R² on closing line predictions)
+- **Machine learning** - Ensemble models predicting line movement (65% accuracy, 23% improvement over baseline)
 - **Data engineering** - Proper schema design for analytical workloads
 - **Systematic thinking** - Automation > manual processes
 
@@ -149,21 +156,30 @@ src/
 ├── analyzers/        # Analytics & ML
 │   ├── clv_calculator.py # CLV calculation logic
 │   ├── features.py   # ML feature engineering
-│   └── ml_predictor.py # Random Forest model
-├── collectors/       # Odds API client + data processor
-└── models/           # SQLAlchemy database models
+│   ├── movement_predictor.py # Ensemble line movement model
+│   └── bet_settlement.py # Bet outcome tracking
+├── collectors/       # Data collection
+│   ├── odds_api_client.py # The Odds API client
+│   ├── odds_proccessor.py # Data processing & storage
+│   └── nba_scores_client.py # NBA.com scores fetcher
+├── models/           # SQLAlchemy database models
+└── utils/            # Utilities (notifications, etc.)
 
 frontend/
 └── src/
     └── Dashboard.tsx # React analytics dashboard w/ ML metrics
 
 scripts/
-├── collect_odds.py   # Main collection script
-├── train_model.py    # ML model training
-└── start_dashboard.sh # One-command startup
+├── collect_odds.py          # Odds collection (opening + closing)
+├── schedule_game_batches.py # Dynamic launchd scheduler
+├── analyze_daily_clv.py     # Daily CLV report generation
+├── fetch_game_scores.py     # NBA score fetching
+├── train_movement_model.py  # ML model training
+├── track_opportunity_performance.py # Bet tracking
+└── update_report_profit_stats.py    # ROI calculations
 
 models/              # Trained ML models (git-ignored)
-├── closing_line_predictor.pkl
+└── line_movement_predictor.pkl
 
 migrations/          # Alembic database migrations
 launchd/            # macOS scheduling configs
@@ -196,10 +212,11 @@ The workflow eliminates manual tracking and provides immediate performance feedb
 - [x] ML model to predict line movement
 - [x] Automated daily CLV reports with ROI tracking
 - [x] Bet performance tracking and settlement
+- [x] Enhanced ML model (XGBoost + Random Forest ensemble)
+- [x] Dynamic game-time batch scheduling
 - [ ] Direct book scraping (Kalshi, Polymarket) for higher frequency data
 - [ ] Arbitrage opportunity detection
 - [ ] Kelly Criterion position sizing
-- [ ] Enhanced ML model tuning
 - [ ] Live odds monitoring with real-time alerts
 
 ## Results
