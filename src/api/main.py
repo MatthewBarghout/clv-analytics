@@ -23,7 +23,7 @@ from src.api.schemas import (
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team
+from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team, UserBet
 
 # Load environment variables
 load_dotenv()
@@ -712,6 +712,130 @@ async def get_report_opportunities(report_id: int):
         db.close()
 
 
+@app.get("/api/bankroll-simulation")
+async def get_bankroll_simulation(
+    bet_size: float = 100.0,
+    starting_bankroll: float = 10000.0,
+):
+    """Get bankroll simulation data with P&L curves and drawdown analysis.
+
+    Args:
+        bet_size: Amount wagered per bet (default $100)
+        starting_bankroll: Starting bankroll amount (default $10,000)
+    """
+    db = get_db()
+
+    try:
+        # Get all settled opportunities ordered by settlement date
+        stmt = (
+            select(OpportunityPerformance, Game, DailyCLVReport)
+            .join(Game, Game.id == OpportunityPerformance.game_id)
+            .join(DailyCLVReport, DailyCLVReport.id == OpportunityPerformance.report_id)
+            .where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
+            .order_by(OpportunityPerformance.settled_at.asc())
+        )
+
+        results = db.execute(stmt).all()
+
+        if not results:
+            return {
+                "has_data": False,
+                "message": "No settled bets found for simulation",
+                "data_points": [],
+                "summary": {},
+            }
+
+        # Build cumulative P&L curve
+        data_points = []
+        cumulative_pl = 0.0
+        peak_bankroll = starting_bankroll
+        max_drawdown = 0.0
+        max_drawdown_pct = 0.0
+        current_drawdown = 0.0
+        win_count = 0
+        loss_count = 0
+        push_count = 0
+
+        for opp, game, report in results:
+            # Calculate profit/loss for this bet
+            # Odds are stored as decimal odds (e.g., 2.01, 1.95)
+            if opp.result == "win":
+                profit = bet_size * (opp.entry_odds - 1)
+                win_count += 1
+            elif opp.result == "loss":
+                profit = -bet_size
+                loss_count += 1
+            else:  # push
+                profit = 0
+                push_count += 1
+
+            cumulative_pl += profit
+            current_bankroll = starting_bankroll + cumulative_pl
+
+            # Track peak and drawdown
+            if current_bankroll > peak_bankroll:
+                peak_bankroll = current_bankroll
+                current_drawdown = 0.0
+            else:
+                current_drawdown = peak_bankroll - current_bankroll
+                if current_drawdown > max_drawdown:
+                    max_drawdown = current_drawdown
+                    max_drawdown_pct = (current_drawdown / peak_bankroll) * 100
+
+            # Get team names
+            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
+            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+
+            data_points.append({
+                "date": opp.settled_at.isoformat() if opp.settled_at else report.report_date.isoformat(),
+                "game_date": game.commence_time.strftime("%Y-%m-%d") if game.commence_time else None,
+                "bet_number": len(data_points) + 1,
+                "cumulative_pl": round(cumulative_pl, 2),
+                "bankroll": round(current_bankroll, 2),
+                "drawdown": round(current_drawdown, 2),
+                "drawdown_pct": round((current_drawdown / peak_bankroll) * 100 if peak_bankroll > 0 else 0, 2),
+                "result": opp.result,
+                "profit": round(profit, 2),
+                "game": f"{away_team.name if away_team else 'Unknown'} @ {home_team.name if home_team else 'Unknown'}",
+                "bookmaker": opp.bookmaker,
+                "outcome": opp.outcome_name,
+                "market": opp.market_type,
+                "odds": opp.entry_odds,
+                "closing_odds": opp.closing_odds,
+                "clv": round(opp.clv_percentage, 2),
+            })
+
+        total_bets = win_count + loss_count + push_count
+        total_wagered = total_bets * bet_size
+
+        return {
+            "has_data": True,
+            "data_points": data_points,
+            "summary": {
+                "starting_bankroll": starting_bankroll,
+                "ending_bankroll": round(starting_bankroll + cumulative_pl, 2),
+                "total_profit_loss": round(cumulative_pl, 2),
+                "roi_pct": round((cumulative_pl / total_wagered) * 100, 2) if total_wagered > 0 else 0,
+                "total_bets": total_bets,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "push_count": push_count,
+                "win_rate": round((win_count / (win_count + loss_count)) * 100, 2) if (win_count + loss_count) > 0 else 0,
+                "max_drawdown": round(max_drawdown, 2),
+                "max_drawdown_pct": round(max_drawdown_pct, 2),
+                "bet_size": bet_size,
+                "total_wagered": round(total_wagered, 2),
+                "peak_bankroll": round(peak_bankroll, 2),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error running bankroll simulation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
 @app.get("/api/games/{game_id}/score")
 async def get_game_score(game_id: int):
     """Get the final score for a completed game."""
@@ -810,6 +934,245 @@ async def get_game_score(game_id: int):
 
     except Exception as e:
         logger.error(f"Error getting score for game {game_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# ============================================================================
+# User Bet Tracking Endpoints
+# ============================================================================
+
+@app.get("/api/user-bets")
+async def get_user_bets(status: str = None):
+    """Get all user bets, optionally filtered by status."""
+    db = get_db()
+
+    try:
+        stmt = select(UserBet).order_by(UserBet.game_date.desc())
+
+        if status:
+            stmt = stmt.where(UserBet.result == status)
+
+        bets = db.execute(stmt).scalars().all()
+
+        return [
+            {
+                "id": bet.id,
+                "game_description": bet.game_description,
+                "game_date": bet.game_date.isoformat(),
+                "bookmaker": bet.bookmaker,
+                "market_type": bet.market_type,
+                "bet_description": bet.bet_description,
+                "odds": bet.odds,
+                "stake": bet.stake,
+                "result": bet.result,
+                "profit_loss": bet.profit_loss,
+                "closing_odds": bet.closing_odds,
+                "clv_percentage": bet.clv_percentage,
+                "notes": bet.notes,
+                "created_at": bet.created_at.isoformat(),
+                "settled_at": bet.settled_at.isoformat() if bet.settled_at else None,
+            }
+            for bet in bets
+        ]
+
+    except Exception as e:
+        logger.error(f"Error fetching user bets: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/user-bets")
+async def create_user_bet(
+    game_description: str,
+    game_date: str,
+    bookmaker: str,
+    market_type: str,
+    bet_description: str,
+    odds: int,
+    stake: float = 100.0,
+    notes: str = None,
+):
+    """Create a new user bet."""
+    db = get_db()
+
+    try:
+        # Parse date
+        parsed_date = datetime.fromisoformat(game_date.replace('Z', '+00:00'))
+
+        bet = UserBet(
+            game_description=game_description,
+            game_date=parsed_date,
+            bookmaker=bookmaker,
+            market_type=market_type,
+            bet_description=bet_description,
+            odds=odds,
+            stake=stake,
+            notes=notes,
+            result="pending",
+        )
+
+        db.add(bet)
+        db.commit()
+        db.refresh(bet)
+
+        return {
+            "id": bet.id,
+            "message": "Bet created successfully",
+            "bet": {
+                "game_description": bet.game_description,
+                "bet_description": bet.bet_description,
+                "odds": bet.odds,
+                "stake": bet.stake,
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating user bet: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.put("/api/user-bets/{bet_id}")
+async def update_user_bet(
+    bet_id: int,
+    result: str = None,
+    closing_odds: int = None,
+    notes: str = None,
+    stake: float = None,
+):
+    """Update a user bet (settle it or add notes)."""
+    db = get_db()
+
+    try:
+        bet = db.get(UserBet, bet_id)
+        if not bet:
+            raise HTTPException(status_code=404, detail="Bet not found")
+
+        if stake is not None:
+            bet.stake = stake
+
+        if result:
+            bet.result = result
+            if result == "pending":
+                # Revert to pending
+                bet.settled_at = None
+                bet.profit_loss = None
+            else:
+                bet.settled_at = datetime.now(timezone.utc)
+                # Calculate profit/loss
+                if result == "win":
+                    if bet.odds > 0:
+                        bet.profit_loss = bet.stake * (bet.odds / 100)
+                    else:
+                        bet.profit_loss = bet.stake * (100 / abs(bet.odds))
+                elif result == "loss":
+                    bet.profit_loss = -bet.stake
+                else:  # push
+                    bet.profit_loss = 0
+
+        if closing_odds is not None:
+            bet.closing_odds = closing_odds
+            # Calculate CLV if we have closing odds
+            if bet.odds and closing_odds:
+                # Convert American odds to implied probability
+                if bet.odds > 0:
+                    entry_prob = 100 / (bet.odds + 100)
+                else:
+                    entry_prob = abs(bet.odds) / (abs(bet.odds) + 100)
+
+                if closing_odds > 0:
+                    closing_prob = 100 / (closing_odds + 100)
+                else:
+                    closing_prob = abs(closing_odds) / (abs(closing_odds) + 100)
+
+                bet.clv_percentage = round((closing_prob - entry_prob) / closing_prob * 100, 2)
+
+        if notes is not None:
+            bet.notes = notes
+
+        db.commit()
+
+        return {
+            "id": bet.id,
+            "message": "Bet updated successfully",
+            "result": bet.result,
+            "profit_loss": bet.profit_loss,
+            "clv_percentage": bet.clv_percentage,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user bet: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.delete("/api/user-bets/{bet_id}")
+async def delete_user_bet(bet_id: int):
+    """Delete a user bet."""
+    db = get_db()
+
+    try:
+        bet = db.get(UserBet, bet_id)
+        if not bet:
+            raise HTTPException(status_code=404, detail="Bet not found")
+
+        db.delete(bet)
+        db.commit()
+
+        return {"message": "Bet deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user bet: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/user-bets/summary")
+async def get_user_bets_summary():
+    """Get summary stats for user bets."""
+    db = get_db()
+
+    try:
+        bets = db.execute(select(UserBet)).scalars().all()
+
+        total = len(bets)
+        pending = sum(1 for b in bets if b.result == "pending")
+        wins = sum(1 for b in bets if b.result == "win")
+        losses = sum(1 for b in bets if b.result == "loss")
+        pushes = sum(1 for b in bets if b.result == "push")
+
+        settled = wins + losses + pushes
+        total_profit = sum(b.profit_loss or 0 for b in bets if b.result in ("win", "loss", "push"))
+        total_staked = sum(b.stake for b in bets if b.result in ("win", "loss"))
+
+        return {
+            "total_bets": total,
+            "pending": pending,
+            "settled": settled,
+            "wins": wins,
+            "losses": losses,
+            "pushes": pushes,
+            "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0,
+            "total_profit": round(total_profit, 2),
+            "total_staked": round(total_staked, 2),
+            "roi": round(total_profit / total_staked * 100, 2) if total_staked > 0 else 0,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting user bets summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

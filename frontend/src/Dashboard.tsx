@@ -140,6 +140,47 @@ interface TrackedOpportunity {
   settled_at: string | null;
 }
 
+interface BankrollDataPoint {
+  date: string;
+  game_date: string;
+  bet_number: number;
+  cumulative_pl: number;
+  bankroll: number;
+  drawdown: number;
+  drawdown_pct: number;
+  result: 'win' | 'loss' | 'push';
+  profit: number;
+  game: string;
+  bookmaker: string;
+  outcome: string;
+  market: string;
+  odds: number;
+  closing_odds: number;
+  clv: number;
+}
+
+interface BankrollSimulation {
+  has_data: boolean;
+  message?: string;
+  data_points: BankrollDataPoint[];
+  summary: {
+    starting_bankroll: number;
+    ending_bankroll: number;
+    total_profit_loss: number;
+    roi_pct: number;
+    total_bets: number;
+    win_count: number;
+    loss_count: number;
+    push_count: number;
+    win_rate: number;
+    max_drawdown: number;
+    max_drawdown_pct: number;
+    bet_size: number;
+    total_wagered: number;
+    peak_bankroll: number;
+  };
+}
+
 const API_BASE = 'http://localhost:8000/api';
 
 export default function Dashboard() {
@@ -151,7 +192,7 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
-  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev' | 'daily-reports'>('recent');
+  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets'>('recent');
   const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
   const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
@@ -161,6 +202,23 @@ export default function Dashboard() {
   const [expandedReportId, setExpandedReportId] = useState<number | null>(null);
   const [trackedOpportunities, setTrackedOpportunities] = useState<TrackedOpportunity[]>([]);
   const [loadingOpportunities, setLoadingOpportunities] = useState(false);
+  const [bankrollSimulation, setBankrollSimulation] = useState<BankrollSimulation | null>(null);
+  const [loadingSimulation, setLoadingSimulation] = useState(false);
+  const [simBetSize, setSimBetSize] = useState(100);
+  const [simStartingBankroll, setSimStartingBankroll] = useState(10000);
+  const [userBets, setUserBets] = useState<any[]>([]);
+  const [userBetsSummary, setUserBetsSummary] = useState<any>(null);
+  const [loadingUserBets, setLoadingUserBets] = useState(false);
+  const [showAddBetForm, setShowAddBetForm] = useState(false);
+  const [newBet, setNewBet] = useState({
+    game_description: '',
+    game_date: '',
+    bookmaker: 'DraftKings',
+    market_type: 'h2h',
+    bet_description: '',
+    odds: '',
+    stake: '100',
+  });
 
   useEffect(() => {
     fetchData();
@@ -171,8 +229,18 @@ export default function Dashboard() {
       fetchHistoryGames();
     } else if (gamesView === 'daily-reports') {
       fetchDailyReports();
+    } else if (gamesView === 'bankroll-sim') {
+      fetchBankrollSimulation();
+    } else if (gamesView === 'my-bets') {
+      fetchUserBets();
     }
   }, [gamesView]);
+
+  useEffect(() => {
+    if (gamesView === 'bankroll-sim') {
+      fetchBankrollSimulation();
+    }
+  }, [simBetSize, simStartingBankroll]);
 
   const fetchDailyReports = async () => {
     try {
@@ -183,6 +251,97 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error('Error fetching daily reports:', err);
+    }
+  };
+
+  const fetchBankrollSimulation = async () => {
+    try {
+      setLoadingSimulation(true);
+      const res = await fetch(
+        `${API_BASE}/bankroll-simulation?bet_size=${simBetSize}&starting_bankroll=${simStartingBankroll}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setBankrollSimulation(data);
+      }
+    } catch (err) {
+      console.error('Error fetching bankroll simulation:', err);
+    } finally {
+      setLoadingSimulation(false);
+    }
+  };
+
+  const fetchUserBets = async () => {
+    try {
+      setLoadingUserBets(true);
+      const [betsRes, summaryRes] = await Promise.all([
+        fetch(`${API_BASE}/user-bets`),
+        fetch(`${API_BASE}/user-bets/summary`),
+      ]);
+      if (betsRes.ok) {
+        const data = await betsRes.json();
+        setUserBets(data);
+      }
+      if (summaryRes.ok) {
+        const data = await summaryRes.json();
+        setUserBetsSummary(data);
+      }
+    } catch (err) {
+      console.error('Error fetching user bets:', err);
+    } finally {
+      setLoadingUserBets(false);
+    }
+  };
+
+  const handleAddBet = async () => {
+    try {
+      const params = new URLSearchParams({
+        game_description: newBet.game_description,
+        game_date: newBet.game_date,
+        bookmaker: newBet.bookmaker,
+        market_type: newBet.market_type,
+        bet_description: newBet.bet_description,
+        odds: newBet.odds,
+        stake: newBet.stake,
+      });
+      const res = await fetch(`${API_BASE}/user-bets?${params}`, { method: 'POST' });
+      if (res.ok) {
+        setShowAddBetForm(false);
+        setNewBet({
+          game_description: '',
+          game_date: '',
+          bookmaker: 'DraftKings',
+          market_type: 'h2h',
+          bet_description: '',
+          odds: '',
+          stake: '100',
+        });
+        fetchUserBets();
+      }
+    } catch (err) {
+      console.error('Error adding bet:', err);
+    }
+  };
+
+  const handleSettleBet = async (betId: number, result: 'win' | 'loss' | 'push') => {
+    try {
+      const res = await fetch(`${API_BASE}/user-bets/${betId}?result=${result}`, { method: 'PUT' });
+      if (res.ok) {
+        fetchUserBets();
+      }
+    } catch (err) {
+      console.error('Error settling bet:', err);
+    }
+  };
+
+  const handleDeleteBet = async (betId: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/user-bets/${betId}`, { method: 'DELETE' });
+      if (res.ok) {
+        fetchUserBets();
+      }
+    } catch (err) {
+      console.error('Error deleting bet:', err);
     }
   };
 
@@ -757,8 +916,32 @@ export default function Dashboard() {
                 >
                   Daily Reports
                 </button>
+                <button
+                  onClick={() => setGamesView('bankroll-sim')}
+                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                    gamesView === 'bankroll-sim'
+                      ? 'bg-gradient-to-r from-purple-500/30 to-pink-500/30 text-white border border-purple-500/50'
+                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  Bankroll Sim
+                </button>
+                <button
+                  onClick={() => setGamesView('my-bets')}
+                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                    gamesView === 'my-bets'
+                      ? 'bg-gradient-to-r from-yellow-500/30 to-orange-500/30 text-white border border-yellow-500/50'
+                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  My Bets {userBets.filter(b => b.result === 'pending').length > 0 && (
+                    <span className="ml-1 px-1.5 py-0.5 text-xs bg-yellow-500/30 rounded-full">
+                      {userBets.filter(b => b.result === 'pending').length}
+                    </span>
+                  )}
+                </button>
               </div>
-              {gamesView !== 'best-ev' && (
+              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && (
                 <div className="text-sm text-gray-400">
                   💡 Click any game to view detailed betting lines
                 </div>
@@ -1048,6 +1231,484 @@ export default function Dashboard() {
                   <div className="text-center py-12 text-gray-400">
                     <p className="text-lg mb-2">No daily reports yet</p>
                     <p className="text-sm">Reports are generated daily at 9:00 AM for completed games</p>
+                  </div>
+                )}
+              </div>
+            ) : gamesView === 'bankroll-sim' ? (
+              // Bankroll Simulation View
+              <div className="space-y-6">
+                {/* Controls */}
+                <div className="flex flex-wrap gap-4 items-center p-4 bg-white/5 rounded-lg border border-white/10">
+                  <div className="flex items-center gap-2">
+                    <label className="text-sm text-gray-400">Bet Size:</label>
+                    <select
+                      value={simBetSize}
+                      onChange={(e) => setSimBetSize(Number(e.target.value))}
+                      className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                    >
+                      <option value={25}>$25</option>
+                      <option value={50}>$50</option>
+                      <option value={100}>$100</option>
+                      <option value={250}>$250</option>
+                      <option value={500}>$500</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label className="text-sm text-gray-400">Starting Bankroll:</label>
+                    <select
+                      value={simStartingBankroll}
+                      onChange={(e) => setSimStartingBankroll(Number(e.target.value))}
+                      className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                    >
+                      <option value={1000}>$1,000</option>
+                      <option value={5000}>$5,000</option>
+                      <option value={10000}>$10,000</option>
+                      <option value={25000}>$25,000</option>
+                      <option value={50000}>$50,000</option>
+                    </select>
+                  </div>
+                </div>
+
+                {loadingSimulation ? (
+                  <div className="text-center py-12">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-purple-500 mx-auto"></div>
+                    <p className="text-gray-400 mt-4">Running simulation...</p>
+                  </div>
+                ) : bankrollSimulation?.has_data ? (
+                  <>
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Total P&L</div>
+                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.total_profit_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {bankrollSimulation.summary.total_profit_loss >= 0 ? '+' : ''}${bankrollSimulation.summary.total_profit_loss.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">ROI</div>
+                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.roi_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {bankrollSimulation.summary.roi_pct >= 0 ? '+' : ''}{bankrollSimulation.summary.roi_pct.toFixed(2)}%
+                        </div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Win Rate</div>
+                        <div className="text-2xl font-bold text-white">
+                          {bankrollSimulation.summary.win_rate.toFixed(1)}%
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {bankrollSimulation.summary.win_count}W-{bankrollSimulation.summary.loss_count}L
+                        </div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Max Drawdown</div>
+                        <div className="text-2xl font-bold text-red-400">
+                          ${bankrollSimulation.summary.max_drawdown.toFixed(2)}
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {bankrollSimulation.summary.max_drawdown_pct.toFixed(1)}% of peak
+                        </div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Total Bets</div>
+                        <div className="text-2xl font-bold text-blue-400">
+                          {bankrollSimulation.summary.total_bets}
+                        </div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Peak Bankroll</div>
+                        <div className="text-2xl font-bold text-purple-400">
+                          ${bankrollSimulation.summary.peak_bankroll.toLocaleString()}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* P&L Curve Chart */}
+                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                      <h3 className="text-lg font-semibold text-white mb-4">Cumulative P&L</h3>
+                      <ResponsiveContainer width="100%" height={300}>
+                        <LineChart data={bankrollSimulation.data_points}>
+                          <defs>
+                            <linearGradient id="colorPL" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#10B981" stopOpacity={0.3} />
+                              <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
+                          <XAxis
+                            dataKey="bet_number"
+                            stroke="#9CA3AF"
+                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                            label={{ value: 'Bet #', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
+                          />
+                          <YAxis
+                            stroke="#9CA3AF"
+                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                            tickFormatter={(value) => `$${value}`}
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: '#1F2937',
+                              border: '1px solid #374151',
+                              borderRadius: '8px',
+                            }}
+                            formatter={(value: number | undefined, name: string | undefined) => {
+                              if (value === undefined) return ['N/A', name ?? ''];
+                              if (name === 'cumulative_pl') return [`$${value.toFixed(2)}`, 'Cumulative P&L'];
+                              return [value, name ?? ''];
+                            }}
+                            labelFormatter={(label) => `Bet #${label}`}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="cumulative_pl"
+                            stroke="#10B981"
+                            strokeWidth={2}
+                            dot={false}
+                            fill="url(#colorPL)"
+                          />
+                          {/* Zero line */}
+                          <Line
+                            type="monotone"
+                            dataKey={() => 0}
+                            stroke="#6B7280"
+                            strokeWidth={1}
+                            strokeDasharray="5 5"
+                            dot={false}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    {/* Drawdown Chart */}
+                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                      <h3 className="text-lg font-semibold text-white mb-4">Drawdown Analysis</h3>
+                      <ResponsiveContainer width="100%" height={200}>
+                        <BarChart data={bankrollSimulation.data_points}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
+                          <XAxis
+                            dataKey="bet_number"
+                            stroke="#9CA3AF"
+                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                          />
+                          <YAxis
+                            stroke="#9CA3AF"
+                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                            tickFormatter={(value) => `${value}%`}
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: '#1F2937',
+                              border: '1px solid #374151',
+                              borderRadius: '8px',
+                            }}
+                            formatter={(value: number | undefined) => [`${value?.toFixed(2) ?? '0'}%`, 'Drawdown']}
+                            labelFormatter={(label) => `Bet #${label}`}
+                          />
+                          <Bar
+                            dataKey="drawdown_pct"
+                            fill="#EF4444"
+                            opacity={0.7}
+                            radius={[2, 2, 0, 0]}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    {/* Bet History Table */}
+                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                      <h3 className="text-lg font-semibold text-white mb-4">Bet History (Verify Each Bet)</h3>
+                      <div className="overflow-x-auto max-h-[500px]">
+                        <table className="w-full text-sm">
+                          <thead className="sticky top-0 bg-gray-900 z-10">
+                            <tr className="border-b border-gray-700">
+                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Date</th>
+                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Game</th>
+                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Book</th>
+                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Bet</th>
+                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Entry</th>
+                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Close</th>
+                              <th className="text-center py-2 px-2 text-gray-400 text-xs">CLV</th>
+                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Result</th>
+                              <th className="text-right py-2 px-2 text-gray-400 text-xs">P&L</th>
+                              <th className="text-right py-2 px-2 text-gray-400 text-xs">Running</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bankrollSimulation.data_points.map((bet, idx) => (
+                              <tr key={idx} className="border-b border-gray-800 hover:bg-white/5">
+                                <td className="py-2 px-2 text-gray-400 text-xs whitespace-nowrap">
+                                  {bet.game_date}
+                                </td>
+                                <td className="py-2 px-2 text-white text-xs max-w-[150px] truncate" title={bet.game}>
+                                  {bet.game}
+                                </td>
+                                <td className="py-2 px-2 text-gray-300 text-xs max-w-[80px] truncate" title={bet.bookmaker}>
+                                  {bet.bookmaker}
+                                </td>
+                                <td className="py-2 px-2 text-xs">
+                                  <span className="text-purple-400">{bet.market}</span>
+                                  <span className="text-gray-500 ml-1">-</span>
+                                  <span className="text-white ml-1 max-w-[100px] truncate inline-block align-bottom" title={bet.outcome}>
+                                    {bet.outcome}
+                                  </span>
+                                </td>
+                                <td className="text-center py-2 px-2 text-blue-400 text-xs font-mono">
+                                  {bet.odds.toFixed(2)}
+                                </td>
+                                <td className="text-center py-2 px-2 text-gray-400 text-xs font-mono">
+                                  {bet.closing_odds.toFixed(2)}
+                                </td>
+                                <td className="text-center py-2 px-2 text-green-400 text-xs font-medium">
+                                  +{bet.clv}%
+                                </td>
+                                <td className="text-center py-2 px-2">
+                                  <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
+                                    bet.result === 'win'
+                                      ? 'bg-green-500/20 text-green-400'
+                                      : bet.result === 'loss'
+                                      ? 'bg-red-500/20 text-red-400'
+                                      : 'bg-gray-500/20 text-gray-400'
+                                  }`}>
+                                    {bet.result === 'win' ? 'W' : bet.result === 'loss' ? 'L' : 'P'}
+                                  </span>
+                                </td>
+                                <td className={`text-right py-2 px-2 font-medium text-xs ${
+                                  bet.profit >= 0 ? 'text-green-400' : 'text-red-400'
+                                }`}>
+                                  {bet.profit >= 0 ? '+' : ''}${bet.profit.toFixed(0)}
+                                </td>
+                                <td className={`text-right py-2 px-2 font-medium text-xs ${
+                                  bet.cumulative_pl >= 0 ? 'text-green-400' : 'text-red-400'
+                                }`}>
+                                  {bet.cumulative_pl >= 0 ? '+' : ''}${bet.cumulative_pl.toFixed(0)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="text-xs text-gray-500 mt-3">
+                        Entry = odds when bet was placed | Close = closing odds before game | CLV = closing line value advantage
+                      </p>
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-center py-12 text-gray-400">
+                    <div className="text-6xl mb-4">📊</div>
+                    <p className="text-lg mb-2">No simulation data available</p>
+                    <p className="text-sm">Settled bets are needed to run the bankroll simulation</p>
+                  </div>
+                )}
+              </div>
+            ) : gamesView === 'my-bets' ? (
+              // My Bets View
+              <div className="space-y-6">
+                {/* Summary Cards */}
+                {userBetsSummary && (
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-xs text-gray-400 mb-1 uppercase">Pending</div>
+                      <div className="text-2xl font-bold text-yellow-400">{userBetsSummary.pending}</div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-xs text-gray-400 mb-1 uppercase">Record</div>
+                      <div className="text-2xl font-bold text-white">
+                        {userBetsSummary.wins}-{userBetsSummary.losses}
+                      </div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-xs text-gray-400 mb-1 uppercase">Win Rate</div>
+                      <div className="text-2xl font-bold text-blue-400">{userBetsSummary.win_rate}%</div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-xs text-gray-400 mb-1 uppercase">Profit</div>
+                      <div className={`text-2xl font-bold ${userBetsSummary.total_profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {userBetsSummary.total_profit >= 0 ? '+' : ''}${userBetsSummary.total_profit}
+                      </div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-xs text-gray-400 mb-1 uppercase">ROI</div>
+                      <div className={`text-2xl font-bold ${userBetsSummary.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {userBetsSummary.roi >= 0 ? '+' : ''}{userBetsSummary.roi}%
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Add Bet Button */}
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setShowAddBetForm(!showAddBetForm)}
+                    className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg border border-green-500/50 transition-all"
+                  >
+                    {showAddBetForm ? 'Cancel' : '+ Add Bet'}
+                  </button>
+                </div>
+
+                {/* Add Bet Form */}
+                {showAddBetForm && (
+                  <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                    <h3 className="text-lg font-semibold text-white mb-4">Add New Bet</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                      <input
+                        type="text"
+                        placeholder="Game (e.g., Bulls @ Celtics)"
+                        value={newBet.game_description}
+                        onChange={(e) => setNewBet({ ...newBet, game_description: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      />
+                      <input
+                        type="datetime-local"
+                        value={newBet.game_date}
+                        onChange={(e) => setNewBet({ ...newBet, game_date: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      />
+                      <select
+                        value={newBet.bookmaker}
+                        onChange={(e) => setNewBet({ ...newBet, bookmaker: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      >
+                        <option value="DraftKings">DraftKings</option>
+                        <option value="FanDuel">FanDuel</option>
+                        <option value="BetMGM">BetMGM</option>
+                        <option value="Caesars">Caesars</option>
+                        <option value="theScore Bet">theScore Bet</option>
+                      </select>
+                      <select
+                        value={newBet.market_type}
+                        onChange={(e) => setNewBet({ ...newBet, market_type: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      >
+                        <option value="h2h">Moneyline</option>
+                        <option value="spreads">Spread</option>
+                        <option value="totals">Totals</option>
+                      </select>
+                      <input
+                        type="text"
+                        placeholder="Bet (e.g., Bulls -1.5)"
+                        value={newBet.bet_description}
+                        onChange={(e) => setNewBet({ ...newBet, bet_description: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      />
+                      <input
+                        type="number"
+                        placeholder="Odds (e.g., +140 or -110)"
+                        value={newBet.odds}
+                        onChange={(e) => setNewBet({ ...newBet, odds: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      />
+                      <input
+                        type="number"
+                        placeholder="Stake"
+                        value={newBet.stake}
+                        onChange={(e) => setNewBet({ ...newBet, stake: e.target.value })}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      />
+                      <button
+                        onClick={handleAddBet}
+                        className="px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-lg font-medium transition-all"
+                      >
+                        Add Bet
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Bets Table */}
+                {loadingUserBets ? (
+                  <div className="text-center py-12">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-yellow-500 mx-auto"></div>
+                  </div>
+                ) : userBets.length > 0 ? (
+                  <div className="bg-white/5 rounded-lg border border-white/10 overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-900">
+                        <tr className="border-b border-gray-700">
+                          <th className="text-left py-3 px-4 text-gray-400">Date</th>
+                          <th className="text-left py-3 px-4 text-gray-400">Game</th>
+                          <th className="text-left py-3 px-4 text-gray-400">Bet</th>
+                          <th className="text-center py-3 px-4 text-gray-400">Book</th>
+                          <th className="text-center py-3 px-4 text-gray-400">Odds</th>
+                          <th className="text-center py-3 px-4 text-gray-400">Stake</th>
+                          <th className="text-center py-3 px-4 text-gray-400">Status</th>
+                          <th className="text-right py-3 px-4 text-gray-400">P&L</th>
+                          <th className="text-center py-3 px-4 text-gray-400">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {userBets.map((bet) => (
+                          <tr key={bet.id} className="border-b border-gray-800 hover:bg-white/5">
+                            <td className="py-3 px-4 text-gray-400">
+                              {new Date(bet.game_date).toLocaleDateString()}
+                            </td>
+                            <td className="py-3 px-4 text-white">{bet.game_description}</td>
+                            <td className="py-3 px-4">
+                              <span className="text-purple-400">{bet.market_type}</span>
+                              <span className="text-white ml-2">{bet.bet_description}</span>
+                            </td>
+                            <td className="text-center py-3 px-4 text-gray-300">{bet.bookmaker}</td>
+                            <td className="text-center py-3 px-4 text-blue-400 font-mono">
+                              {bet.odds > 0 ? '+' : ''}{bet.odds}
+                            </td>
+                            <td className="text-center py-3 px-4 text-white">${bet.stake}</td>
+                            <td className="text-center py-3 px-4">
+                              <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                bet.result === 'win' ? 'bg-green-500/20 text-green-400' :
+                                bet.result === 'loss' ? 'bg-red-500/20 text-red-400' :
+                                bet.result === 'push' ? 'bg-gray-500/20 text-gray-400' :
+                                'bg-yellow-500/20 text-yellow-400'
+                              }`}>
+                                {bet.result.toUpperCase()}
+                              </span>
+                            </td>
+                            <td className={`text-right py-3 px-4 font-medium ${
+                              bet.profit_loss === null ? 'text-gray-500' :
+                              bet.profit_loss >= 0 ? 'text-green-400' : 'text-red-400'
+                            }`}>
+                              {bet.profit_loss !== null ? `${bet.profit_loss >= 0 ? '+' : ''}$${bet.profit_loss.toFixed(0)}` : '-'}
+                            </td>
+                            <td className="text-center py-3 px-4">
+                              {bet.result === 'pending' ? (
+                                <div className="flex gap-1 justify-center">
+                                  <button
+                                    onClick={() => handleSettleBet(bet.id, 'win')}
+                                    className="px-2 py-1 text-xs bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded"
+                                  >
+                                    W
+                                  </button>
+                                  <button
+                                    onClick={() => handleSettleBet(bet.id, 'loss')}
+                                    className="px-2 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded"
+                                  >
+                                    L
+                                  </button>
+                                  <button
+                                    onClick={() => handleSettleBet(bet.id, 'push')}
+                                    className="px-2 py-1 text-xs bg-gray-500/20 hover:bg-gray-500/30 text-gray-400 rounded"
+                                  >
+                                    P
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteBet(bet.id)}
+                                    className="px-2 py-1 text-xs bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded"
+                                  >
+                                    X
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="text-gray-500 text-xs">Settled</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="text-center py-12 text-gray-400">
+                    <div className="text-6xl mb-4">🎰</div>
+                    <p className="text-lg mb-2">No bets tracked yet</p>
+                    <p className="text-sm">Click "+ Add Bet" to start tracking your bets</p>
                   </div>
                 )}
               </div>
