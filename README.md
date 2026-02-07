@@ -90,13 +90,62 @@ Ensemble model (XGBoost + Random Forest) predicts line movement direction and ma
 - Distance from consensus (6.2%)
 - Hours to game (4.7%)
 
+**Advanced ML Features:**
+- Temporal features: movement velocity, price volatility, cumulative movement, direction changes
+- Bookmaker features: sharp book detection (Pinnacle), relative positioning, steam move signals
+- Market-specific direction thresholds: h2h=0.02, spreads=0.01, totals=0.01
+- Per-market ensemble weights optimized via grid search
+- Walk-forward (expanding window) validation for time-series integrity
+- Auto-retraining when performance degrades >10%
+
 **API Endpoints:**
 - `GET /api/ml/stats` - Model performance metrics
 - `GET /api/ml/predictions/{game_id}` - Predicted vs actual closing lines
 - `POST /api/ml/retrain` - Retrain with latest data
 - `GET /api/ml/feature-importance` - Feature importance rankings
+- `GET /api/ml/opportunities` - Comprehensive filterable opportunities
+- `GET /api/ml/upcoming-opportunities` - Games starting in next N hours
 
 Use predictions to identify +EV opportunities where the model predicts favorable line movement.
+
+### Bet Sizing Strategies
+Multiple position sizing strategies for bankroll management:
+
+- **Fixed Unit** - Flat amount per bet (e.g., $100)
+- **Fractional** - Percentage of bankroll (e.g., 2%)
+- **Kelly Criterion** - Optimal sizing based on edge: f* = (bp - q) / b
+- **Half-Kelly** - Conservative Kelly at 50% for reduced variance
+- **Confidence-Weighted** - Scale bet size by ML model confidence
+
+**Risk Metrics:**
+- Sharpe Ratio - Risk-adjusted returns
+- Sortino Ratio - Downside-focused risk metric
+- Max drawdown tracking
+
+### Enhanced Bankroll Simulation
+Advanced simulation with strategy selection and filtering:
+
+**Parameters:**
+- `strategy` - fixed, fractional, kelly, half_kelly, confidence
+- `bookmaker_filter` - Filter by specific bookmaker
+- `market_filter` - Filter by market type (h2h, spreads, totals)
+- `clv_threshold` - Minimum CLV to include
+
+**Performance Breakdown:**
+- By bookmaker - Which books are most profitable
+- By market type - Which markets perform best
+- By month - Track performance over time
+- By CLV bucket - Performance at different edge levels
+
+### Opportunities Explorer
+Comprehensive interface for discovering and tracking betting opportunities:
+
+- Filterable data table with status, CLV, bookmaker, market filters
+- Date range selection
+- Pagination for large datasets
+- Export to CSV
+- Track pending vs settled bets
+- Sort by CLV, confidence, EV score, or date
 
 ### Performance Dashboard
 - **Mean CLV** - Overall edge across all analyzed bets
@@ -155,9 +204,10 @@ src/
 │   └── ml_endpoints.py # ML prediction endpoints
 ├── analyzers/        # Analytics & ML
 │   ├── clv_calculator.py # CLV calculation logic
-│   ├── features.py   # ML feature engineering
-│   ├── movement_predictor.py # Ensemble line movement model
-│   └── bet_settlement.py # Bet outcome tracking
+│   ├── features.py   # ML feature engineering (temporal + bookmaker features)
+│   ├── movement_predictor.py # Ensemble line movement model (per-market weights)
+│   ├── bet_settlement.py # Bet outcome tracking
+│   └── bet_sizing.py # Kelly, fractional, confidence-weighted sizing
 ├── collectors/       # Data collection
 │   ├── odds_api_client.py # The Odds API client
 │   ├── odds_proccessor.py # Data processing & storage
@@ -167,16 +217,19 @@ src/
 
 frontend/
 └── src/
-    └── Dashboard.tsx # React analytics dashboard w/ ML metrics
+    ├── Dashboard.tsx # React analytics dashboard w/ ML metrics
+    └── components/
+        └── OpportunitiesExplorer.tsx # Filterable opportunities table
 
 scripts/
 ├── collect_odds.py          # Odds collection (opening + closing)
 ├── schedule_game_batches.py # Dynamic launchd scheduler
 ├── analyze_daily_clv.py     # Daily CLV report generation
 ├── fetch_game_scores.py     # NBA score fetching
-├── train_movement_model.py  # ML model training
+├── train_movement_model.py  # ML model training (walk-forward validation)
 ├── track_opportunity_performance.py # Bet tracking
-└── update_report_profit_stats.py    # ROI calculations
+├── update_report_profit_stats.py    # ROI calculations
+└── auto_retrain.py          # Auto-retraining on performance degradation
 
 models/              # Trained ML models (git-ignored)
 └── line_movement_predictor.pkl
@@ -214,9 +267,12 @@ The workflow eliminates manual tracking and provides immediate performance feedb
 - [x] Bet performance tracking and settlement
 - [x] Enhanced ML model (XGBoost + Random Forest ensemble)
 - [x] Dynamic game-time batch scheduling
+- [x] Kelly Criterion position sizing with multiple strategies
+- [x] Advanced ML features (temporal, bookmaker, walk-forward validation)
+- [x] Comprehensive opportunities explorer with filtering
+- [x] Auto-retraining on model degradation
 - [ ] Direct book scraping (Kalshi, Polymarket) for higher frequency data
 - [ ] Arbitrage opportunity detection
-- [ ] Kelly Criterion position sizing
 - [ ] Live odds monitoring with real-time alerts
 
 ## Results

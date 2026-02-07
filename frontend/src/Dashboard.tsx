@@ -175,10 +175,36 @@ interface BankrollSimulation {
     win_rate: number;
     max_drawdown: number;
     max_drawdown_pct: number;
-    bet_size: number;
     total_wagered: number;
     peak_bankroll: number;
+    strategy: string;
+    sharpe_ratio: number;
+    sortino_ratio: number;
+    avg_bet_size: number;
+    bet_size_std: number;
   };
+  by_bookmaker?: Record<string, {
+    bets: number;
+    wins: number;
+    losses: number;
+    pushes: number;
+    profit: number;
+    wagered: number;
+    roi: number;
+    avg_clv: number;
+    win_rate: number;
+  }>;
+  by_market?: Record<string, {
+    bets: number;
+    wins: number;
+    losses: number;
+    pushes: number;
+    profit: number;
+    wagered: number;
+    roi: number;
+    avg_clv: number;
+    win_rate: number;
+  }>;
 }
 
 const API_BASE = 'http://localhost:8000/api';
@@ -206,6 +232,12 @@ export default function Dashboard() {
   const [loadingSimulation, setLoadingSimulation] = useState(false);
   const [simBetSize, setSimBetSize] = useState(100);
   const [simStartingBankroll, setSimStartingBankroll] = useState(10000);
+  const [simStrategy, setSimStrategy] = useState('fixed');
+  const [simFractionPercent, setSimFractionPercent] = useState(2);
+  const [simMaxBetPercent, setSimMaxBetPercent] = useState(25);
+  const [simBookmakerFilter, setSimBookmakerFilter] = useState<string | null>(null);
+  const [simMarketFilter, setSimMarketFilter] = useState<string | null>(null);
+  const [simClvThreshold, setSimClvThreshold] = useState<number | null>(null);
   const [userBets, setUserBets] = useState<any[]>([]);
   const [userBetsSummary, setUserBetsSummary] = useState<any>(null);
   const [loadingUserBets, setLoadingUserBets] = useState(false);
@@ -240,7 +272,7 @@ export default function Dashboard() {
     if (gamesView === 'bankroll-sim') {
       fetchBankrollSimulation();
     }
-  }, [simBetSize, simStartingBankroll]);
+  }, [simBetSize, simStartingBankroll, simStrategy, simFractionPercent, simMaxBetPercent, simBookmakerFilter, simMarketFilter, simClvThreshold]);
 
   const fetchDailyReports = async () => {
     try {
@@ -257,9 +289,18 @@ export default function Dashboard() {
   const fetchBankrollSimulation = async () => {
     try {
       setLoadingSimulation(true);
-      const res = await fetch(
-        `${API_BASE}/bankroll-simulation?bet_size=${simBetSize}&starting_bankroll=${simStartingBankroll}`
-      );
+      const params = new URLSearchParams({
+        bet_size: simBetSize.toString(),
+        starting_bankroll: simStartingBankroll.toString(),
+        strategy: simStrategy,
+        fraction_percent: simFractionPercent.toString(),
+        max_bet_percent: simMaxBetPercent.toString(),
+      });
+      if (simBookmakerFilter) params.append('bookmaker_filter', simBookmakerFilter);
+      if (simMarketFilter) params.append('market_filter', simMarketFilter);
+      if (simClvThreshold !== null) params.append('clv_threshold', simClvThreshold.toString());
+
+      const res = await fetch(`${API_BASE}/bankroll-simulation?${params}`);
       if (res.ok) {
         const data = await res.json();
         setBankrollSimulation(data);
@@ -1238,34 +1279,126 @@ export default function Dashboard() {
               // Bankroll Simulation View
               <div className="space-y-6">
                 {/* Controls */}
-                <div className="flex flex-wrap gap-4 items-center p-4 bg-white/5 rounded-lg border border-white/10">
-                  <div className="flex items-center gap-2">
-                    <label className="text-sm text-gray-400">Bet Size:</label>
-                    <select
-                      value={simBetSize}
-                      onChange={(e) => setSimBetSize(Number(e.target.value))}
-                      className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                    >
-                      <option value={25}>$25</option>
-                      <option value={50}>$50</option>
-                      <option value={100}>$100</option>
-                      <option value={250}>$250</option>
-                      <option value={500}>$500</option>
-                    </select>
+                <div className="bg-white/5 rounded-lg p-4 border border-white/10 space-y-4">
+                  {/* Primary Controls Row */}
+                  <div className="flex flex-wrap gap-4 items-center">
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-400">Strategy:</label>
+                      <select
+                        value={simStrategy}
+                        onChange={(e) => setSimStrategy(e.target.value)}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                      >
+                        <option value="fixed">Fixed Unit</option>
+                        <option value="fractional">Fractional</option>
+                        <option value="kelly">Full Kelly</option>
+                        <option value="half_kelly">Half Kelly</option>
+                        <option value="confidence">Confidence-Weighted</option>
+                      </select>
+                    </div>
+                    {simStrategy === 'fixed' && (
+                      <div className="flex items-center gap-2">
+                        <label className="text-sm text-gray-400">Bet Size:</label>
+                        <select
+                          value={simBetSize}
+                          onChange={(e) => setSimBetSize(Number(e.target.value))}
+                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                        >
+                          <option value={25}>$25</option>
+                          <option value={50}>$50</option>
+                          <option value={100}>$100</option>
+                          <option value={250}>$250</option>
+                          <option value={500}>$500</option>
+                        </select>
+                      </div>
+                    )}
+                    {(simStrategy === 'fractional' || simStrategy === 'confidence') && (
+                      <div className="flex items-center gap-2">
+                        <label className="text-sm text-gray-400">Fraction:</label>
+                        <select
+                          value={simFractionPercent}
+                          onChange={(e) => setSimFractionPercent(Number(e.target.value))}
+                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                        >
+                          <option value={1}>1%</option>
+                          <option value={2}>2%</option>
+                          <option value={3}>3%</option>
+                          <option value={5}>5%</option>
+                        </select>
+                      </div>
+                    )}
+                    {(simStrategy === 'kelly' || simStrategy === 'half_kelly') && (
+                      <div className="flex items-center gap-2">
+                        <label className="text-sm text-gray-400">Max Bet:</label>
+                        <select
+                          value={simMaxBetPercent}
+                          onChange={(e) => setSimMaxBetPercent(Number(e.target.value))}
+                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                        >
+                          <option value={10}>10%</option>
+                          <option value={15}>15%</option>
+                          <option value={25}>25%</option>
+                        </select>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-400">Bankroll:</label>
+                      <select
+                        value={simStartingBankroll}
+                        onChange={(e) => setSimStartingBankroll(Number(e.target.value))}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                      >
+                        <option value={1000}>$1,000</option>
+                        <option value={5000}>$5,000</option>
+                        <option value={10000}>$10,000</option>
+                        <option value={25000}>$25,000</option>
+                        <option value={50000}>$50,000</option>
+                      </select>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <label className="text-sm text-gray-400">Starting Bankroll:</label>
-                    <select
-                      value={simStartingBankroll}
-                      onChange={(e) => setSimStartingBankroll(Number(e.target.value))}
-                      className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                    >
-                      <option value={1000}>$1,000</option>
-                      <option value={5000}>$5,000</option>
-                      <option value={10000}>$10,000</option>
-                      <option value={25000}>$25,000</option>
-                      <option value={50000}>$50,000</option>
-                    </select>
+                  {/* Filter Controls Row */}
+                  <div className="flex flex-wrap gap-4 items-center">
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-400">Bookmaker:</label>
+                      <select
+                        value={simBookmakerFilter || ''}
+                        onChange={(e) => setSimBookmakerFilter(e.target.value || null)}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                      >
+                        <option value="">All</option>
+                        <option value="DraftKings">DraftKings</option>
+                        <option value="FanDuel">FanDuel</option>
+                        <option value="theScore Bet">theScore</option>
+                        <option value="BetMGM">BetMGM</option>
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-400">Market:</label>
+                      <select
+                        value={simMarketFilter || ''}
+                        onChange={(e) => setSimMarketFilter(e.target.value || null)}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                      >
+                        <option value="">All</option>
+                        <option value="h2h">Moneyline</option>
+                        <option value="spreads">Spreads</option>
+                        <option value="totals">Totals</option>
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-400">Min CLV:</label>
+                      <select
+                        value={simClvThreshold ?? ''}
+                        onChange={(e) => setSimClvThreshold(e.target.value ? Number(e.target.value) : null)}
+                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
+                      >
+                        <option value="">Any</option>
+                        <option value={1}>1%+</option>
+                        <option value={2}>2%+</option>
+                        <option value={3}>3%+</option>
+                        <option value={5}>5%+</option>
+                      </select>
+                    </div>
                   </div>
                 </div>
 
@@ -1277,7 +1410,7 @@ export default function Dashboard() {
                 ) : bankrollSimulation?.has_data ? (
                   <>
                     {/* Summary Cards */}
-                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4">
                       <div className="bg-white/5 rounded-lg p-4 border border-white/10">
                         <div className="text-xs text-gray-400 mb-1 uppercase">Total P&L</div>
                         <div className={`text-2xl font-bold ${bankrollSimulation.summary.total_profit_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
@@ -1320,7 +1453,79 @@ export default function Dashboard() {
                           ${bankrollSimulation.summary.peak_bankroll.toLocaleString()}
                         </div>
                       </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Sharpe Ratio</div>
+                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.sharpe_ratio >= 0 ? 'text-cyan-400' : 'text-orange-400'}`}>
+                          {bankrollSimulation.summary.sharpe_ratio?.toFixed(2) ?? 'N/A'}
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">Risk-adjusted</div>
+                      </div>
+                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                        <div className="text-xs text-gray-400 mb-1 uppercase">Avg Bet Size</div>
+                        <div className="text-2xl font-bold text-yellow-400">
+                          ${bankrollSimulation.summary.avg_bet_size?.toFixed(0) ?? 'N/A'}
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {bankrollSimulation.summary.strategy?.replace('_', ' ')}
+                        </div>
+                      </div>
                     </div>
+
+                    {/* Performance Breakdown */}
+                    {(bankrollSimulation.by_bookmaker || bankrollSimulation.by_market) && (
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        {bankrollSimulation.by_bookmaker && Object.keys(bankrollSimulation.by_bookmaker).length > 0 && (
+                          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                            <h3 className="text-lg font-semibold text-white mb-4">By Bookmaker</h3>
+                            <div className="space-y-3">
+                              {Object.entries(bankrollSimulation.by_bookmaker)
+                                .sort(([, a], [, b]) => b.profit - a.profit)
+                                .map(([name, stats]) => (
+                                  <div key={name} className="flex items-center justify-between py-2 border-b border-gray-700/50">
+                                    <div>
+                                      <div className="text-white font-medium">{name}</div>
+                                      <div className="text-xs text-gray-500">{stats.bets} bets | {stats.win_rate}% win</div>
+                                    </div>
+                                    <div className="text-right">
+                                      <div className={`font-bold ${stats.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {stats.profit >= 0 ? '+' : ''}${stats.profit.toFixed(0)}
+                                      </div>
+                                      <div className={`text-xs ${stats.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {stats.roi >= 0 ? '+' : ''}{stats.roi}% ROI
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                        {bankrollSimulation.by_market && Object.keys(bankrollSimulation.by_market).length > 0 && (
+                          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                            <h3 className="text-lg font-semibold text-white mb-4">By Market Type</h3>
+                            <div className="space-y-3">
+                              {Object.entries(bankrollSimulation.by_market)
+                                .sort(([, a], [, b]) => b.profit - a.profit)
+                                .map(([name, stats]) => (
+                                  <div key={name} className="flex items-center justify-between py-2 border-b border-gray-700/50">
+                                    <div>
+                                      <div className="text-white font-medium">{name.toUpperCase()}</div>
+                                      <div className="text-xs text-gray-500">{stats.bets} bets | {stats.win_rate}% win | {stats.avg_clv}% avg CLV</div>
+                                    </div>
+                                    <div className="text-right">
+                                      <div className={`font-bold ${stats.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {stats.profit >= 0 ? '+' : ''}${stats.profit.toFixed(0)}
+                                      </div>
+                                      <div className={`text-xs ${stats.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {stats.roi >= 0 ? '+' : ''}{stats.roi}% ROI
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* P&L Curve Chart */}
                     <div className="bg-white/5 rounded-lg p-6 border border-white/10">

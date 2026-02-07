@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.analyzers.features import FeatureEngineer
 from src.analyzers.movement_predictor import LineMovementPredictor
-from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot
+from src.models.database import Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Team
 
 # Load environment variables
 load_dotenv()
@@ -400,12 +400,27 @@ async def get_game_predictions(game_id: int):
 
 
 @router.get("/best-opportunities", response_model=List[EVOpportunity])
-async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
+async def get_best_opportunities(
+    limit: int = 50,
+    min_confidence: float = 0.5,
+    bookmaker_filter: str = None,
+    market_filter: str = None,
+    min_hours_to_game: float = None,
+    max_hours_to_game: float = None,
+):
     """
     Get best +EV betting opportunities based on predicted line movement.
 
     Returns opportunities where the model predicts unfavorable line movement
     with high confidence, meaning you should bet now before odds worsen.
+
+    Args:
+        limit: Maximum number of opportunities to return
+        min_confidence: Minimum ML confidence threshold
+        bookmaker_filter: Only include opportunities from this bookmaker
+        market_filter: Only include opportunities from this market (h2h, spreads, totals)
+        min_hours_to_game: Minimum hours until game starts
+        max_hours_to_game: Maximum hours until game starts
     """
     db = get_db()
 
@@ -423,6 +438,10 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
             .order_by(Game.commence_time)
         )
 
+        # Apply market filter
+        if market_filter:
+            stmt = stmt.where(OddsSnapshot.market_type == market_filter)
+
         results = db.execute(stmt).all()
 
         if not results:
@@ -432,6 +451,20 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
 
         for snapshot, game in results:
             hours_to_game = (game.commence_time - snapshot.timestamp).total_seconds() / 3600
+
+            # Apply hours filters
+            if min_hours_to_game is not None and hours_to_game < min_hours_to_game:
+                continue
+            if max_hours_to_game is not None and hours_to_game > max_hours_to_game:
+                continue
+
+            # Apply bookmaker filter
+            bookmaker = db.query(Bookmaker).filter(
+                Bookmaker.id == snapshot.bookmaker_id
+            ).first()
+            if bookmaker_filter and (not bookmaker or bookmaker.name != bookmaker_filter):
+                continue
+
             day_of_week = game.commence_time.weekday()
             is_weekend = day_of_week >= 5
 
@@ -451,7 +484,7 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
                     db, game.id, snapshot.market_type, outcome_name
                 )
 
-                # Create features
+                # Create features - with new temporal/bookmaker features set to defaults
                 features = pd.DataFrame([{
                     "bookmaker_id": snapshot.bookmaker_id,
                     "market_type": snapshot.market_type,
@@ -473,6 +506,18 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
                         if consensus_line is not None
                         else False
                     ),
+                    # Temporal features - defaults for live prediction
+                    "time_since_last_update": 0.0,
+                    "movement_velocity": 0.0,
+                    "updates_count": 1,
+                    "price_volatility_24h": 0.0,
+                    "cumulative_movement": 0.0,
+                    "movement_direction_changes": 0,
+                    # Bookmaker features
+                    "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
+                    "relative_to_pinnacle": 0.0,
+                    "books_moved_count": 0,
+                    "steam_move_signal": 0.0,
                 }])
 
                 # Predict movement
@@ -498,10 +543,9 @@ async def get_best_opportunities(limit: int = 50, min_confidence: float = 0.5):
                 else:
                     continue
 
-                # Get bookmaker name
-                bookmaker = db.query(Bookmaker).filter(
-                    Bookmaker.id == snapshot.bookmaker_id
-                ).first()
+                # Calculate edge estimate
+                fair_prob = 1 / float(opening_price)
+                edge_estimate = abs(predicted_delta) * fair_prob
 
                 # Format current line
                 if opening_point != 0:
@@ -612,3 +656,350 @@ async def check_model_trained():
     """
     is_trained = Path(MODEL_PATH).exists()
     return {"is_trained": is_trained, "model_path": MODEL_PATH}
+
+
+# ============================================================================
+# Comprehensive Opportunities Endpoints
+# ============================================================================
+
+
+class OpportunityDetail(BaseModel):
+    """Detailed opportunity record."""
+    id: int
+    game_id: int
+    home_team: str
+    away_team: str
+    commence_time: datetime
+    bookmaker: str
+    market_type: str
+    outcome_name: str
+    point_line: Optional[float]
+    entry_odds: float
+    closing_odds: float
+    clv_percentage: float
+    result: Optional[str]
+    profit_loss: Optional[float]
+    settled_at: Optional[datetime]
+    status: str
+
+
+@router.get("/opportunities")
+async def get_opportunities(
+    status: str = "all",
+    min_confidence: float = None,
+    min_clv: float = None,
+    bookmaker: str = None,
+    market_type: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    sort_by: str = "clv",
+    limit: int = 100,
+    offset: int = 0,
+):
+    """
+    Get comprehensive list of opportunities with filtering and pagination.
+
+    Args:
+        status: Filter by status - all, pending, settled
+        min_confidence: Minimum ML confidence (not currently tracked in DB)
+        min_clv: Minimum CLV percentage to include
+        bookmaker: Filter by bookmaker name
+        market_type: Filter by market type (h2h, spreads, totals)
+        date_from: Start date (YYYY-MM-DD)
+        date_to: End date (YYYY-MM-DD)
+        sort_by: Sort field - clv, confidence, ev_score, date
+        limit: Maximum results to return
+        offset: Skip first N results
+    """
+    db = get_db()
+
+    try:
+        # Build base query
+        stmt = (
+            select(OpportunityPerformance, Game)
+            .join(Game, Game.id == OpportunityPerformance.game_id)
+        )
+
+        # Apply status filter
+        if status == "pending":
+            stmt = stmt.where(OpportunityPerformance.result == "pending")
+        elif status == "settled":
+            stmt = stmt.where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
+
+        # Apply CLV filter
+        if min_clv is not None:
+            stmt = stmt.where(OpportunityPerformance.clv_percentage >= min_clv)
+
+        # Apply bookmaker filter
+        if bookmaker:
+            stmt = stmt.where(OpportunityPerformance.bookmaker == bookmaker)
+
+        # Apply market filter
+        if market_type:
+            stmt = stmt.where(OpportunityPerformance.market_type == market_type)
+
+        # Apply date filters
+        if date_from:
+            try:
+                from_date = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                stmt = stmt.where(Game.commence_time >= from_date)
+            except ValueError:
+                pass
+
+        if date_to:
+            try:
+                to_date = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                stmt = stmt.where(Game.commence_time <= to_date)
+            except ValueError:
+                pass
+
+        # Apply sorting
+        if sort_by == "clv":
+            stmt = stmt.order_by(OpportunityPerformance.clv_percentage.desc())
+        elif sort_by == "date":
+            stmt = stmt.order_by(Game.commence_time.desc())
+        else:
+            stmt = stmt.order_by(OpportunityPerformance.clv_percentage.desc())
+
+        # Apply pagination
+        stmt = stmt.offset(offset).limit(limit)
+
+        results = db.execute(stmt).all()
+
+        opportunities = []
+        for opp, game in results:
+            # Get team names
+            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
+            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+
+            opp_status = "pending" if opp.result == "pending" or opp.result is None else "settled"
+
+            opportunities.append({
+                "id": opp.id,
+                "game_id": opp.game_id,
+                "home_team": home_team.name if home_team else "Unknown",
+                "away_team": away_team.name if away_team else "Unknown",
+                "commence_time": game.commence_time.isoformat(),
+                "bookmaker": opp.bookmaker,
+                "market_type": opp.market_type,
+                "outcome_name": opp.outcome_name,
+                "point_line": opp.point_line,
+                "entry_odds": opp.entry_odds,
+                "closing_odds": opp.closing_odds,
+                "clv_percentage": round(opp.clv_percentage, 2),
+                "result": opp.result,
+                "profit_loss": round(opp.profit_loss, 2) if opp.profit_loss else None,
+                "settled_at": opp.settled_at.isoformat() if opp.settled_at else None,
+                "status": opp_status,
+            })
+
+        # Get total count for pagination
+        count_stmt = (
+            select(OpportunityPerformance)
+        )
+        if status == "pending":
+            count_stmt = count_stmt.where(OpportunityPerformance.result == "pending")
+        elif status == "settled":
+            count_stmt = count_stmt.where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
+        if min_clv is not None:
+            count_stmt = count_stmt.where(OpportunityPerformance.clv_percentage >= min_clv)
+        if bookmaker:
+            count_stmt = count_stmt.where(OpportunityPerformance.bookmaker == bookmaker)
+        if market_type:
+            count_stmt = count_stmt.where(OpportunityPerformance.market_type == market_type)
+
+        total_count = len(db.execute(count_stmt).all())
+
+        return {
+            "opportunities": opportunities,
+            "total": total_count,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(opportunities) < total_count,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting opportunities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.get("/upcoming-opportunities")
+async def get_upcoming_opportunities(
+    hours_ahead: int = 24,
+    min_ev_score: float = 0.0,
+):
+    """
+    Get opportunities for upcoming games grouped by game.
+
+    Args:
+        hours_ahead: Number of hours to look ahead
+        min_ev_score: Minimum EV score to include
+    """
+    db = get_db()
+
+    try:
+        model = get_model()
+        engineer = FeatureEngineer()
+
+        now = datetime.now(timezone.utc)
+        cutoff = now + timedelta(hours=hours_ahead)
+
+        # Get upcoming games
+        stmt = (
+            select(Game, Team)
+            .join(Team, Team.id == Game.home_team_id)
+            .where(Game.commence_time > now)
+            .where(Game.commence_time <= cutoff)
+            .order_by(Game.commence_time)
+        )
+
+        games = db.execute(stmt).all()
+
+        if not games:
+            return {"games": [], "total_opportunities": 0}
+
+        game_opportunities = []
+
+        for game, home_team in games:
+            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+
+            # Get all snapshots for this game
+            snapshot_stmt = (
+                select(OddsSnapshot)
+                .where(OddsSnapshot.game_id == game.id)
+            )
+            snapshots = db.execute(snapshot_stmt).scalars().all()
+
+            game_opps = []
+            for snapshot in snapshots:
+                bookmaker = db.query(Bookmaker).filter(
+                    Bookmaker.id == snapshot.bookmaker_id
+                ).first()
+
+                hours_to_game = (game.commence_time - now).total_seconds() / 3600
+                day_of_week = game.commence_time.weekday()
+                is_weekend = day_of_week >= 5
+
+                for outcome in snapshot.outcomes:
+                    outcome_name = outcome.get("name")
+                    opening_price = outcome.get("price")
+                    opening_point = outcome.get("point", 0.0)
+
+                    if not outcome_name or opening_price is None:
+                        continue
+
+                    # Calculate consensus
+                    consensus_line = engineer.calculate_consensus_line(
+                        db, game.id, snapshot.market_type, outcome_name
+                    )
+                    line_spread = engineer.calculate_line_spread(
+                        db, game.id, snapshot.market_type, outcome_name
+                    )
+
+                    # Create features with defaults for new features
+                    features = pd.DataFrame([{
+                        "bookmaker_id": snapshot.bookmaker_id,
+                        "market_type": snapshot.market_type,
+                        "hours_to_game": hours_to_game,
+                        "day_of_week": day_of_week,
+                        "is_weekend": is_weekend,
+                        "outcome_name": outcome_name,
+                        "opening_price": float(opening_price),
+                        "opening_point": float(opening_point) if opening_point is not None else 0.0,
+                        "consensus_line": consensus_line if consensus_line is not None else float(opening_price),
+                        "line_spread": line_spread if line_spread is not None else 0.0,
+                        "distance_from_consensus": (
+                            float(opening_price) - consensus_line
+                            if consensus_line is not None
+                            else 0.0
+                        ),
+                        "is_outlier": (
+                            abs(float(opening_price) - consensus_line) > 0.05
+                            if consensus_line is not None
+                            else False
+                        ),
+                        # Default temporal features
+                        "time_since_last_update": 0.0,
+                        "movement_velocity": 0.0,
+                        "updates_count": 1,
+                        "price_volatility_24h": 0.0,
+                        "cumulative_movement": 0.0,
+                        "movement_direction_changes": 0,
+                        # Default bookmaker features
+                        "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
+                        "relative_to_pinnacle": 0.0,
+                        "books_moved_count": 0,
+                        "steam_move_signal": 0.0,
+                    }])
+
+                    try:
+                        movement_pred = model.predict_movement(features)
+                        predicted_delta = float(movement_pred["predicted_delta"][0])
+                        confidence = float(movement_pred["confidence"][0])
+                        direction = movement_pred["predicted_direction"][0]
+
+                        # Calculate EV score
+                        if direction == "DOWN" and predicted_delta < -0.01:
+                            ev_score = abs(predicted_delta) * confidence * 100
+                        elif direction == "UP" and predicted_delta > 0.01:
+                            ev_score = abs(predicted_delta) * confidence * 100
+                        else:
+                            ev_score = 0.0
+
+                        if ev_score < min_ev_score:
+                            continue
+
+                        # Format line
+                        if opening_point != 0:
+                            current_line = f"{opening_point:+.1f} at {decimal_to_american(opening_price)}"
+                        else:
+                            current_line = decimal_to_american(opening_price)
+
+                        game_opps.append({
+                            "bookmaker": bookmaker.name if bookmaker else "Unknown",
+                            "market_type": snapshot.market_type,
+                            "outcome_name": outcome_name,
+                            "current_line": current_line,
+                            "predicted_movement": round(predicted_delta, 4),
+                            "predicted_direction": direction,
+                            "confidence": round(confidence, 3),
+                            "ev_score": round(ev_score, 2),
+                        })
+                    except Exception:
+                        continue
+
+            # Sort opportunities by EV score
+            game_opps.sort(key=lambda x: x["ev_score"], reverse=True)
+
+            if game_opps:
+                game_opportunities.append({
+                    "game_id": game.id,
+                    "home_team": home_team.name,
+                    "away_team": away_team.name if away_team else "Unknown",
+                    "commence_time": game.commence_time.isoformat(),
+                    "hours_to_game": round(hours_to_game, 1),
+                    "opportunities": game_opps[:10],  # Top 10 per game
+                    "total_opportunities": len(game_opps),
+                })
+
+        # Sort games by best opportunity
+        game_opportunities.sort(
+            key=lambda x: x["opportunities"][0]["ev_score"] if x["opportunities"] else 0,
+            reverse=True
+        )
+
+        total_opps = sum(g["total_opportunities"] for g in game_opportunities)
+
+        return {
+            "games": game_opportunities,
+            "total_opportunities": total_opps,
+            "hours_ahead": hours_ahead,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting upcoming opportunities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()

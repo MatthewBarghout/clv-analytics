@@ -1,20 +1,279 @@
 """Feature engineering for line movement prediction ML model."""
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.orm import Session
 
 from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot
 
 logger = logging.getLogger(__name__)
 
+# Market-specific direction thresholds for classifying movement
+DIRECTION_THRESHOLDS = {
+    'h2h': 0.02,      # Moneyline moves more freely
+    'spreads': 0.01,  # Spreads are tighter
+    'totals': 0.01,   # Totals are tighter
+}
+
+# Sharp bookmakers that set the market
+SHARP_BOOKMAKERS = {'pinnacle', 'pinnaclesports', 'betcris', 'bookmaker'}
+
+
+def get_direction_threshold(market_type: str) -> float:
+    """Get the direction classification threshold for a market type."""
+    return DIRECTION_THRESHOLDS.get(market_type, 0.01)
+
 
 class FeatureEngineer:
     """Handles feature extraction and data preparation for line movement prediction."""
+
+    def __init__(self):
+        """Initialize feature engineer with cached bookmaker info."""
+        self._bookmaker_cache: Dict[int, str] = {}
+        self._pinnacle_id: Optional[int] = None
+
+    def _get_bookmaker_name(self, session: Session, bookmaker_id: int) -> str:
+        """Get bookmaker name with caching."""
+        if bookmaker_id not in self._bookmaker_cache:
+            bookmaker = session.query(Bookmaker).filter(Bookmaker.id == bookmaker_id).first()
+            self._bookmaker_cache[bookmaker_id] = bookmaker.key.lower() if bookmaker else ""
+        return self._bookmaker_cache[bookmaker_id]
+
+    def _get_pinnacle_id(self, session: Session) -> Optional[int]:
+        """Get Pinnacle bookmaker ID with caching."""
+        if self._pinnacle_id is None:
+            for sharp in SHARP_BOOKMAKERS:
+                bookmaker = session.query(Bookmaker).filter(Bookmaker.key.ilike(f"%{sharp}%")).first()
+                if bookmaker:
+                    self._pinnacle_id = bookmaker.id
+                    break
+        return self._pinnacle_id
+
+    def is_sharp_bookmaker(self, session: Session, bookmaker_id: int) -> bool:
+        """Check if a bookmaker is considered 'sharp' (market-setting)."""
+        name = self._get_bookmaker_name(session, bookmaker_id)
+        return name in SHARP_BOOKMAKERS
+
+    def calculate_temporal_features(
+        self,
+        session: Session,
+        game_id: int,
+        bookmaker_id: int,
+        market_type: str,
+        outcome_name: str,
+        current_timestamp: datetime,
+    ) -> Dict[str, float]:
+        """
+        Calculate temporal features based on historical snapshots.
+
+        Returns:
+            Dict with temporal features:
+            - time_since_last_update: Hours since previous snapshot
+            - movement_velocity: Rate of change (delta/hours) from last update
+            - updates_count: Number of prior snapshots
+            - price_volatility_24h: Std dev of prices in last 24 hours
+            - cumulative_movement: Total movement from first snapshot
+            - movement_direction_changes: Number of direction reversals
+        """
+        try:
+            # Get all prior snapshots for this outcome
+            stmt = (
+                select(OddsSnapshot)
+                .where(OddsSnapshot.game_id == game_id)
+                .where(OddsSnapshot.bookmaker_id == bookmaker_id)
+                .where(OddsSnapshot.market_type == market_type)
+                .where(OddsSnapshot.timestamp < current_timestamp)
+                .order_by(OddsSnapshot.timestamp.asc())
+            )
+            prior_snapshots = session.execute(stmt).scalars().all()
+
+            if not prior_snapshots:
+                return {
+                    "time_since_last_update": 0.0,
+                    "movement_velocity": 0.0,
+                    "updates_count": 0,
+                    "price_volatility_24h": 0.0,
+                    "cumulative_movement": 0.0,
+                    "movement_direction_changes": 0,
+                }
+
+            # Extract prices for this outcome
+            prices_with_times = []
+            for snapshot in prior_snapshots:
+                for outcome in snapshot.outcomes:
+                    if outcome.get("name") == outcome_name:
+                        price = outcome.get("price")
+                        if price is not None:
+                            prices_with_times.append((snapshot.timestamp, float(price)))
+                        break
+
+            if not prices_with_times:
+                return {
+                    "time_since_last_update": 0.0,
+                    "movement_velocity": 0.0,
+                    "updates_count": 0,
+                    "price_volatility_24h": 0.0,
+                    "cumulative_movement": 0.0,
+                    "movement_direction_changes": 0,
+                }
+
+            # Time since last update
+            last_time, last_price = prices_with_times[-1]
+            time_since_last = (current_timestamp - last_time).total_seconds() / 3600
+
+            # Movement velocity
+            if len(prices_with_times) >= 2:
+                prev_time, prev_price = prices_with_times[-2]
+                time_delta = (last_time - prev_time).total_seconds() / 3600
+                price_delta = last_price - prev_price
+                velocity = price_delta / time_delta if time_delta > 0 else 0.0
+            else:
+                velocity = 0.0
+
+            # Cumulative movement from first snapshot
+            first_price = prices_with_times[0][1]
+            cumulative_movement = last_price - first_price
+
+            # Price volatility in last 24 hours
+            cutoff_24h = current_timestamp - timedelta(hours=24)
+            recent_prices = [p for t, p in prices_with_times if t >= cutoff_24h]
+            volatility = float(np.std(recent_prices)) if len(recent_prices) > 1 else 0.0
+
+            # Direction changes
+            direction_changes = 0
+            if len(prices_with_times) >= 3:
+                prices_only = [p for _, p in prices_with_times]
+                for i in range(1, len(prices_only) - 1):
+                    prev_direction = prices_only[i] - prices_only[i - 1]
+                    next_direction = prices_only[i + 1] - prices_only[i]
+                    if (prev_direction > 0 and next_direction < 0) or (prev_direction < 0 and next_direction > 0):
+                        direction_changes += 1
+
+            return {
+                "time_since_last_update": time_since_last,
+                "movement_velocity": velocity,
+                "updates_count": len(prices_with_times),
+                "price_volatility_24h": volatility,
+                "cumulative_movement": cumulative_movement,
+                "movement_direction_changes": direction_changes,
+            }
+
+        except Exception as e:
+            logger.error(f"Error calculating temporal features: {e}")
+            return {
+                "time_since_last_update": 0.0,
+                "movement_velocity": 0.0,
+                "updates_count": 0,
+                "price_volatility_24h": 0.0,
+                "cumulative_movement": 0.0,
+                "movement_direction_changes": 0,
+            }
+
+    def calculate_bookmaker_features(
+        self,
+        session: Session,
+        game_id: int,
+        bookmaker_id: int,
+        market_type: str,
+        outcome_name: str,
+        current_price: float,
+    ) -> Dict[str, float]:
+        """
+        Calculate bookmaker-specific features.
+
+        Returns:
+            Dict with bookmaker features:
+            - bookmaker_is_sharp: 1 if Pinnacle/sharp book, 0 otherwise
+            - relative_to_pinnacle: Distance from Pinnacle line
+            - books_moved_count: Number of books that have moved in same direction
+            - steam_move_signal: Signal indicating coordinated movement across books
+        """
+        try:
+            is_sharp = 1.0 if self.is_sharp_bookmaker(session, bookmaker_id) else 0.0
+
+            # Get Pinnacle line if available
+            pinnacle_id = self._get_pinnacle_id(session)
+            relative_to_pinnacle = 0.0
+
+            if pinnacle_id and pinnacle_id != bookmaker_id:
+                stmt = (
+                    select(OddsSnapshot)
+                    .where(OddsSnapshot.game_id == game_id)
+                    .where(OddsSnapshot.bookmaker_id == pinnacle_id)
+                    .where(OddsSnapshot.market_type == market_type)
+                    .order_by(OddsSnapshot.timestamp.desc())
+                    .limit(1)
+                )
+                pinnacle_snapshot = session.execute(stmt).scalar_one_or_none()
+
+                if pinnacle_snapshot:
+                    for outcome in pinnacle_snapshot.outcomes:
+                        if outcome.get("name") == outcome_name:
+                            pinnacle_price = outcome.get("price")
+                            if pinnacle_price:
+                                relative_to_pinnacle = current_price - float(pinnacle_price)
+                            break
+
+            # Count books that have moved - get latest snapshot from each bookmaker
+            stmt = (
+                select(OddsSnapshot)
+                .where(OddsSnapshot.game_id == game_id)
+                .where(OddsSnapshot.market_type == market_type)
+                .order_by(OddsSnapshot.bookmaker_id, OddsSnapshot.timestamp.desc())
+            )
+            all_snapshots = session.execute(stmt).scalars().all()
+
+            # Group by bookmaker and track latest prices
+            latest_by_book = {}
+            first_by_book = {}
+            for snapshot in all_snapshots:
+                bid = snapshot.bookmaker_id
+                for outcome in snapshot.outcomes:
+                    if outcome.get("name") == outcome_name:
+                        price = outcome.get("price")
+                        if price:
+                            if bid not in latest_by_book:
+                                latest_by_book[bid] = float(price)
+                            first_by_book[bid] = float(price)  # Will be overwritten to get first
+                        break
+
+            # Count direction of movements
+            up_moves = 0
+            down_moves = 0
+            for bid, latest_price in latest_by_book.items():
+                first_price = first_by_book.get(bid, latest_price)
+                if latest_price > first_price + 0.01:
+                    up_moves += 1
+                elif latest_price < first_price - 0.01:
+                    down_moves += 1
+
+            total_books = len(latest_by_book)
+            steam_signal = 0.0
+            if total_books >= 3:
+                # Steam move if 60%+ of books moved in same direction
+                max_moves = max(up_moves, down_moves)
+                if max_moves / total_books >= 0.6:
+                    steam_signal = 1.0 if up_moves > down_moves else -1.0
+
+            return {
+                "bookmaker_is_sharp": is_sharp,
+                "relative_to_pinnacle": relative_to_pinnacle,
+                "books_moved_count": up_moves + down_moves,
+                "steam_move_signal": steam_signal,
+            }
+
+        except Exception as e:
+            logger.error(f"Error calculating bookmaker features: {e}")
+            return {
+                "bookmaker_is_sharp": 0.0,
+                "relative_to_pinnacle": 0.0,
+                "books_moved_count": 0,
+                "steam_move_signal": 0.0,
+            }
 
     def calculate_consensus_line(
         self, session: Session, game_id: int, market_type: str, outcome_name: str
@@ -182,6 +441,18 @@ class FeatureEngineer:
                     session, game.id, snapshot.market_type, outcome_name
                 )
 
+                # Calculate temporal features
+                temporal_features = self.calculate_temporal_features(
+                    session, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, snapshot.timestamp
+                )
+
+                # Calculate bookmaker features
+                bookmaker_features = self.calculate_bookmaker_features(
+                    session, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, float(opening_price)
+                )
+
                 # Calculate movement targets
                 price_movement = float(closing_price) - float(opening_price)
                 point_movement = (
@@ -190,16 +461,18 @@ class FeatureEngineer:
                     else 0.0
                 )
 
-                # Determine directional movement for price
-                if price_movement > 0.01:  # Moved up
+                # Determine directional movement using market-specific threshold
+                threshold = get_direction_threshold(snapshot.market_type)
+                if price_movement > threshold:
                     direction = "UP"
-                elif price_movement < -0.01:  # Moved down
+                elif price_movement < -threshold:
                     direction = "DOWN"
-                else:  # Stayed same
+                else:
                     direction = "STAY"
 
-                # Create row
+                # Create row with all features
                 row = {
+                    # Base features
                     "bookmaker_id": snapshot.bookmaker_id,
                     "market_type": snapshot.market_type,
                     "hours_to_game": hours_to_game,
@@ -220,6 +493,18 @@ class FeatureEngineer:
                         if consensus_line is not None
                         else False
                     ),
+                    # Temporal features
+                    "time_since_last_update": temporal_features["time_since_last_update"],
+                    "movement_velocity": temporal_features["movement_velocity"],
+                    "updates_count": temporal_features["updates_count"],
+                    "price_volatility_24h": temporal_features["price_volatility_24h"],
+                    "cumulative_movement": temporal_features["cumulative_movement"],
+                    "movement_direction_changes": temporal_features["movement_direction_changes"],
+                    # Bookmaker features
+                    "bookmaker_is_sharp": bookmaker_features["bookmaker_is_sharp"],
+                    "relative_to_pinnacle": bookmaker_features["relative_to_pinnacle"],
+                    "books_moved_count": bookmaker_features["books_moved_count"],
+                    "steam_move_signal": bookmaker_features["steam_move_signal"],
                     # Targets
                     "price_movement": price_movement,
                     "point_movement": point_movement,
@@ -262,6 +547,7 @@ class FeatureEngineer:
 
         # Separate features and targets
         feature_cols = [
+            # Base features
             "bookmaker_id",
             "market_type",
             "hours_to_game",
@@ -274,7 +560,22 @@ class FeatureEngineer:
             "line_spread",
             "distance_from_consensus",
             "is_outlier",
+            # Temporal features
+            "time_since_last_update",
+            "movement_velocity",
+            "updates_count",
+            "price_volatility_24h",
+            "cumulative_movement",
+            "movement_direction_changes",
+            # Bookmaker features
+            "bookmaker_is_sharp",
+            "relative_to_pinnacle",
+            "books_moved_count",
+            "steam_move_signal",
         ]
+
+        # Filter to only columns that exist in the dataframe
+        feature_cols = [col for col in feature_cols if col in df.columns]
 
         X = df[feature_cols]
         y_regression = df[["price_movement", "point_movement"]]

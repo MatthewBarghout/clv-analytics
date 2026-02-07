@@ -11,6 +11,13 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.analyzers.clv_calculator import CLVCalculator
+from src.analyzers.bet_sizing import (
+    BetContext,
+    BetSizingStrategy,
+    calculate_sharpe_ratio,
+    calculate_sortino_ratio,
+    get_bet_sizer,
+)
 from src.collectors.odds_api_client import OddsAPIClient
 from src.api.schemas import (
     BookmakerStats,
@@ -716,12 +723,24 @@ async def get_report_opportunities(report_id: int):
 async def get_bankroll_simulation(
     bet_size: float = 100.0,
     starting_bankroll: float = 10000.0,
+    strategy: str = "fixed",
+    fraction_percent: float = 2.0,
+    max_bet_percent: float = 25.0,
+    bookmaker_filter: str = None,
+    market_filter: str = None,
+    clv_threshold: float = None,
 ):
     """Get bankroll simulation data with P&L curves and drawdown analysis.
 
     Args:
-        bet_size: Amount wagered per bet (default $100)
+        bet_size: Amount wagered per bet for fixed strategy (default $100)
         starting_bankroll: Starting bankroll amount (default $10,000)
+        strategy: Betting strategy - fixed, fractional, kelly, half_kelly, confidence
+        fraction_percent: Percentage of bankroll for fractional/confidence strategies
+        max_bet_percent: Maximum bet as percentage of bankroll (Kelly cap)
+        bookmaker_filter: Only include bets from this bookmaker
+        market_filter: Only include bets from this market type (h2h, spreads, totals)
+        clv_threshold: Minimum CLV% to include bet in simulation
     """
     db = get_db()
 
@@ -735,6 +754,14 @@ async def get_bankroll_simulation(
             .order_by(OpportunityPerformance.settled_at.asc())
         )
 
+        # Apply filters
+        if bookmaker_filter:
+            stmt = stmt.where(OpportunityPerformance.bookmaker == bookmaker_filter)
+        if market_filter:
+            stmt = stmt.where(OpportunityPerformance.market_type == market_filter)
+        if clv_threshold is not None:
+            stmt = stmt.where(OpportunityPerformance.clv_percentage >= clv_threshold)
+
         results = db.execute(stmt).all()
 
         if not results:
@@ -743,11 +770,28 @@ async def get_bankroll_simulation(
                 "message": "No settled bets found for simulation",
                 "data_points": [],
                 "summary": {},
+                "by_bookmaker": {},
+                "by_market": {},
             }
+
+        # Initialize bet sizer based on strategy
+        try:
+            strategy_enum = BetSizingStrategy(strategy)
+        except ValueError:
+            strategy_enum = BetSizingStrategy.FIXED
+
+        bet_sizer = get_bet_sizer(
+            strategy=strategy_enum,
+            unit_size=bet_size,
+            fraction=fraction_percent / 100,
+            kelly_fraction=1.0 if strategy_enum == BetSizingStrategy.KELLY else 0.5,
+        )
 
         # Build cumulative P&L curve
         data_points = []
+        bet_returns = []  # For Sharpe calculation
         cumulative_pl = 0.0
+        current_bankroll = starting_bankroll
         peak_bankroll = starting_bankroll
         max_drawdown = 0.0
         max_drawdown_pct = 0.0
@@ -755,21 +799,45 @@ async def get_bankroll_simulation(
         win_count = 0
         loss_count = 0
         push_count = 0
+        total_wagered = 0.0
+        bet_sizes = []
+
+        # Track by bookmaker and market
+        by_bookmaker = {}
+        by_market = {}
 
         for opp, game, report in results:
+            # Calculate bet size using the chosen strategy
+            context = BetContext(
+                bankroll=current_bankroll,
+                odds=opp.entry_odds,
+                clv_percentage=opp.clv_percentage,
+                ml_confidence=0.6,  # Default confidence
+                max_fraction=max_bet_percent / 100,
+            )
+
+            sizing_result = bet_sizer.calculate_bet_size(context)
+            actual_bet_size = sizing_result.bet_size
+            bet_sizes.append(actual_bet_size)
+
             # Calculate profit/loss for this bet
-            # Odds are stored as decimal odds (e.g., 2.01, 1.95)
             if opp.result == "win":
-                profit = bet_size * (opp.entry_odds - 1)
+                profit = actual_bet_size * (opp.entry_odds - 1)
                 win_count += 1
             elif opp.result == "loss":
-                profit = -bet_size
+                profit = -actual_bet_size
                 loss_count += 1
             else:  # push
                 profit = 0
                 push_count += 1
 
+            # Track return for Sharpe ratio
+            if actual_bet_size > 0:
+                bet_return = profit / actual_bet_size
+                bet_returns.append(bet_return)
+
             cumulative_pl += profit
+            total_wagered += actual_bet_size
             current_bankroll = starting_bankroll + cumulative_pl
 
             # Track peak and drawdown
@@ -781,6 +849,40 @@ async def get_bankroll_simulation(
                 if current_drawdown > max_drawdown:
                     max_drawdown = current_drawdown
                     max_drawdown_pct = (current_drawdown / peak_bankroll) * 100
+
+            # Track by bookmaker
+            if opp.bookmaker not in by_bookmaker:
+                by_bookmaker[opp.bookmaker] = {
+                    "bets": 0, "wins": 0, "losses": 0, "pushes": 0,
+                    "profit": 0.0, "wagered": 0.0, "clv_sum": 0.0
+                }
+            by_bookmaker[opp.bookmaker]["bets"] += 1
+            by_bookmaker[opp.bookmaker]["wagered"] += actual_bet_size
+            by_bookmaker[opp.bookmaker]["profit"] += profit
+            by_bookmaker[opp.bookmaker]["clv_sum"] += opp.clv_percentage
+            if opp.result == "win":
+                by_bookmaker[opp.bookmaker]["wins"] += 1
+            elif opp.result == "loss":
+                by_bookmaker[opp.bookmaker]["losses"] += 1
+            else:
+                by_bookmaker[opp.bookmaker]["pushes"] += 1
+
+            # Track by market
+            if opp.market_type not in by_market:
+                by_market[opp.market_type] = {
+                    "bets": 0, "wins": 0, "losses": 0, "pushes": 0,
+                    "profit": 0.0, "wagered": 0.0, "clv_sum": 0.0
+                }
+            by_market[opp.market_type]["bets"] += 1
+            by_market[opp.market_type]["wagered"] += actual_bet_size
+            by_market[opp.market_type]["profit"] += profit
+            by_market[opp.market_type]["clv_sum"] += opp.clv_percentage
+            if opp.result == "win":
+                by_market[opp.market_type]["wins"] += 1
+            elif opp.result == "loss":
+                by_market[opp.market_type]["losses"] += 1
+            else:
+                by_market[opp.market_type]["pushes"] += 1
 
             # Get team names
             home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
@@ -796,6 +898,7 @@ async def get_bankroll_simulation(
                 "drawdown_pct": round((current_drawdown / peak_bankroll) * 100 if peak_bankroll > 0 else 0, 2),
                 "result": opp.result,
                 "profit": round(profit, 2),
+                "bet_size": round(actual_bet_size, 2),
                 "game": f"{away_team.name if away_team else 'Unknown'} @ {home_team.name if home_team else 'Unknown'}",
                 "bookmaker": opp.bookmaker,
                 "outcome": opp.outcome_name,
@@ -806,14 +909,40 @@ async def get_bankroll_simulation(
             })
 
         total_bets = win_count + loss_count + push_count
-        total_wagered = total_bets * bet_size
+
+        # Calculate risk metrics
+        sharpe_ratio = calculate_sharpe_ratio(bet_returns) if bet_returns else 0.0
+        sortino_ratio = calculate_sortino_ratio(bet_returns) if bet_returns else 0.0
+
+        # Calculate bet size statistics
+        import numpy as np
+        avg_bet_size = float(np.mean(bet_sizes)) if bet_sizes else 0.0
+        bet_size_std = float(np.std(bet_sizes)) if len(bet_sizes) > 1 else 0.0
+
+        # Finalize by_bookmaker stats
+        for bk in by_bookmaker.values():
+            bk["roi"] = round((bk["profit"] / bk["wagered"]) * 100, 2) if bk["wagered"] > 0 else 0
+            bk["avg_clv"] = round(bk["clv_sum"] / bk["bets"], 2) if bk["bets"] > 0 else 0
+            bk["win_rate"] = round((bk["wins"] / (bk["wins"] + bk["losses"])) * 100, 2) if (bk["wins"] + bk["losses"]) > 0 else 0
+            bk["profit"] = round(bk["profit"], 2)
+            bk["wagered"] = round(bk["wagered"], 2)
+            del bk["clv_sum"]
+
+        # Finalize by_market stats
+        for mkt in by_market.values():
+            mkt["roi"] = round((mkt["profit"] / mkt["wagered"]) * 100, 2) if mkt["wagered"] > 0 else 0
+            mkt["avg_clv"] = round(mkt["clv_sum"] / mkt["bets"], 2) if mkt["bets"] > 0 else 0
+            mkt["win_rate"] = round((mkt["wins"] / (mkt["wins"] + mkt["losses"])) * 100, 2) if (mkt["wins"] + mkt["losses"]) > 0 else 0
+            mkt["profit"] = round(mkt["profit"], 2)
+            mkt["wagered"] = round(mkt["wagered"], 2)
+            del mkt["clv_sum"]
 
         return {
             "has_data": True,
             "data_points": data_points,
             "summary": {
                 "starting_bankroll": starting_bankroll,
-                "ending_bankroll": round(starting_bankroll + cumulative_pl, 2),
+                "ending_bankroll": round(current_bankroll, 2),
                 "total_profit_loss": round(cumulative_pl, 2),
                 "roi_pct": round((cumulative_pl / total_wagered) * 100, 2) if total_wagered > 0 else 0,
                 "total_bets": total_bets,
@@ -823,14 +952,130 @@ async def get_bankroll_simulation(
                 "win_rate": round((win_count / (win_count + loss_count)) * 100, 2) if (win_count + loss_count) > 0 else 0,
                 "max_drawdown": round(max_drawdown, 2),
                 "max_drawdown_pct": round(max_drawdown_pct, 2),
-                "bet_size": bet_size,
                 "total_wagered": round(total_wagered, 2),
                 "peak_bankroll": round(peak_bankroll, 2),
+                "strategy": strategy,
+                "sharpe_ratio": round(sharpe_ratio, 3),
+                "sortino_ratio": round(sortino_ratio, 3),
+                "avg_bet_size": round(avg_bet_size, 2),
+                "bet_size_std": round(bet_size_std, 2),
             },
+            "by_bookmaker": by_bookmaker,
+            "by_market": by_market,
         }
 
     except Exception as e:
         logger.error(f"Error running bankroll simulation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/bankroll-simulation/breakdown")
+async def get_bankroll_breakdown(
+    group_by: str = "bookmaker",
+    clv_bucket_size: float = 1.0,
+):
+    """Get performance breakdown grouped by different dimensions.
+
+    Args:
+        group_by: Dimension to group by - bookmaker, market, month, clv_bucket
+        clv_bucket_size: Size of CLV buckets in percentage points (for clv_bucket grouping)
+    """
+    db = get_db()
+
+    try:
+        # Get all settled opportunities
+        stmt = (
+            select(OpportunityPerformance, Game)
+            .join(Game, Game.id == OpportunityPerformance.game_id)
+            .where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
+            .order_by(OpportunityPerformance.settled_at.asc())
+        )
+
+        results = db.execute(stmt).all()
+
+        if not results:
+            return {"has_data": False, "breakdown": []}
+
+        # Group data
+        groups = {}
+
+        for opp, game in results:
+            # Determine group key
+            if group_by == "bookmaker":
+                key = opp.bookmaker
+            elif group_by == "market":
+                key = opp.market_type
+            elif group_by == "month":
+                if opp.settled_at:
+                    key = opp.settled_at.strftime("%Y-%m")
+                else:
+                    key = "Unknown"
+            elif group_by == "clv_bucket":
+                # Create CLV buckets (e.g., 0-1%, 1-2%, 2-3%, etc.)
+                bucket_floor = int(opp.clv_percentage / clv_bucket_size) * clv_bucket_size
+                bucket_ceil = bucket_floor + clv_bucket_size
+                if opp.clv_percentage < 0:
+                    key = f"{bucket_floor:.1f}% to {bucket_ceil:.1f}%"
+                else:
+                    key = f"{bucket_floor:.1f}% to {bucket_ceil:.1f}%"
+            else:
+                key = "all"
+
+            if key not in groups:
+                groups[key] = {
+                    "bets": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "pushes": 0,
+                    "profit": 0.0,
+                    "clv_sum": 0.0,
+                }
+
+            groups[key]["bets"] += 1
+            groups[key]["clv_sum"] += opp.clv_percentage
+
+            # Assume $100 unit bets for breakdown
+            if opp.result == "win":
+                profit = 100 * (opp.entry_odds - 1)
+                groups[key]["wins"] += 1
+            elif opp.result == "loss":
+                profit = -100
+                groups[key]["losses"] += 1
+            else:
+                profit = 0
+                groups[key]["pushes"] += 1
+
+            groups[key]["profit"] += profit
+
+        # Build breakdown list
+        breakdown = []
+        for key, data in groups.items():
+            settled = data["wins"] + data["losses"]
+            breakdown.append({
+                "group": key,
+                "bets": data["bets"],
+                "wins": data["wins"],
+                "losses": data["losses"],
+                "pushes": data["pushes"],
+                "profit": round(data["profit"], 2),
+                "roi": round((data["profit"] / (data["bets"] * 100)) * 100, 2) if data["bets"] > 0 else 0,
+                "win_rate": round((data["wins"] / settled) * 100, 2) if settled > 0 else 0,
+                "avg_clv": round(data["clv_sum"] / data["bets"], 2) if data["bets"] > 0 else 0,
+            })
+
+        # Sort by profit descending
+        breakdown.sort(key=lambda x: x["profit"], reverse=True)
+
+        return {
+            "has_data": True,
+            "group_by": group_by,
+            "breakdown": breakdown,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting breakdown: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

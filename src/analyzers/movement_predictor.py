@@ -67,6 +67,13 @@ class LineMovementPredictor:
         self.xgb_weight = xgb_weight
         self.rf_weight = rf_weight
 
+        # Per-market weights (can be optimized via grid search)
+        self.market_weights: Dict[str, Dict[str, float]] = {
+            'h2h': {'xgb': 0.5, 'rf': 0.5},
+            'spreads': {'xgb': 0.5, 'rf': 0.5},
+            'totals': {'xgb': 0.5, 'rf': 0.5},
+        }
+
         # XGBoost regression model for movement magnitude
         self.xgb_regression = XGBRegressor(
             n_estimators=n_estimators,
@@ -122,6 +129,7 @@ class LineMovementPredictor:
         self.feature_names: Optional[list] = None
         self.categorical_features = ["market_type", "outcome_name"]
         self.numerical_features = [
+            # Base features
             "bookmaker_id",
             "hours_to_game",
             "day_of_week",
@@ -132,6 +140,18 @@ class LineMovementPredictor:
             "line_spread",
             "distance_from_consensus",
             "is_outlier",
+            # Temporal features
+            "time_since_last_update",
+            "movement_velocity",
+            "updates_count",
+            "price_volatility_24h",
+            "cumulative_movement",
+            "movement_direction_changes",
+            # Bookmaker features
+            "bookmaker_is_sharp",
+            "relative_to_pinnacle",
+            "books_moved_count",
+            "steam_move_signal",
         ]
 
         # Load movement statistics for prediction capping
@@ -276,6 +296,79 @@ class LineMovementPredictor:
         logger.info(f"Number of features after preprocessing: {X_train_processed.shape[1]}")
         logger.info(f"Direction classes: {self.label_encoder.classes_}")
 
+    def optimize_ensemble_weights(
+        self,
+        X_val: pd.DataFrame,
+        y_val: pd.DataFrame,
+        weight_options: list = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Optimize ensemble weights per market type using grid search on validation data.
+
+        Args:
+            X_val: Validation features
+            y_val: Validation targets (price_movement column)
+            weight_options: List of XGB weights to try (RF = 1 - XGB)
+
+        Returns:
+            Dictionary of optimal weights per market type
+        """
+        if weight_options is None:
+            weight_options = [0.3, 0.4, 0.5, 0.6, 0.7]
+
+        X_val_processed = self.preprocessor.transform(X_val)
+
+        # Get individual model predictions
+        xgb_pred = self.xgb_regression.predict(X_val_processed)
+        rf_pred = self.rf_regression.predict(X_val_processed)
+
+        y_true = y_val["price_movement"].values
+
+        optimal_weights = {}
+
+        # Get unique market types
+        market_types = X_val["market_type"].unique()
+
+        for market in market_types:
+            market_mask = X_val["market_type"] == market
+            market_indices = np.where(market_mask)[0]
+
+            if len(market_indices) < 10:
+                logger.info(f"Insufficient data for {market}, using default weights")
+                optimal_weights[market] = {'xgb': 0.5, 'rf': 0.5}
+                continue
+
+            best_mae = float('inf')
+            best_xgb_weight = 0.5
+
+            for xgb_w in weight_options:
+                rf_w = 1 - xgb_w
+                ensemble_pred = (xgb_pred[market_indices] * xgb_w) + (rf_pred[market_indices] * rf_w)
+                mae = mean_absolute_error(y_true[market_indices], ensemble_pred)
+
+                if mae < best_mae:
+                    best_mae = mae
+                    best_xgb_weight = xgb_w
+
+            optimal_weights[market] = {
+                'xgb': best_xgb_weight,
+                'rf': 1 - best_xgb_weight,
+            }
+            logger.info(
+                f"Optimized weights for {market}: XGB={best_xgb_weight:.1f}, "
+                f"RF={1-best_xgb_weight:.1f} (MAE={best_mae:.4f})"
+            )
+
+        self.market_weights = optimal_weights
+        return optimal_weights
+
+    def get_weights_for_market(self, market_type: str) -> tuple:
+        """Get XGB and RF weights for a specific market type."""
+        if market_type in self.market_weights:
+            weights = self.market_weights[market_type]
+            return weights['xgb'], weights['rf']
+        return self.xgb_weight, self.rf_weight
+
     def predict_movement(self, X: pd.DataFrame) -> dict:
         """
         Predict line movement using ensemble (XGBoost + Random Forest average).
@@ -296,8 +389,12 @@ class LineMovementPredictor:
         xgb_pred = self.xgb_regression.predict(X_processed)
         rf_pred = self.rf_regression.predict(X_processed)
 
-        # Ensemble regression predictions (weighted average)
-        unconstrained_delta = (xgb_pred * self.xgb_weight) + (rf_pred * self.rf_weight)
+        # Ensemble regression predictions with per-market weights
+        unconstrained_delta = np.zeros(len(X))
+        for i in range(len(X)):
+            market_type = X.iloc[i]["market_type"]
+            xgb_w, rf_w = self.get_weights_for_market(market_type)
+            unconstrained_delta[i] = (xgb_pred[i] * xgb_w) + (rf_pred[i] * rf_w)
 
         # Constrain predictions to realistic ranges
         constrained_deltas = []
@@ -319,8 +416,12 @@ class LineMovementPredictor:
         rf_direction_encoded = self.rf_classification.predict(X_processed)
         rf_direction_proba = self.rf_classification.predict_proba(X_processed)
 
-        # Ensemble classification predictions (weighted average of probabilities)
-        ensemble_proba = (xgb_direction_proba * self.xgb_weight) + (rf_direction_proba * self.rf_weight)
+        # Ensemble classification predictions with per-market weights
+        ensemble_proba = np.zeros_like(xgb_direction_proba)
+        for i in range(len(X)):
+            market_type = X.iloc[i]["market_type"]
+            xgb_w, rf_w = self.get_weights_for_market(market_type)
+            ensemble_proba[i] = (xgb_direction_proba[i] * xgb_w) + (rf_direction_proba[i] * rf_w)
 
         # Get final direction from ensemble probabilities
         direction_encoded = np.argmax(ensemble_proba, axis=1)
@@ -545,6 +646,7 @@ class LineMovementPredictor:
             "learning_rate": self.learning_rate,
             "xgb_weight": self.xgb_weight,
             "rf_weight": self.rf_weight,
+            "market_weights": self.market_weights,
         }
 
         # Create directory if it doesn't exist
@@ -577,5 +679,11 @@ class LineMovementPredictor:
         self.learning_rate = model_data["learning_rate"]
         self.xgb_weight = model_data.get("xgb_weight", 0.5)
         self.rf_weight = model_data.get("rf_weight", 0.5)
+        self.market_weights = model_data.get("market_weights", {
+            'h2h': {'xgb': 0.5, 'rf': 0.5},
+            'spreads': {'xgb': 0.5, 'rf': 0.5},
+            'totals': {'xgb': 0.5, 'rf': 0.5},
+        })
 
         logger.info(f"Ensemble model loaded from {filepath}")
+        logger.info(f"Market weights: {self.market_weights}")
