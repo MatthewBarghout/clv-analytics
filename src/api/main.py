@@ -1,6 +1,8 @@
 """FastAPI backend for CLV analytics dashboard."""
 import logging
 import os
+import statistics
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List
 
@@ -49,7 +51,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,6 +78,24 @@ def get_db() -> Session:
         pass
 
 
+# Simple in-memory TTL cache
+_cache: dict = {}
+_cache_timestamps: dict = {}
+
+
+def _cache_get(key: str, ttl_seconds: int):
+    """Return cached value if not expired, else None."""
+    if key in _cache and (time.time() - _cache_timestamps.get(key, 0)) < ttl_seconds:
+        return _cache[key]
+    return None
+
+
+def _cache_set(key: str, value) -> None:
+    """Store value in cache with current timestamp."""
+    _cache[key] = value
+    _cache_timestamps[key] = time.time()
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -85,6 +105,10 @@ async def health_check():
 @app.get("/api/stats", response_model=CLVStats)
 async def get_clv_stats():
     """Get overall CLV statistics."""
+    cached = _cache_get("clv_stats", ttl_seconds=300)
+    if cached is not None:
+        return cached
+
     db = get_db()
     calc = CLVCalculator()
 
@@ -152,17 +176,17 @@ async def get_clv_stats():
             for market, values in by_market_type.items()
         }
 
-        return CLVStats(
+        result = CLVStats(
             mean_clv=sum(clv_values) / total if total > 0 else None,
-            median_clv=(
-                sorted(clv_values)[total // 2] if total > 0 else None
-            ),
+            median_clv=statistics.median(clv_values) if total > 0 else None,
             total_analyzed=total,
             positive_clv_count=positive_count,
             positive_clv_percentage=(positive_count / total * 100) if total > 0 else 0,
             by_bookmaker=bookmaker_stats,
             by_market_type=market_stats,
         )
+        _cache_set("clv_stats", result)
+        return result
 
     except Exception as e:
         logger.error(f"Error calculating stats: {e}")
@@ -199,13 +223,31 @@ async def get_games(limit: int = 50):
 
         results = db.execute(stmt).all()
 
+        # Pre-fetch away teams and betting outcomes to avoid N+1 queries
+        if results:
+            away_team_ids = list({game.away_team_id for game, _, _, _ in results})
+            game_ids = [game.id for game, _, _, _ in results]
+            away_teams_map = {
+                t.id: t
+                for t in db.execute(select(Team).where(Team.id.in_(away_team_ids))).scalars().all()
+            }
+            outcomes_map = {
+                o.game_id: o
+                for o in db.execute(
+                    select(BettingOutcome).where(BettingOutcome.game_id.in_(game_ids))
+                ).scalars().all()
+            }
+        else:
+            away_teams_map = {}
+            outcomes_map = {}
+
         games_with_clv = []
         for game, home_team_name, snapshots_count, closing_lines_count in results:
-            # Get away team name
-            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+            # Get away team name from pre-fetched map
+            away_team = away_teams_map.get(game.away_team_id)
 
-            # Get betting outcome (score) if available
-            betting_outcome = db.query(BettingOutcome).filter(BettingOutcome.game_id == game.id).first()
+            # Get betting outcome (score) from pre-fetched map
+            betting_outcome = outcomes_map.get(game.id)
 
             # Calculate CLV for this game
             avg_game_clv = None
@@ -279,6 +321,11 @@ async def get_clv_history(time_range: str = "30d"):
     Args:
         time_range: Time range filter - "7d", "30d", "90d", or "all"
     """
+    cache_key = f"clv_history_{time_range}"
+    cached = _cache_get(cache_key, ttl_seconds=300)
+    if cached is not None:
+        return cached
+
     db = get_db()
     calc = CLVCalculator()
 
@@ -348,7 +395,9 @@ async def get_clv_history(time_range: str = "30d"):
                 )
             )
 
-        return sorted(history, key=lambda x: x.date)
+        result = sorted(history, key=lambda x: x.date)
+        _cache_set(cache_key, result)
+        return result
 
     except Exception as e:
         logger.error(f"Error fetching CLV history: {e}")
@@ -360,58 +409,55 @@ async def get_clv_history(time_range: str = "30d"):
 @app.get("/api/bookmakers", response_model=List[BookmakerStats])
 async def get_bookmaker_stats():
     """Get statistics by bookmaker."""
+    cached = _cache_get("bookmaker_stats", ttl_seconds=600)
+    if cached is not None:
+        return cached
+
     db = get_db()
     calc = CLVCalculator()
 
     try:
-        # Get all bookmakers
-        bookmakers = db.query(Bookmaker).all()
-        stats_list = []
-
-        for bookmaker in bookmakers:
-            # Get snapshots with closing lines for this bookmaker
-            stmt = (
-                select(OddsSnapshot, ClosingLine)
-                .join(
-                    ClosingLine,
-                    (ClosingLine.game_id == OddsSnapshot.game_id)
-                    & (ClosingLine.bookmaker_id == OddsSnapshot.bookmaker_id)
-                    & (ClosingLine.market_type == OddsSnapshot.market_type),
-                )
-                .where(OddsSnapshot.bookmaker_id == bookmaker.id)
+        # Single query across all bookmakers instead of N per-bookmaker queries
+        stmt = (
+            select(OddsSnapshot, ClosingLine, Bookmaker)
+            .join(
+                ClosingLine,
+                (ClosingLine.game_id == OddsSnapshot.game_id)
+                & (ClosingLine.bookmaker_id == OddsSnapshot.bookmaker_id)
+                & (ClosingLine.market_type == OddsSnapshot.market_type),
             )
+            .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
+        )
 
-            results = db.execute(stmt).all()
-            clv_values = []
+        results = db.execute(stmt).all()
 
-            for snapshot, closing_line in results:
-                for outcome in snapshot.outcomes:
-                    team_name = outcome.get("name")
-                    entry_odds = calc._extract_odds_for_team(
-                        snapshot.outcomes, team_name
-                    )
-                    closing_odds = calc._extract_odds_for_team(
-                        closing_line.outcomes, team_name
-                    )
+        # Group CLV values by bookmaker
+        by_bookmaker: dict = {}
+        for snapshot, closing_line, bookmaker in results:
+            name = bookmaker.name
+            if name not in by_bookmaker:
+                by_bookmaker[name] = []
+            for outcome in snapshot.outcomes:
+                team_name = outcome.get("name")
+                entry_odds = calc._extract_odds_for_team(snapshot.outcomes, team_name)
+                closing_odds = calc._extract_odds_for_team(closing_line.outcomes, team_name)
+                if entry_odds and closing_odds:
+                    by_bookmaker[name].append(calc.calculate_clv(entry_odds, closing_odds))
 
-                    if entry_odds and closing_odds:
-                        clv = calc.calculate_clv(entry_odds, closing_odds)
-                        clv_values.append(clv)
-
+        stats_list = []
+        for name, clv_values in by_bookmaker.items():
             total = len(clv_values)
             positive_count = sum(1 for clv in clv_values if clv > 0)
-
             stats_list.append(
                 BookmakerStats(
-                    bookmaker_name=bookmaker.name,
+                    bookmaker_name=name,
                     total_snapshots=total,
                     avg_clv=sum(clv_values) / total if total > 0 else None,
-                    positive_clv_percentage=(
-                        (positive_count / total * 100) if total > 0 else 0
-                    ),
+                    positive_clv_percentage=(positive_count / total * 100) if total > 0 else 0,
                 )
             )
 
+        _cache_set("bookmaker_stats", stats_list)
         return stats_list
 
     except Exception as e:
@@ -674,14 +720,29 @@ async def get_report_opportunities(report_id: int):
 
         results = db.execute(stmt).all()
 
+        # Pre-fetch teams and outcomes to avoid N+1 queries
+        if results:
+            rpt_game_ids = [game.id for _, game in results]
+            all_team_ids = list({tid for _, game in results for tid in (game.home_team_id, game.away_team_id)})
+            teams_map = {
+                t.id: t
+                for t in db.execute(select(Team).where(Team.id.in_(all_team_ids))).scalars().all()
+            }
+            rpt_outcomes_map = {
+                o.game_id: o
+                for o in db.execute(
+                    select(BettingOutcome).where(BettingOutcome.game_id.in_(rpt_game_ids))
+                ).scalars().all()
+            }
+        else:
+            teams_map = {}
+            rpt_outcomes_map = {}
+
         opportunities = []
         for opp, game in results:
-            # Get team names
-            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
-            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
-
-            # Get betting outcome for final score
-            outcome = db.query(BettingOutcome).filter(BettingOutcome.game_id == game.id).first()
+            home_team = teams_map.get(game.home_team_id)
+            away_team = teams_map.get(game.away_team_id)
+            outcome = rpt_outcomes_map.get(game.id)
 
             opportunities.append({
                 "id": opp.id,
@@ -802,6 +863,13 @@ async def get_bankroll_simulation(
         total_wagered = 0.0
         bet_sizes = []
 
+        # Pre-fetch all teams to avoid N+1 queries inside the loop
+        sim_team_ids = list({tid for _, game, _ in results for tid in (game.home_team_id, game.away_team_id)})
+        sim_teams_map = {
+            t.id: t
+            for t in db.execute(select(Team).where(Team.id.in_(sim_team_ids))).scalars().all()
+        }
+
         # Track by bookmaker and market
         by_bookmaker = {}
         by_market = {}
@@ -884,9 +952,9 @@ async def get_bankroll_simulation(
             else:
                 by_market[opp.market_type]["pushes"] += 1
 
-            # Get team names
-            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
-            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+            # Get team names from pre-fetched map
+            home_team = sim_teams_map.get(game.home_team_id)
+            away_team = sim_teams_map.get(game.away_team_id)
 
             data_points.append({
                 "date": opp.settled_at.isoformat() if opp.settled_at else report.report_date.isoformat(),
@@ -1393,15 +1461,26 @@ async def get_user_bets_summary():
     try:
         bets = db.execute(select(UserBet)).scalars().all()
 
+        # Accumulate all stats in a single loop
         total = len(bets)
-        pending = sum(1 for b in bets if b.result == "pending")
-        wins = sum(1 for b in bets if b.result == "win")
-        losses = sum(1 for b in bets if b.result == "loss")
-        pushes = sum(1 for b in bets if b.result == "push")
+        pending = wins = losses = pushes = 0
+        total_profit = total_staked = 0.0
+        for b in bets:
+            if b.result == "pending":
+                pending += 1
+            elif b.result == "win":
+                wins += 1
+                total_profit += b.profit_loss or 0
+                total_staked += b.stake
+            elif b.result == "loss":
+                losses += 1
+                total_profit += b.profit_loss or 0
+                total_staked += b.stake
+            elif b.result == "push":
+                pushes += 1
+                total_profit += b.profit_loss or 0
 
         settled = wins + losses + pushes
-        total_profit = sum(b.profit_loss or 0 for b in bets if b.result in ("win", "loss", "push"))
-        total_staked = sum(b.stake for b in bets if b.result in ("win", "loss"))
 
         return {
             "total_bets": total,

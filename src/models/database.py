@@ -121,12 +121,17 @@ class Game(Base):
     closing_lines: Mapped[List["ClosingLine"]] = relationship(
         "ClosingLine", back_populates="game", cascade="all, delete-orphan"
     )
+    outcome: Mapped["BettingOutcome"] = relationship(
+        "BettingOutcome", back_populates="game", uselist=False, cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         # Index for querying games by commence time
         Index("ix_games_commence_time", "commence_time"),
         # Index for finding games by sport and time
         Index("ix_games_sport_commence", "sport_id", "commence_time"),
+        # Composite index for active game filters (completed + time)
+        Index("ix_games_completed_commence", "completed", "commence_time"),
     )
 
     def __repr__(self) -> str:
@@ -308,6 +313,19 @@ class DailyCLVReport(Base):
     # Format: [{"game_id": 1, "home": "Lakers", "away": "Celtics", "avg_clv": 2.5, ...}]
     game_summaries: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
+    # Top EV opportunities (JSONB array of +EV betting opportunities from ML predictions)
+    # Format: [{"game_id": 1, "bookmaker": "FanDuel", "market": "h2h", "outcome": "Lakers", "ev_score": 8.5, "predicted_movement": -0.05, ...}]
+    ev_opportunities: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    # Performance tracking (added for profit/loss analysis)
+    settled_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    win_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    loss_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    push_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    hypothetical_profit: Mapped[float] = mapped_column(nullable=True)  # Total P/L in dollars
+    win_rate: Mapped[float] = mapped_column(nullable=True)  # Win percentage
+    roi: Mapped[float] = mapped_column(nullable=True)  # Return on investment percentage
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -320,4 +338,163 @@ class DailyCLVReport(Base):
         return (
             f"<DailyCLVReport(id={self.id}, report_date={self.report_date}, "
             f"games_analyzed={self.games_analyzed}, avg_clv={self.avg_clv})>"
+        )
+
+
+class BettingOutcome(Base):
+    """Stores final game results and scores for bet settlement."""
+
+    __tablename__ = "betting_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("games.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+
+    # Game completion status
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Final scores
+    home_score: Mapped[int] = mapped_column(Integer, nullable=True)
+    away_score: Mapped[int] = mapped_column(Integer, nullable=True)
+
+    # Derived results for betting
+    winner: Mapped[str] = mapped_column(String(100), nullable=True)  # "home", "away", or "push"
+    total_points: Mapped[int] = mapped_column(Integer, nullable=True)  # home_score + away_score
+    point_differential: Mapped[int] = mapped_column(Integer, nullable=True)  # home_score - away_score
+
+    # Metadata
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationship
+    game: Mapped["Game"] = relationship("Game", back_populates="outcome")
+
+    __table_args__ = (
+        Index("ix_betting_outcomes_game_id", "game_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BettingOutcome(id={self.id}, game_id={self.game_id}, "
+            f"completed={self.completed}, score={self.away_score}-{self.home_score})>"
+        )
+
+
+class OpportunityPerformance(Base):
+    """Tracks performance of betting opportunities from daily reports."""
+
+    __tablename__ = "opportunity_performance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to the opportunity data (stored in daily_clv_reports.best_opportunities)
+    report_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("daily_clv_reports.id", ondelete="CASCADE"), nullable=False
+    )
+    game_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("games.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # Opportunity details (denormalized for easy querying)
+    bookmaker: Mapped[str] = mapped_column(String(50), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(20), nullable=False)  # h2h, spreads, totals
+    outcome_name: Mapped[str] = mapped_column(String(100), nullable=False)  # Team name or "Over/Under"
+
+    # Odds and CLV at time of opportunity
+    entry_odds: Mapped[float] = mapped_column(nullable=False)  # American odds
+    closing_odds: Mapped[float] = mapped_column(nullable=False)
+    clv_percentage: Mapped[float] = mapped_column(nullable=False)
+
+    # Point line for spreads/totals (e.g., -5.5 for spread, 220.5 for total)
+    point_line: Mapped[float] = mapped_column(nullable=True)
+
+    # Bet tracking (assuming $100 unit bets)
+    bet_amount: Mapped[float] = mapped_column(nullable=False, default=100.0)
+
+    # Result (calculated after game completion)
+    result: Mapped[str] = mapped_column(String(10), nullable=True)  # "win", "loss", "push", "pending"
+    profit_loss: Mapped[float] = mapped_column(nullable=True)  # Actual P/L in dollars
+
+    # Metadata
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    settled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    report: Mapped["DailyCLVReport"] = relationship("DailyCLVReport")
+    game: Mapped["Game"] = relationship("Game")
+
+    __table_args__ = (
+        Index("ix_opportunity_performance_game_id", "game_id"),
+        Index("ix_opportunity_performance_report_id", "report_id"),
+        Index("ix_opportunity_performance_result", "result"),
+        # Composite indexes for common query patterns
+        Index("ix_opportunity_performance_report_game_result", "report_id", "game_id", "result"),
+        Index("ix_opportunity_performance_settled_result", "settled_at", "result"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpportunityPerformance(id={self.id}, game_id={self.game_id}, "
+            f"market={self.market_type}, result={self.result}, p/l=${self.profit_loss})>"
+        )
+
+
+class UserBet(Base):
+    """Tracks user's manually entered bets."""
+
+    __tablename__ = "user_bets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Game info (can be linked to game_id if exists, or manual entry)
+    game_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("games.id", ondelete="SET NULL"), nullable=True
+    )
+    game_description: Mapped[str] = mapped_column(String(200), nullable=False)  # e.g., "Bulls vs Celtics"
+    game_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Bet details
+    bookmaker: Mapped[str] = mapped_column(String(50), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(20), nullable=False)  # h2h, spreads, totals
+    bet_description: Mapped[str] = mapped_column(String(100), nullable=False)  # e.g., "Bulls -1.5"
+
+    # Odds (stored as American odds)
+    odds: Mapped[int] = mapped_column(Integer, nullable=False)  # e.g., +140, -110
+
+    # Stake
+    stake: Mapped[float] = mapped_column(nullable=False, default=100.0)
+
+    # Result tracking
+    result: Mapped[str] = mapped_column(String(10), nullable=True, default="pending")  # "win", "loss", "push", "pending"
+    profit_loss: Mapped[float] = mapped_column(nullable=True)
+
+    # CLV tracking (filled in after closing line is known)
+    closing_odds: Mapped[int] = mapped_column(Integer, nullable=True)
+    clv_percentage: Mapped[float] = mapped_column(nullable=True)
+
+    # Metadata
+    notes: Mapped[str] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    settled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationship
+    game: Mapped["Game"] = relationship("Game")
+
+    __table_args__ = (
+        Index("ix_user_bets_game_date", "game_date"),
+        Index("ix_user_bets_result", "result"),
+        # Composite index for filtering by result and date
+        Index("ix_user_bets_result_game_date", "result", "game_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<UserBet(id={self.id}, bet='{self.bet_description}', "
+            f"odds={self.odds}, result={self.result})>"
         )

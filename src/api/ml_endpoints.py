@@ -375,10 +375,10 @@ async def get_game_predictions(game_id: int):
                     unconstrained_movement=float(movement_pred["unconstrained_delta"][0]),
                 ))
 
-            # Get bookmaker name
-            bookmaker = db.query(Bookmaker).filter(
-                Bookmaker.id == snapshot.bookmaker_id
-            ).first()
+            # Get bookmaker name (bookmakers_map may not exist here; use direct query only once)
+            bookmaker = db.execute(
+                select(Bookmaker).where(Bookmaker.id == snapshot.bookmaker_id)
+            ).scalar_one_or_none()
 
             predictions.append(SnapshotMovementPrediction(
                 snapshot_id=snapshot.id,
@@ -447,6 +447,23 @@ async def get_best_opportunities(
         if not results:
             return []
 
+        # Pre-fetch all bookmakers used in results to avoid N+1 queries
+        best_opp_bk_ids = list({snapshot.bookmaker_id for snapshot, _ in results})
+        best_opp_bk_map = {
+            b.id: b
+            for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(best_opp_bk_ids))).scalars().all()
+        }
+
+        # Pre-fetch home/away teams for all games in results
+        best_opp_game_team_ids = list({
+            tid for _, game in results
+            for tid in (game.home_team_id, game.away_team_id)
+        })
+        best_opp_teams_map = {
+            t.id: t
+            for t in db.execute(select(Team).where(Team.id.in_(best_opp_game_team_ids))).scalars().all()
+        }
+
         opportunities = []
 
         for snapshot, game in results:
@@ -458,10 +475,8 @@ async def get_best_opportunities(
             if max_hours_to_game is not None and hours_to_game > max_hours_to_game:
                 continue
 
-            # Apply bookmaker filter
-            bookmaker = db.query(Bookmaker).filter(
-                Bookmaker.id == snapshot.bookmaker_id
-            ).first()
+            # Apply bookmaker filter using pre-fetched map
+            bookmaker = best_opp_bk_map.get(snapshot.bookmaker_id)
             if bookmaker_filter and (not bookmaker or bookmaker.name != bookmaker_filter):
                 continue
 
@@ -553,10 +568,12 @@ async def get_best_opportunities(
                 else:
                     current_line = decimal_to_american(opening_price)
 
+                home_t = best_opp_teams_map.get(game.home_team_id)
+                away_t = best_opp_teams_map.get(game.away_team_id)
                 opportunities.append(EVOpportunity(
                     game_id=game.id,
-                    home_team=game.home_team.name,
-                    away_team=game.away_team.name,
+                    home_team=home_t.name if home_t else "Unknown",
+                    away_team=away_t.name if away_t else "Unknown",
                     commence_time=game.commence_time,
                     bookmaker_name=bookmaker.name if bookmaker else "Unknown",
                     market_type=snapshot.market_type,
@@ -766,11 +783,20 @@ async def get_opportunities(
 
         results = db.execute(stmt).all()
 
+        # Pre-fetch all teams to avoid N+1 queries
+        if results:
+            opp_team_ids = list({tid for _, game in results for tid in (game.home_team_id, game.away_team_id)})
+            opp_teams_map = {
+                t.id: t
+                for t in db.execute(select(Team).where(Team.id.in_(opp_team_ids))).scalars().all()
+            }
+        else:
+            opp_teams_map = {}
+
         opportunities = []
         for opp, game in results:
-            # Get team names
-            home_team = db.query(Team).filter(Team.id == game.home_team_id).first()
-            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+            home_team = opp_teams_map.get(game.home_team_id)
+            away_team = opp_teams_map.get(game.away_team_id)
 
             opp_status = "pending" if opp.result == "pending" or opp.result is None else "settled"
 
@@ -808,7 +834,9 @@ async def get_opportunities(
         if market_type:
             count_stmt = count_stmt.where(OpportunityPerformance.market_type == market_type)
 
-        total_count = len(db.execute(count_stmt).all())
+        from sqlalchemy import func as sa_func
+        count_result = db.execute(select(sa_func.count()).select_from(count_stmt.subquery())).scalar()
+        total_count = count_result or 0
 
         return {
             "opportunities": opportunities,
@@ -860,23 +888,37 @@ async def get_upcoming_opportunities(
         if not games:
             return {"games": [], "total_opportunities": 0}
 
+        # Pre-fetch away teams and all snapshots+bookmakers to avoid N+1 queries
+        upcoming_game_ids = [game.id for game, _ in games]
+        away_team_ids = list({game.away_team_id for game, _ in games})
+        upcoming_away_map = {
+            t.id: t
+            for t in db.execute(select(Team).where(Team.id.in_(away_team_ids))).scalars().all()
+        }
+        # Load all snapshots for upcoming games at once
+        all_snapshots = db.execute(
+            select(OddsSnapshot).where(OddsSnapshot.game_id.in_(upcoming_game_ids))
+        ).scalars().all()
+        snapshots_by_game: dict = {}
+        for snap in all_snapshots:
+            snapshots_by_game.setdefault(snap.game_id, []).append(snap)
+
+        # Pre-fetch all bookmakers used in those snapshots
+        bk_ids = list({snap.bookmaker_id for snap in all_snapshots})
+        bookmakers_map = {
+            b.id: b
+            for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(bk_ids))).scalars().all()
+        }
+
         game_opportunities = []
 
         for game, home_team in games:
-            away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
-
-            # Get all snapshots for this game
-            snapshot_stmt = (
-                select(OddsSnapshot)
-                .where(OddsSnapshot.game_id == game.id)
-            )
-            snapshots = db.execute(snapshot_stmt).scalars().all()
+            away_team = upcoming_away_map.get(game.away_team_id)
+            snapshots = snapshots_by_game.get(game.id, [])
 
             game_opps = []
             for snapshot in snapshots:
-                bookmaker = db.query(Bookmaker).filter(
-                    Bookmaker.id == snapshot.bookmaker_id
-                ).first()
+                bookmaker = bookmakers_map.get(snapshot.bookmaker_id)
 
                 hours_to_game = (game.commence_time - now).total_seconds() / 3600
                 day_of_week = game.commence_time.weekday()

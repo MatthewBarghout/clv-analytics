@@ -1,22 +1,16 @@
-import React, { useEffect, useState } from 'react';
-import {
-  BarChart,
-  Bar,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  Cell,
-} from 'recharts';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { GlassCard } from './components/GlassCard';
 import { AnimatedCounter } from './components/AnimatedCounter';
-import { TimeRangeSelector } from './components/TimeRangeSelector';
 import { GameDetailsModal } from './components/GameDetailsModal';
 import { GameAnalysis } from './components/GameAnalysis';
+import { MLStats } from './components/MLStats';
+import { CLVOverview } from './components/CLVOverview';
+import { BookmakerPerformance } from './components/BookmakerPerformance';
+import { DailyReports } from './components/DailyReports';
+import { BankrollSimulator } from './components/BankrollSimulator';
+import { MyBets } from './components/MyBets';
+
+// ── Types ──────────────────────────────────────────────────────────────────
 
 interface CLVStats {
   mean_clv: number | null;
@@ -90,124 +84,11 @@ interface EVOpportunity {
   was_constrained: boolean;
 }
 
-interface DailyCLVReport {
-  id: number;
-  report_date: string;
-  games_analyzed: number;
-  total_opportunities: number;
-  avg_clv: number;
-  median_clv: number;
-  positive_clv_count: number;
-  positive_clv_percentage: number;
-  // Performance tracking
-  settled_count?: number;
-  win_count?: number;
-  loss_count?: number;
-  push_count?: number;
-  hypothetical_profit?: number;
-  win_rate?: number;
-  roi?: number;
-  best_opportunities: Array<{
-    game_id: number;
-    bookmaker: string;
-    market_type: string;
-    outcome: string;
-    clv: number;
-    entry_odds: number;
-    closing_odds: number;
-  }>;
-  by_bookmaker: Record<string, { avg_clv: number; count: number; positive_count: number }>;
-  by_market: Record<string, { avg_clv: number; count: number; positive_count: number }>;
-}
-
-interface TrackedOpportunity {
-  id: number;
-  game_id: number;
-  home_team: string;
-  away_team: string;
-  home_score: number | null;
-  away_score: number | null;
-  bookmaker: string;
-  market_type: string;
-  outcome_name: string;
-  point_line: number | null;  // Spread or total line
-  entry_odds: number;
-  closing_odds: number;
-  clv_percentage: number;
-  bet_amount: number;
-  result: 'win' | 'loss' | 'push' | 'pending';
-  profit_loss: number | null;
-  settled_at: string | null;
-}
-
-interface BankrollDataPoint {
-  date: string;
-  game_date: string;
-  bet_number: number;
-  cumulative_pl: number;
-  bankroll: number;
-  drawdown: number;
-  drawdown_pct: number;
-  result: 'win' | 'loss' | 'push';
-  profit: number;
-  game: string;
-  bookmaker: string;
-  outcome: string;
-  market: string;
-  odds: number;
-  closing_odds: number;
-  clv: number;
-}
-
-interface BankrollSimulation {
-  has_data: boolean;
-  message?: string;
-  data_points: BankrollDataPoint[];
-  summary: {
-    starting_bankroll: number;
-    ending_bankroll: number;
-    total_profit_loss: number;
-    roi_pct: number;
-    total_bets: number;
-    win_count: number;
-    loss_count: number;
-    push_count: number;
-    win_rate: number;
-    max_drawdown: number;
-    max_drawdown_pct: number;
-    total_wagered: number;
-    peak_bankroll: number;
-    strategy: string;
-    sharpe_ratio: number;
-    sortino_ratio: number;
-    avg_bet_size: number;
-    bet_size_std: number;
-  };
-  by_bookmaker?: Record<string, {
-    bets: number;
-    wins: number;
-    losses: number;
-    pushes: number;
-    profit: number;
-    wagered: number;
-    roi: number;
-    avg_clv: number;
-    win_rate: number;
-  }>;
-  by_market?: Record<string, {
-    bets: number;
-    wins: number;
-    losses: number;
-    pushes: number;
-    profit: number;
-    wagered: number;
-    roi: number;
-    avg_clv: number;
-    win_rate: number;
-  }>;
-}
-
 const API_BASE = 'http://localhost:8000/api';
+
+type GamesView = 'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets';
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
   const [stats, setStats] = useState<CLVStats | null>(null);
@@ -218,226 +99,41 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
-  const [gamesView, setGamesView] = useState<'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets'>('recent');
+  const [gamesView, setGamesView] = useState<GamesView>('recent');
   const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
   const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
   const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
   const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
-  const [dailyReports, setDailyReports] = useState<DailyCLVReport[]>([]);
-  const [expandedReportId, setExpandedReportId] = useState<number | null>(null);
-  const [trackedOpportunities, setTrackedOpportunities] = useState<TrackedOpportunity[]>([]);
-  const [loadingOpportunities, setLoadingOpportunities] = useState(false);
-  const [bankrollSimulation, setBankrollSimulation] = useState<BankrollSimulation | null>(null);
-  const [loadingSimulation, setLoadingSimulation] = useState(false);
-  const [simBetSize, setSimBetSize] = useState(100);
-  const [simStartingBankroll, setSimStartingBankroll] = useState(10000);
-  const [simStrategy, setSimStrategy] = useState('fixed');
-  const [simFractionPercent, setSimFractionPercent] = useState(2);
-  const [simMaxBetPercent, setSimMaxBetPercent] = useState(25);
-  const [simBookmakerFilter, setSimBookmakerFilter] = useState<string | null>(null);
-  const [simMarketFilter, setSimMarketFilter] = useState<string | null>(null);
-  const [simClvThreshold, setSimClvThreshold] = useState<number | null>(null);
-  const [userBets, setUserBets] = useState<any[]>([]);
-  const [userBetsSummary, setUserBetsSummary] = useState<any>(null);
-  const [loadingUserBets, setLoadingUserBets] = useState(false);
-  const [showAddBetForm, setShowAddBetForm] = useState(false);
-  const [newBet, setNewBet] = useState({
-    game_description: '',
-    game_date: '',
-    bookmaker: 'DraftKings',
-    market_type: 'h2h',
-    bet_description: '',
-    odds: '',
-    stake: '100',
-  });
 
-  useEffect(() => {
-    fetchData();
-  }, [timeRange]);
-
-  useEffect(() => {
-    if (gamesView === 'history') {
-      fetchHistoryGames();
-    } else if (gamesView === 'daily-reports') {
-      fetchDailyReports();
-    } else if (gamesView === 'bankroll-sim') {
-      fetchBankrollSimulation();
-    } else if (gamesView === 'my-bets') {
-      fetchUserBets();
-    }
-  }, [gamesView]);
-
-  useEffect(() => {
-    if (gamesView === 'bankroll-sim') {
-      fetchBankrollSimulation();
-    }
-  }, [simBetSize, simStartingBankroll, simStrategy, simFractionPercent, simMaxBetPercent, simBookmakerFilter, simMarketFilter, simClvThreshold]);
-
-  const fetchDailyReports = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/daily-reports?limit=14`);
-      if (res.ok) {
-        const data = await res.json();
-        setDailyReports(data);
-      }
-    } catch (err) {
-      console.error('Error fetching daily reports:', err);
-    }
-  };
-
-  const fetchBankrollSimulation = async () => {
-    try {
-      setLoadingSimulation(true);
-      const params = new URLSearchParams({
-        bet_size: simBetSize.toString(),
-        starting_bankroll: simStartingBankroll.toString(),
-        strategy: simStrategy,
-        fraction_percent: simFractionPercent.toString(),
-        max_bet_percent: simMaxBetPercent.toString(),
-      });
-      if (simBookmakerFilter) params.append('bookmaker_filter', simBookmakerFilter);
-      if (simMarketFilter) params.append('market_filter', simMarketFilter);
-      if (simClvThreshold !== null) params.append('clv_threshold', simClvThreshold.toString());
-
-      const res = await fetch(`${API_BASE}/bankroll-simulation?${params}`);
-      if (res.ok) {
-        const data = await res.json();
-        setBankrollSimulation(data);
-      }
-    } catch (err) {
-      console.error('Error fetching bankroll simulation:', err);
-    } finally {
-      setLoadingSimulation(false);
-    }
-  };
-
-  const fetchUserBets = async () => {
-    try {
-      setLoadingUserBets(true);
-      const [betsRes, summaryRes] = await Promise.all([
-        fetch(`${API_BASE}/user-bets`),
-        fetch(`${API_BASE}/user-bets/summary`),
-      ]);
-      if (betsRes.ok) {
-        const data = await betsRes.json();
-        setUserBets(data);
-      }
-      if (summaryRes.ok) {
-        const data = await summaryRes.json();
-        setUserBetsSummary(data);
-      }
-    } catch (err) {
-      console.error('Error fetching user bets:', err);
-    } finally {
-      setLoadingUserBets(false);
-    }
-  };
-
-  const handleAddBet = async () => {
-    try {
-      const params = new URLSearchParams({
-        game_description: newBet.game_description,
-        game_date: newBet.game_date,
-        bookmaker: newBet.bookmaker,
-        market_type: newBet.market_type,
-        bet_description: newBet.bet_description,
-        odds: newBet.odds,
-        stake: newBet.stake,
-      });
-      const res = await fetch(`${API_BASE}/user-bets?${params}`, { method: 'POST' });
-      if (res.ok) {
-        setShowAddBetForm(false);
-        setNewBet({
-          game_description: '',
-          game_date: '',
-          bookmaker: 'DraftKings',
-          market_type: 'h2h',
-          bet_description: '',
-          odds: '',
-          stake: '100',
-        });
-        fetchUserBets();
-      }
-    } catch (err) {
-      console.error('Error adding bet:', err);
-    }
-  };
-
-  const handleSettleBet = async (betId: number, result: 'win' | 'loss' | 'push') => {
-    try {
-      const res = await fetch(`${API_BASE}/user-bets/${betId}?result=${result}`, { method: 'PUT' });
-      if (res.ok) {
-        fetchUserBets();
-      }
-    } catch (err) {
-      console.error('Error settling bet:', err);
-    }
-  };
-
-  const handleDeleteBet = async (betId: number) => {
-    try {
-      const res = await fetch(`${API_BASE}/user-bets/${betId}`, { method: 'DELETE' });
-      if (res.ok) {
-        fetchUserBets();
-      }
-    } catch (err) {
-      console.error('Error deleting bet:', err);
-    }
-  };
-
-  const fetchTrackedOpportunities = async (reportId: number) => {
-    try {
-      setLoadingOpportunities(true);
-      const res = await fetch(`${API_BASE}/daily-reports/${reportId}/opportunities`);
-      if (res.ok) {
-        const data = await res.json();
-        setTrackedOpportunities(data.opportunities || []);
-      }
-    } catch (err) {
-      console.error('Error fetching tracked opportunities:', err);
-      setTrackedOpportunities([]);
-    } finally {
-      setLoadingOpportunities(false);
-    }
-  };
-
-  const toggleReportExpanded = (reportId: number) => {
-    if (expandedReportId === reportId) {
-      setExpandedReportId(null);
-      setTrackedOpportunities([]);
-    } else {
-      setExpandedReportId(reportId);
-      fetchTrackedOpportunities(reportId);
-    }
-  };
-
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes] = await Promise.all([
-        fetch(`${API_BASE}/stats`),
-        fetch(`${API_BASE}/bookmakers`),
-        fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
-        fetch(`${API_BASE}/games?limit=20`),
-        fetch(`${API_BASE}/ml/stats`),
-        fetch(`${API_BASE}/ml/feature-importance`),
-        fetch(`${API_BASE}/ml/best-opportunities?limit=50&min_ev_score=0`),
-      ]);
+      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes] =
+        await Promise.all([
+          fetch(`${API_BASE}/stats`),
+          fetch(`${API_BASE}/bookmakers`),
+          fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
+          fetch(`${API_BASE}/games?limit=20`),
+          fetch(`${API_BASE}/ml/stats`),
+          fetch(`${API_BASE}/ml/feature-importance`),
+          fetch(`${API_BASE}/ml/best-opportunities?limit=50&min_ev_score=0`),
+        ]);
 
       if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok || !gamesRes.ok) {
         throw new Error('Failed to fetch data');
       }
 
-      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData] = await Promise.all([
-        statsRes.json(),
-        bookmakersRes.json(),
-        historyRes.json(),
-        gamesRes.json(),
-        mlStatsRes.ok ? mlStatsRes.json() : null,
-        featureImportanceRes.ok ? featureImportanceRes.json() : [],
-        opportunitiesRes.ok ? opportunitiesRes.json() : [],
-      ]);
+      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData] =
+        await Promise.all([
+          statsRes.json(),
+          bookmakersRes.json(),
+          historyRes.json(),
+          gamesRes.json(),
+          mlStatsRes.ok ? mlStatsRes.json() : null,
+          featureImportanceRes.ok ? featureImportanceRes.json() : [],
+          opportunitiesRes.ok ? opportunitiesRes.json() : [],
+        ]);
 
       setStats(statsData);
       setBookmakers(bookmakersData);
@@ -452,30 +148,36 @@ export default function Dashboard() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [timeRange]);
 
-  const fetchHistoryGames = async () => {
+  const fetchHistoryGames = useCallback(async () => {
     try {
-      // Fetch more games for history view (limit 100)
       const res = await fetch(`${API_BASE}/games?limit=100`);
       if (res.ok) {
         const data = await res.json();
-        // Filter only completed games with CLV data
-        const completedWithCLV = data.filter((g: GameWithCLV) => g.completed && g.avg_clv !== null);
-        setHistoryGames(completedWithCLV);
+        setHistoryGames(data.filter((g: GameWithCLV) => g.completed && g.avg_clv !== null));
       }
     } catch (err) {
       console.error('Error fetching history:', err);
     }
-  };
+  }, []);
 
-  const handleGameClick = (game: GameWithCLV) => {
-    setSelectedGame(game);
-  };
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
 
-  const handleCloseModal = () => {
-    setSelectedGame(null);
-  };
+  useEffect(() => {
+    if (gamesView === 'history') fetchHistoryGames();
+  }, [gamesView, fetchHistoryGames]);
+
+  const handleGameClick = useCallback((game: GameWithCLV) => setSelectedGame(game), []);
+  const handleCloseModal = useCallback(() => setSelectedGame(null), []);
+
+  // Tab data arrays memoized
+  const displayedGames = useMemo(
+    () => (gamesView === 'recent' ? games : historyGames),
+    [gamesView, games, historyGames]
+  );
 
   if (loading) {
     return (
@@ -508,6 +210,7 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white p-4 md:p-8">
       <div className="max-w-7xl mx-auto">
+        {/* Header */}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
           <h1 className="text-4xl md:text-5xl font-bold mb-4 md:mb-0 bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">
             CLV Analytics Dashboard
@@ -520,37 +223,24 @@ export default function Dashboard() {
           </button>
         </div>
 
-        {/* Enhanced Summary Cards */}
+        {/* Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <GlassCard gradient={(stats?.mean_clv || 0) > 0 ? 'green' : 'red'}>
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">
-              Mean CLV
-            </h3>
+            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Mean CLV</h3>
             <AnimatedCounter
               value={stats?.mean_clv || 0}
               decimals={2}
               suffix="%"
-              className={`text-4xl font-bold ${
-                (stats?.mean_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'
-              }`}
+              className={`text-4xl font-bold ${(stats?.mean_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}
             />
           </GlassCard>
-
           <GlassCard gradient="blue">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">
-              Total Analyzed
-            </h3>
-            <AnimatedCounter
-              value={stats?.total_analyzed || 0}
-              className="text-4xl font-bold text-blue-400"
-            />
+            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Total Analyzed</h3>
+            <AnimatedCounter value={stats?.total_analyzed || 0} className="text-4xl font-bold text-blue-400" />
             <p className="text-sm text-gray-400 mt-2">Betting opportunities</p>
           </GlassCard>
-
           <GlassCard gradient="green">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">
-              Positive CLV Rate
-            </h3>
+            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Positive CLV Rate</h3>
             <AnimatedCounter
               value={stats?.positive_clv_percentage || 0}
               decimals={1}
@@ -561,1594 +251,217 @@ export default function Dashboard() {
               {stats?.positive_clv_count || 0} of {stats?.total_analyzed || 0} bets
             </p>
           </GlassCard>
-
           <GlassCard gradient="purple">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">
-              Median CLV
-            </h3>
+            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Median CLV</h3>
             <AnimatedCounter
               value={stats?.median_clv || 0}
               decimals={2}
               suffix="%"
-              className={`text-4xl font-bold ${
-                (stats?.median_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'
-              }`}
+              className={`text-4xl font-bold ${(stats?.median_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}
             />
           </GlassCard>
         </div>
 
         {/* ML Model Performance */}
-        {mlStats?.is_trained && (
-          <GlassCard className="mb-8">
-            <h2 className="text-2xl font-bold mb-6 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-              ML Model Performance
-            </h2>
+        <MLStats mlStats={mlStats} featureImportance={featureImportance} />
 
-            {/* Model Metrics Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Movement MAE
-                </h3>
-                <AnimatedCounter
-                  value={mlStats.movement_mae || 0}
-                  decimals={4}
-                  className="text-2xl font-bold text-purple-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">Avg prediction error</p>
-              </div>
+        {/* CLV Overview (market breakdown + trend chart) */}
+        <CLVOverview stats={stats} history={history} timeRange={timeRange} onTimeRangeChange={setTimeRange} />
 
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Directional Accuracy
-                </h3>
-                <AnimatedCounter
-                  value={(mlStats.directional_accuracy || 0) * 100}
-                  decimals={1}
-                  suffix="%"
-                  className="text-2xl font-bold text-green-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">Correct direction</p>
-              </div>
+        {/* Bookmaker Performance */}
+        <BookmakerPerformance bookmakers={bookmakers} />
 
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Improvement
-                </h3>
-                <AnimatedCounter
-                  value={mlStats.improvement_vs_baseline || 0}
-                  decimals={1}
-                  suffix="%"
-                  className="text-2xl font-bold text-blue-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">vs baseline</p>
-              </div>
-
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Precision
-                </h3>
-                <AnimatedCounter
-                  value={(mlStats.directional_precision || 0) * 100}
-                  decimals={1}
-                  suffix="%"
-                  className="text-2xl font-bold text-cyan-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">Direction precision</p>
-              </div>
-
-              <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">
-                  Training Records
-                </h3>
-                <AnimatedCounter
-                  value={mlStats.training_records || 0}
-                  className="text-2xl font-bold text-orange-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">Data points</p>
-              </div>
-            </div>
-
-            {/* Feature Importance Chart */}
-            {featureImportance.length > 0 && (
-              <div className="mt-6">
-                <h3 className="text-lg font-semibold mb-4 text-gray-300">
-                  Feature Importance
-                </h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart
-                    data={featureImportance.slice(0, 7)}
-                    layout="vertical"
-                    margin={{ top: 5, right: 30, left: 100, bottom: 5 }}
-                  >
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                    <XAxis
-                      type="number"
-                      stroke="#9CA3AF"
-                      tick={{ fill: '#9CA3AF' }}
-                    />
-                    <YAxis
-                      type="category"
-                      dataKey="feature_name"
-                      stroke="#9CA3AF"
-                      tick={{ fill: '#9CA3AF' }}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: '#1F2937',
-                        border: '1px solid #374151',
-                        borderRadius: '8px',
-                        backdropFilter: 'blur(10px)',
-                      }}
-                      labelStyle={{ color: '#F3F4F6' }}
-                      itemStyle={{ color: '#9CA3AF' }}
-                      formatter={(value: number | undefined) => [(value ? (value * 100).toFixed(2) : '0') + '%', 'Importance']}
-                    />
-                    <Bar
-                      dataKey="importance"
-                      fill="#3b82f6"
-                      radius={[0, 4, 4, 0]}
-                      isAnimationActive={true}
-                      animationDuration={800}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-
-            {/* Model Info */}
-            {mlStats.last_trained && (
-              <div className="mt-4 text-xs text-gray-500 text-center">
-                Last trained: {new Date(mlStats.last_trained).toLocaleString()}
-              </div>
-            )}
-          </GlassCard>
-        )}
-
-        {!mlStats?.is_trained && (
-          <GlassCard className="mb-8 border-yellow-500/30 bg-yellow-500/5">
-            <div className="flex items-center gap-4">
-              <div className="text-4xl">⚠️</div>
-              <div>
-                <h3 className="text-lg font-semibold text-yellow-400 mb-1">
-                  ML Model Not Trained
-                </h3>
-                <p className="text-sm text-gray-400">
-                  Run <code className="px-2 py-1 bg-gray-800 rounded text-yellow-400">poetry run python scripts/train_model.py</code> to train the closing line prediction model.
-                </p>
-              </div>
-            </div>
-          </GlassCard>
-        )}
-
-        {/* Market Type Breakdown */}
-        {stats?.by_market_type && Object.keys(stats.by_market_type).length > 0 && (
-          <GlassCard className="mb-8">
-            <h2 className="text-2xl font-bold mb-6 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-              CLV by Market Type
-            </h2>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart
-                data={Object.entries(stats.by_market_type).map(([market, data]) => ({
-                  market: market.toUpperCase(),
-                  avg_clv: data.avg_clv,
-                  count: data.count,
-                }))}
-              >
-                <defs>
-                  <linearGradient id="colorPositive" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#22c55e" stopOpacity={0.8} />
-                    <stop offset="100%" stopColor="#22c55e" stopOpacity={0.3} />
-                  </linearGradient>
-                  <linearGradient id="colorNegative" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.8} />
-                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0.3} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                <XAxis dataKey="market" stroke="#9CA3AF" tick={{ fill: '#9CA3AF' }} />
-                <YAxis
-                  stroke="#9CA3AF"
-                  tick={{ fill: '#9CA3AF' }}
-                  label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: '#9CA3AF' }}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: '#1F2937',
-                    border: '1px solid #374151',
-                    borderRadius: '8px',
-                    backdropFilter: 'blur(10px)',
-                  }}
-                  labelStyle={{ color: '#F3F4F6' }}
-                  itemStyle={{ color: '#9CA3AF' }}
-                  formatter={(value: number | undefined, _name: string | undefined, props: any) => [
-                    `${value ? value.toFixed(2) : '0'}% (${props.payload.count} bets)`,
-                    'Avg CLV',
-                  ]}
-                />
-                <Bar dataKey="avg_clv" radius={[8, 8, 0, 0]} isAnimationActive={true} animationDuration={800}>
-                  {Object.entries(stats.by_market_type).map(([_market, data], index) => (
-                    <Cell key={`cell-${index}`} fill={data.avg_clv > 0 ? 'url(#colorPositive)' : 'url(#colorNegative)'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </GlassCard>
-        )}
-
-        {/* CLV Trend Chart with Time Range Selector */}
-        <GlassCard className="mb-8">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
-            <h2 className="text-2xl font-bold mb-4 md:mb-0 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-              CLV Trend Over Time
-            </h2>
-            <TimeRangeSelector selected={timeRange} onChange={setTimeRange} />
-          </div>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={history}>
-              <defs>
-                <linearGradient id="colorCLV" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10B981" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-              <XAxis dataKey="date" stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} />
-              <YAxis
-                stroke="#9CA3AF"
-                tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: '#9CA3AF' }}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1F2937',
-                  border: '1px solid #374151',
-                  borderRadius: '8px',
-                  backdropFilter: 'blur(10px)',
-                }}
-                labelStyle={{ color: '#F3F4F6', fontWeight: 'bold' }}
-                itemStyle={{ color: '#10B981' }}
-              />
-              <Legend wrapperStyle={{ color: '#9CA3AF' }} />
-              <Line
-                type="monotone"
-                dataKey="avg_clv"
-                stroke="#10B981"
-                strokeWidth={3}
-                dot={{ fill: '#10B981', strokeWidth: 2, r: 4 }}
-                activeDot={{ r: 6, strokeWidth: 2 }}
-                fill="url(#colorCLV)"
-                name="Avg CLV %"
-                isAnimationActive={true}
-                animationBegin={0}
-                animationDuration={1000}
-                animationEasing="ease-in-out"
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </GlassCard>
-
-        {/* Enhanced Bookmaker Stats */}
-        <GlassCard className="mb-8">
-          <h2 className="text-2xl font-bold mb-6 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-            Bookmaker Performance
-          </h2>
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-gray-700/50">
-                  <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Bookmaker
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Avg CLV
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Positive CLV %
-                  </th>
-                  <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Total Snapshots
-                  </th>
-                  <th className="text-right py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                    Performance
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {bookmakers.map((bookmaker, index) => (
-                  <tr
-                    key={bookmaker.bookmaker_name}
-                    className="border-b border-gray-700/30 hover:bg-white/5 transition-colors duration-200"
-                    style={{ animationDelay: `${index * 50}ms` }}
-                  >
-                    <td className="py-4 px-4">
-                      <span className="font-medium text-white">{bookmaker.bookmaker_name}</span>
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <span
-                        className={`font-bold text-lg ${
-                          (bookmaker.avg_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'
-                        }`}
-                      >
-                        {bookmaker.avg_clv?.toFixed(2) || 'N/A'}%
-                      </span>
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <div className="flex items-center justify-center gap-2">
-                        <div className="w-24 h-2 bg-gray-700 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-gradient-to-r from-clv-positive-600 to-clv-positive-400 rounded-full transition-all duration-500"
-                            style={{ width: `${bookmaker.positive_clv_percentage}%` }}
-                          />
-                        </div>
-                        <span className="text-clv-positive-400 font-medium text-sm">
-                          {bookmaker.positive_clv_percentage.toFixed(1)}%
-                        </span>
-                      </div>
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <span className="text-blue-400 font-medium">{bookmaker.total_snapshots.toLocaleString()}</span>
-                    </td>
-                    <td className="text-right py-4 px-4">
-                      {(bookmaker.avg_clv || 0) > 0 ? (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-clv-positive-500/20 text-clv-positive-400 border border-clv-positive-500/30">
-                          Favorable
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-clv-negative-500/20 text-clv-negative-400 border border-clv-negative-500/30">
-                          Unfavorable
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </GlassCard>
-
-        {/* Games Table with History */}
+        {/* Games / Views section */}
         <GlassCard>
           <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
             <h2 className="text-2xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent mb-4 md:mb-0">
               Games
             </h2>
             <div className="flex items-center gap-4">
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setGamesView('recent')}
-                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                    gamesView === 'recent'
-                      ? 'bg-white/20 text-white border border-white/30'
-                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                  Recent
-                </button>
-                <button
-                  onClick={() => setGamesView('history')}
-                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                    gamesView === 'history'
-                      ? 'bg-white/20 text-white border border-white/30'
-                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                  History ({historyGames.length})
-                </button>
-                {mlStats?.is_trained && bestOpportunities.length > 0 && (
-                  <button
-                    onClick={() => setGamesView('best-ev')}
-                    className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                      gamesView === 'best-ev'
-                        ? 'bg-gradient-to-r from-green-500/30 to-emerald-500/30 text-white border border-green-500/50'
-                        : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                    }`}
-                  >
-                    Best +EV ({bestOpportunities.length})
-                  </button>
-                )}
-                <button
-                  onClick={() => setGamesView('daily-reports')}
-                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                    gamesView === 'daily-reports'
-                      ? 'bg-gradient-to-r from-blue-500/30 to-cyan-500/30 text-white border border-blue-500/50'
-                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                  Daily Reports
-                </button>
-                <button
-                  onClick={() => setGamesView('bankroll-sim')}
-                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                    gamesView === 'bankroll-sim'
-                      ? 'bg-gradient-to-r from-purple-500/30 to-pink-500/30 text-white border border-purple-500/50'
-                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                  Bankroll Sim
-                </button>
-                <button
-                  onClick={() => setGamesView('my-bets')}
-                  className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                    gamesView === 'my-bets'
-                      ? 'bg-gradient-to-r from-yellow-500/30 to-orange-500/30 text-white border border-yellow-500/50'
-                      : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                  My Bets {userBets.filter(b => b.result === 'pending').length > 0 && (
-                    <span className="ml-1 px-1.5 py-0.5 text-xs bg-yellow-500/30 rounded-full">
-                      {userBets.filter(b => b.result === 'pending').length}
-                    </span>
-                  )}
-                </button>
+              <div className="flex gap-2 flex-wrap">
+                {(['recent', 'history', 'best-ev', 'daily-reports', 'bankroll-sim', 'my-bets'] as const).map((view) => {
+                  const labels: Record<GamesView, string> = {
+                    recent: 'Recent',
+                    history: `History (${historyGames.length})`,
+                    'best-ev': `Best +EV (${bestOpportunities.length})`,
+                    'daily-reports': 'Daily Reports',
+                    'bankroll-sim': 'Bankroll Sim',
+                    'my-bets': 'My Bets',
+                  };
+                  const activeClass: Record<GamesView, string> = {
+                    recent: 'bg-white/20 text-white border border-white/30',
+                    history: 'bg-white/20 text-white border border-white/30',
+                    'best-ev': 'bg-gradient-to-r from-green-500/30 to-emerald-500/30 text-white border border-green-500/50',
+                    'daily-reports': 'bg-gradient-to-r from-blue-500/30 to-cyan-500/30 text-white border border-blue-500/50',
+                    'bankroll-sim': 'bg-gradient-to-r from-purple-500/30 to-pink-500/30 text-white border border-purple-500/50',
+                    'my-bets': 'bg-gradient-to-r from-yellow-500/30 to-orange-500/30 text-white border border-yellow-500/50',
+                  };
+
+                  // Hide best-ev tab when no data
+                  if (view === 'best-ev' && (!mlStats?.is_trained || bestOpportunities.length === 0)) return null;
+
+                  return (
+                    <button
+                      key={view}
+                      onClick={() => setGamesView(view)}
+                      className={`px-4 py-2 rounded-lg transition-all duration-200 ${
+                        gamesView === view
+                          ? activeClass[view]
+                          : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                      }`}
+                    >
+                      {labels[view]}
+                    </button>
+                  );
+                })}
               </div>
-              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && (
-                <div className="text-sm text-gray-400">
-                  💡 Click any game to view detailed betting lines
-                </div>
+              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && gamesView !== 'daily-reports' && (
+                <div className="text-sm text-gray-400">💡 Click any game to view detailed betting lines</div>
               )}
             </div>
           </div>
+
           <div className="overflow-x-auto">
-            {gamesView === 'daily-reports' ? (
-              // Daily Reports View
-              <div className="space-y-6">
-                {dailyReports.map((report, index) => (
-                  <div
-                    key={report.id}
-                    className="bg-white/5 rounded-lg p-6 border border-white/10 hover:bg-white/8 transition-all duration-200"
-                    style={{ animationDelay: `${index * 50}ms` }}
-                  >
-                    <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-4">
-                      <div>
-                        <h3 className="text-xl font-bold text-white mb-1">
-                          {new Date(report.report_date).toLocaleDateString('en-US', {
-                            weekday: 'long',
-                            year: 'numeric',
-                            month: 'long',
-                            day: 'numeric',
-                          })}
-                        </h3>
-                        <p className="text-sm text-gray-400">
-                          {report.games_analyzed} games • {report.total_opportunities} betting opportunities
-                        </p>
-                      </div>
-                      <div className="flex gap-4 mt-4 md:mt-0">
-                        <div className="text-center">
-                          <div className="text-sm text-gray-400 mb-1">Avg CLV</div>
-                          <div className={`text-2xl font-bold ${report.avg_clv > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                            {report.avg_clv > 0 ? '+' : ''}{report.avg_clv.toFixed(2)}%
-                          </div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-sm text-gray-400 mb-1">Positive CLV</div>
-                          <div className="text-2xl font-bold text-green-400">
-                            {report.positive_clv_percentage.toFixed(0)}%
-                          </div>
-                        </div>
-                      </div>
-                    </div>
+            {gamesView === 'daily-reports' && <DailyReports />}
 
-                    {/* Profit Tracking Stats - Only show if we have settled bets */}
-                    {report.settled_count !== undefined && report.settled_count > 0 && (
-                      <div className="mt-4 p-4 bg-gradient-to-r from-purple-500/10 to-blue-500/10 rounded-lg border border-purple-500/20">
-                        <h4 className="text-sm font-semibold text-purple-300 mb-3 uppercase tracking-wider flex items-center gap-2">
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                            <path d="M8.433 7.418c.155-.103.346-.196.567-.267v1.698a2.305 2.305 0 01-.567-.267C8.07 8.34 8 8.114 8 8c0-.114.07-.34.433-.582zM11 12.849v-1.698c.22.071.412.164.567.267.364.243.433.468.433.582 0 .114-.07.34-.433.582a2.305 2.305 0 01-.567.267z" />
-                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v.092a4.535 4.535 0 00-1.676.662C6.602 6.234 6 7.009 6 8c0 .99.602 1.765 1.324 2.246.48.32 1.054.545 1.676.662v1.941c-.391-.127-.68-.317-.843-.504a1 1 0 10-1.51 1.31c.562.649 1.413 1.076 2.353 1.253V15a1 1 0 102 0v-.092a4.535 4.535 0 001.676-.662C13.398 13.766 14 12.991 14 12c0-.99-.602-1.765-1.324-2.246A4.535 4.535 0 0011 9.092V7.151c.391.127.68.317.843.504a1 1 0 101.511-1.31c-.563-.649-1.413-1.076-2.354-1.253V5z" clipRule="evenodd" />
-                          </svg>
-                          Hypothetical Performance ($100 per bet)
-                        </h4>
-                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                          <div className="text-center">
-                            <div className="text-xs text-gray-400 mb-1">Win Rate</div>
-                            <div className="text-xl font-bold text-white">
-                              {report.win_rate?.toFixed(1)}%
-                            </div>
-                            <div className="text-xs text-gray-500 mt-1">
-                              {report.win_count}W-{report.loss_count}L
-                              {report.push_count! > 0 && `-${report.push_count}P`}
-                            </div>
-                          </div>
-                          <div className="text-center">
-                            <div className="text-xs text-gray-400 mb-1">Settled</div>
-                            <div className="text-xl font-bold text-white">
-                              {report.settled_count}/{report.total_opportunities}
-                            </div>
-                            <div className="text-xs text-gray-500 mt-1">
-                              {((report.settled_count / report.total_opportunities) * 100).toFixed(0)}% complete
-                            </div>
-                          </div>
-                          <div className="text-center">
-                            <div className="text-xs text-gray-400 mb-1">Profit/Loss</div>
-                            <div className={`text-xl font-bold ${(report.hypothetical_profit || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                              {(report.hypothetical_profit || 0) >= 0 ? '+' : ''}${report.hypothetical_profit?.toFixed(2)}
-                            </div>
-                            <div className="text-xs text-gray-500 mt-1">
-                              ${(report.settled_count * 100).toLocaleString()} wagered
-                            </div>
-                          </div>
-                          <div className="text-center">
-                            <div className="text-xs text-gray-400 mb-1">ROI</div>
-                            <div className={`text-xl font-bold ${(report.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                              {(report.roi || 0) >= 0 ? '+' : ''}{report.roi?.toFixed(2)}%
-                            </div>
-                            <div className="text-xs text-gray-500 mt-1">
-                              return on investment
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
+            {gamesView === 'bankroll-sim' && <BankrollSimulator />}
 
-                    {/* Top 3 Best Opportunities */}
-                    <div className="mt-4">
-                      <h4 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wider">
-                        Top 3 Best Opportunities
-                      </h4>
-                      <div className="space-y-2">
-                        {report.best_opportunities.slice(0, 3).map((opp, oppIndex) => (
-                          <div
-                            key={oppIndex}
-                            className="flex items-center justify-between bg-white/5 rounded-lg p-3 border border-white/5"
-                          >
-                            <div className="flex items-center gap-3">
-                              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-yellow-500/30 to-orange-500/30 border border-yellow-500/50 flex items-center justify-center">
-                                <span className="text-yellow-400 font-bold text-sm">#{oppIndex + 1}</span>
-                              </div>
-                              <div>
-                                <div className="text-sm font-medium text-white">
-                                  {opp.bookmaker} • {opp.market_type}
-                                </div>
-                                <div className="text-xs text-gray-400">{opp.outcome}</div>
-                              </div>
-                            </div>
-                            <div className="text-right">
-                              <div className="text-lg font-bold text-green-400">
-                                +{opp.clv.toFixed(2)}%
-                              </div>
-                              <div className="text-xs text-gray-500">
-                                {opp.entry_odds > 0 ? '+' : ''}{opp.entry_odds} → {opp.closing_odds > 0 ? '+' : ''}{opp.closing_odds}
-                              </div>
-                            </div>
+            {gamesView === 'my-bets' && <MyBets />}
+
+            {gamesView === 'best-ev' && (
+              bestOpportunities.length > 0 ? (
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-gray-700/50">
+                      {['Game', 'Market', 'Outcome', 'Current Line', 'Predicted Movement', 'Direction', 'Confidence', 'Bookmaker', 'EV Score'].map((h, i) => (
+                        <th key={h} className={`py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider ${i <= 2 || i === 7 ? 'text-left' : 'text-center'}`}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bestOpportunities.map((opp, index) => (
+                      <tr key={index} className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200" style={{ animationDelay: `${index * 30}ms` }}>
+                        <td className="py-4 px-4">
+                          <span className="font-medium text-white text-sm">{opp.away_team} @ {opp.home_team}</span>
+                          <div className="text-xs text-gray-500 mt-1">
+                            {new Date(opp.commence_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
                           </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Quick Stats */}
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-white/10">
-                      <div className="text-center">
-                        <div className="text-xs text-gray-400 mb-1">Best Book</div>
-                        <div className="text-sm font-medium text-blue-400">
-                          {Object.entries(report.by_bookmaker)
-                            .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0]?.[0] || 'N/A'}
-                        </div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-xs text-gray-400 mb-1">Best Market</div>
-                        <div className="text-sm font-medium text-purple-400">
-                          {Object.entries(report.by_market)
-                            .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0]?.[0] || 'N/A'}
-                        </div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-xs text-gray-400 mb-1">Median CLV</div>
-                        <div className={`text-sm font-medium ${report.median_clv > 0 ? 'text-green-400' : 'text-gray-400'}`}>
-                          {report.median_clv > 0 ? '+' : ''}{report.median_clv.toFixed(2)}%
-                        </div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-xs text-gray-400 mb-1">Hit Rate</div>
-                        <div className="text-sm font-medium text-cyan-400">
-                          {report.positive_clv_count}/{report.total_opportunities}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* View Tracked Bets Button */}
-                    {report.settled_count !== undefined && report.settled_count > 0 && (
-                      <div className="mt-4 pt-4 border-t border-white/10">
-                        <button
-                          onClick={() => toggleReportExpanded(report.id)}
-                          className={`w-full px-4 py-3 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 ${
-                            expandedReportId === report.id
-                              ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50'
-                              : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
-                          }`}
-                        >
-                          <svg
-                            className={`w-4 h-4 transition-transform duration-200 ${expandedReportId === report.id ? 'rotate-180' : ''}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                          </svg>
-                          {expandedReportId === report.id ? 'Hide Tracked Bets' : `View ${report.settled_count} Tracked Bets`}
-                        </button>
-
-                        {/* Expanded Tracked Opportunities */}
-                        {expandedReportId === report.id && (
-                          <div className="mt-4">
-                            {loadingOpportunities ? (
-                              <div className="text-center py-8">
-                                <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-purple-500 mx-auto"></div>
-                                <p className="text-gray-400 mt-2 text-sm">Loading tracked bets...</p>
-                              </div>
-                            ) : trackedOpportunities.length > 0 ? (
-                              <div className="space-y-2">
-                                <h4 className="text-sm font-semibold text-purple-300 mb-3 uppercase tracking-wider">
-                                  Tracked Bet Results
-                                </h4>
-                                {trackedOpportunities.map((opp) => (
-                                  <div
-                                    key={opp.id}
-                                    className={`flex items-center justify-between rounded-lg p-3 border ${
-                                      opp.result === 'win'
-                                        ? 'bg-green-500/10 border-green-500/30'
-                                        : opp.result === 'loss'
-                                        ? 'bg-red-500/10 border-red-500/30'
-                                        : opp.result === 'push'
-                                        ? 'bg-gray-500/10 border-gray-500/30'
-                                        : 'bg-white/5 border-white/10'
-                                    }`}
-                                  >
-                                    <div className="flex items-center gap-3">
-                                      {/* Result Icon */}
-                                      <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
-                                        opp.result === 'win'
-                                          ? 'bg-green-500/30 border border-green-500/50'
-                                          : opp.result === 'loss'
-                                          ? 'bg-red-500/30 border border-red-500/50'
-                                          : opp.result === 'push'
-                                          ? 'bg-gray-500/30 border border-gray-500/50'
-                                          : 'bg-yellow-500/30 border border-yellow-500/50'
-                                      }`}>
-                                        {opp.result === 'win' ? (
-                                          <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 20 20">
-                                            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                                          </svg>
-                                        ) : opp.result === 'loss' ? (
-                                          <svg className="w-4 h-4 text-red-400" fill="currentColor" viewBox="0 0 20 20">
-                                            <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
-                                          </svg>
-                                        ) : opp.result === 'push' ? (
-                                          <span className="text-gray-400 font-bold text-sm">=</span>
-                                        ) : (
-                                          <span className="text-yellow-400 font-bold text-sm">?</span>
-                                        )}
-                                      </div>
-                                      <div>
-                                        <div className="text-sm font-medium text-white">
-                                          {opp.away_team} @ {opp.home_team}
-                                          {opp.home_score !== null && opp.away_score !== null && (
-                                            <span className="text-gray-400 ml-2">
-                                              ({opp.away_score} - {opp.home_score})
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="text-xs text-gray-400">
-                                          {opp.bookmaker} • {opp.market_type} • {opp.outcome_name}
-                                          {opp.point_line !== null && (
-                                            <span className="text-blue-400 ml-1">
-                                              {opp.market_type === 'spreads'
-                                                ? `(${opp.point_line > 0 ? '+' : ''}${opp.point_line})`
-                                                : `(${opp.point_line})`}
-                                            </span>
-                                          )}
-                                        </div>
-                                      </div>
-                                    </div>
-                                    <div className="text-right">
-                                      <div className={`text-lg font-bold ${
-                                        opp.profit_loss !== null && opp.profit_loss >= 0 ? 'text-green-400' : 'text-red-400'
-                                      }`}>
-                                        {opp.profit_loss !== null ? (
-                                          `${opp.profit_loss >= 0 ? '+' : ''}$${opp.profit_loss.toFixed(2)}`
-                                        ) : (
-                                          'Pending'
-                                        )}
-                                      </div>
-                                      <div className="text-xs text-gray-500">
-                                        CLV: +{opp.clv_percentage.toFixed(2)}% | {opp.entry_odds > 0 ? '+' : ''}{opp.entry_odds}
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="text-center py-8 text-gray-400">
-                                <p>No tracked opportunities found for this report</p>
-                              </div>
-                            )}
+                        </td>
+                        <td className="py-4 px-4">
+                          <span className="px-2 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">{opp.market_type}</span>
+                        </td>
+                        <td className="py-4 px-4"><span className="text-sm font-medium text-white">{opp.outcome_name}</span></td>
+                        <td className="text-center py-4 px-4"><span className="text-sm font-mono text-blue-400">{opp.current_line}</span></td>
+                        <td className="text-center py-4 px-4">
+                          <div className="flex items-center justify-center gap-1">
+                            <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
+                            </span>
+                            {opp.was_constrained && <span className="text-yellow-400 text-xs" title="Prediction capped to realistic range">⚠️</span>}
                           </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))}
-                {dailyReports.length === 0 && (
-                  <div className="text-center py-12 text-gray-400">
-                    <p className="text-lg mb-2">No daily reports yet</p>
-                    <p className="text-sm">Reports are generated daily at 9:00 AM for completed games</p>
-                  </div>
-                )}
-              </div>
-            ) : gamesView === 'bankroll-sim' ? (
-              // Bankroll Simulation View
-              <div className="space-y-6">
-                {/* Controls */}
-                <div className="bg-white/5 rounded-lg p-4 border border-white/10 space-y-4">
-                  {/* Primary Controls Row */}
-                  <div className="flex flex-wrap gap-4 items-center">
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-400">Strategy:</label>
-                      <select
-                        value={simStrategy}
-                        onChange={(e) => setSimStrategy(e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                      >
-                        <option value="fixed">Fixed Unit</option>
-                        <option value="fractional">Fractional</option>
-                        <option value="kelly">Full Kelly</option>
-                        <option value="half_kelly">Half Kelly</option>
-                        <option value="confidence">Confidence-Weighted</option>
-                      </select>
-                    </div>
-                    {simStrategy === 'fixed' && (
-                      <div className="flex items-center gap-2">
-                        <label className="text-sm text-gray-400">Bet Size:</label>
-                        <select
-                          value={simBetSize}
-                          onChange={(e) => setSimBetSize(Number(e.target.value))}
-                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                        >
-                          <option value={25}>$25</option>
-                          <option value={50}>$50</option>
-                          <option value={100}>$100</option>
-                          <option value={250}>$250</option>
-                          <option value={500}>$500</option>
-                        </select>
-                      </div>
-                    )}
-                    {(simStrategy === 'fractional' || simStrategy === 'confidence') && (
-                      <div className="flex items-center gap-2">
-                        <label className="text-sm text-gray-400">Fraction:</label>
-                        <select
-                          value={simFractionPercent}
-                          onChange={(e) => setSimFractionPercent(Number(e.target.value))}
-                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                        >
-                          <option value={1}>1%</option>
-                          <option value={2}>2%</option>
-                          <option value={3}>3%</option>
-                          <option value={5}>5%</option>
-                        </select>
-                      </div>
-                    )}
-                    {(simStrategy === 'kelly' || simStrategy === 'half_kelly') && (
-                      <div className="flex items-center gap-2">
-                        <label className="text-sm text-gray-400">Max Bet:</label>
-                        <select
-                          value={simMaxBetPercent}
-                          onChange={(e) => setSimMaxBetPercent(Number(e.target.value))}
-                          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                        >
-                          <option value={10}>10%</option>
-                          <option value={15}>15%</option>
-                          <option value={25}>25%</option>
-                        </select>
-                      </div>
-                    )}
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-400">Bankroll:</label>
-                      <select
-                        value={simStartingBankroll}
-                        onChange={(e) => setSimStartingBankroll(Number(e.target.value))}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                      >
-                        <option value={1000}>$1,000</option>
-                        <option value={5000}>$5,000</option>
-                        <option value={10000}>$10,000</option>
-                        <option value={25000}>$25,000</option>
-                        <option value={50000}>$50,000</option>
-                      </select>
-                    </div>
-                  </div>
-                  {/* Filter Controls Row */}
-                  <div className="flex flex-wrap gap-4 items-center">
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-400">Bookmaker:</label>
-                      <select
-                        value={simBookmakerFilter || ''}
-                        onChange={(e) => setSimBookmakerFilter(e.target.value || null)}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                      >
-                        <option value="">All</option>
-                        <option value="DraftKings">DraftKings</option>
-                        <option value="FanDuel">FanDuel</option>
-                        <option value="theScore Bet">theScore</option>
-                        <option value="BetMGM">BetMGM</option>
-                      </select>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-400">Market:</label>
-                      <select
-                        value={simMarketFilter || ''}
-                        onChange={(e) => setSimMarketFilter(e.target.value || null)}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                      >
-                        <option value="">All</option>
-                        <option value="h2h">Moneyline</option>
-                        <option value="spreads">Spreads</option>
-                        <option value="totals">Totals</option>
-                      </select>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-400">Min CLV:</label>
-                      <select
-                        value={simClvThreshold ?? ''}
-                        onChange={(e) => setSimClvThreshold(e.target.value ? Number(e.target.value) : null)}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-white text-sm"
-                      >
-                        <option value="">Any</option>
-                        <option value={1}>1%+</option>
-                        <option value={2}>2%+</option>
-                        <option value={3}>3%+</option>
-                        <option value={5}>5%+</option>
-                      </select>
-                    </div>
-                  </div>
+                        </td>
+                        <td className="text-center py-4 px-4">
+                          <span className={`px-2 py-1 rounded text-xs font-medium border ${opp.predicted_direction === 'UP' ? 'bg-green-500/20 text-green-400 border-green-500/30' : opp.predicted_direction === 'DOWN' ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-gray-500/20 text-gray-400 border-gray-500/30'}`}>
+                            {opp.predicted_direction}
+                          </span>
+                        </td>
+                        <td className="text-center py-4 px-4"><span className="text-sm font-medium text-cyan-400">{(opp.confidence * 100).toFixed(0)}%</span></td>
+                        <td className="py-4 px-4"><span className="text-sm text-gray-300">{opp.bookmaker_name}</span></td>
+                        <td className="text-center py-4 px-4">
+                          <span className="px-2 py-1 rounded text-sm font-bold bg-green-500/20 text-green-400 border border-green-500/30">{opp.ev_score.toFixed(2)}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <div className="text-center py-12 text-gray-400">
+                  <p className="text-lg mb-2">No +EV opportunities available</p>
+                  <p className="text-sm">Opportunities appear when the ML model predicts favorable betting conditions</p>
                 </div>
+              )
+            )}
 
-                {loadingSimulation ? (
-                  <div className="text-center py-12">
-                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-purple-500 mx-auto"></div>
-                    <p className="text-gray-400 mt-4">Running simulation...</p>
-                  </div>
-                ) : bankrollSimulation?.has_data ? (
-                  <>
-                    {/* Summary Cards */}
-                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4">
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Total P&L</div>
-                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.total_profit_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {bankrollSimulation.summary.total_profit_loss >= 0 ? '+' : ''}${bankrollSimulation.summary.total_profit_loss.toFixed(2)}
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">ROI</div>
-                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.roi_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {bankrollSimulation.summary.roi_pct >= 0 ? '+' : ''}{bankrollSimulation.summary.roi_pct.toFixed(2)}%
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Win Rate</div>
-                        <div className="text-2xl font-bold text-white">
-                          {bankrollSimulation.summary.win_rate.toFixed(1)}%
-                        </div>
-                        <div className="text-xs text-gray-500 mt-1">
-                          {bankrollSimulation.summary.win_count}W-{bankrollSimulation.summary.loss_count}L
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Max Drawdown</div>
-                        <div className="text-2xl font-bold text-red-400">
-                          ${bankrollSimulation.summary.max_drawdown.toFixed(2)}
-                        </div>
-                        <div className="text-xs text-gray-500 mt-1">
-                          {bankrollSimulation.summary.max_drawdown_pct.toFixed(1)}% of peak
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Total Bets</div>
-                        <div className="text-2xl font-bold text-blue-400">
-                          {bankrollSimulation.summary.total_bets}
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Peak Bankroll</div>
-                        <div className="text-2xl font-bold text-purple-400">
-                          ${bankrollSimulation.summary.peak_bankroll.toLocaleString()}
-                        </div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Sharpe Ratio</div>
-                        <div className={`text-2xl font-bold ${bankrollSimulation.summary.sharpe_ratio >= 0 ? 'text-cyan-400' : 'text-orange-400'}`}>
-                          {bankrollSimulation.summary.sharpe_ratio?.toFixed(2) ?? 'N/A'}
-                        </div>
-                        <div className="text-xs text-gray-500 mt-1">Risk-adjusted</div>
-                      </div>
-                      <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                        <div className="text-xs text-gray-400 mb-1 uppercase">Avg Bet Size</div>
-                        <div className="text-2xl font-bold text-yellow-400">
-                          ${bankrollSimulation.summary.avg_bet_size?.toFixed(0) ?? 'N/A'}
-                        </div>
-                        <div className="text-xs text-gray-500 mt-1">
-                          {bankrollSimulation.summary.strategy?.replace('_', ' ')}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Performance Breakdown */}
-                    {(bankrollSimulation.by_bookmaker || bankrollSimulation.by_market) && (
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                        {bankrollSimulation.by_bookmaker && Object.keys(bankrollSimulation.by_bookmaker).length > 0 && (
-                          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                            <h3 className="text-lg font-semibold text-white mb-4">By Bookmaker</h3>
-                            <div className="space-y-3">
-                              {Object.entries(bankrollSimulation.by_bookmaker)
-                                .sort(([, a], [, b]) => b.profit - a.profit)
-                                .map(([name, stats]) => (
-                                  <div key={name} className="flex items-center justify-between py-2 border-b border-gray-700/50">
-                                    <div>
-                                      <div className="text-white font-medium">{name}</div>
-                                      <div className="text-xs text-gray-500">{stats.bets} bets | {stats.win_rate}% win</div>
-                                    </div>
-                                    <div className="text-right">
-                                      <div className={`font-bold ${stats.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                        {stats.profit >= 0 ? '+' : ''}${stats.profit.toFixed(0)}
-                                      </div>
-                                      <div className={`text-xs ${stats.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                        {stats.roi >= 0 ? '+' : ''}{stats.roi}% ROI
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                            </div>
-                          </div>
-                        )}
-                        {bankrollSimulation.by_market && Object.keys(bankrollSimulation.by_market).length > 0 && (
-                          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                            <h3 className="text-lg font-semibold text-white mb-4">By Market Type</h3>
-                            <div className="space-y-3">
-                              {Object.entries(bankrollSimulation.by_market)
-                                .sort(([, a], [, b]) => b.profit - a.profit)
-                                .map(([name, stats]) => (
-                                  <div key={name} className="flex items-center justify-between py-2 border-b border-gray-700/50">
-                                    <div>
-                                      <div className="text-white font-medium">{name.toUpperCase()}</div>
-                                      <div className="text-xs text-gray-500">{stats.bets} bets | {stats.win_rate}% win | {stats.avg_clv}% avg CLV</div>
-                                    </div>
-                                    <div className="text-right">
-                                      <div className={`font-bold ${stats.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                        {stats.profit >= 0 ? '+' : ''}${stats.profit.toFixed(0)}
-                                      </div>
-                                      <div className={`text-xs ${stats.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                        {stats.roi >= 0 ? '+' : ''}{stats.roi}% ROI
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* P&L Curve Chart */}
-                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                      <h3 className="text-lg font-semibold text-white mb-4">Cumulative P&L</h3>
-                      <ResponsiveContainer width="100%" height={300}>
-                        <LineChart data={bankrollSimulation.data_points}>
-                          <defs>
-                            <linearGradient id="colorPL" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#10B981" stopOpacity={0.3} />
-                              <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                          <XAxis
-                            dataKey="bet_number"
-                            stroke="#9CA3AF"
-                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                            label={{ value: 'Bet #', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                          />
-                          <YAxis
-                            stroke="#9CA3AF"
-                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                            tickFormatter={(value) => `$${value}`}
-                          />
-                          <Tooltip
-                            contentStyle={{
-                              backgroundColor: '#1F2937',
-                              border: '1px solid #374151',
-                              borderRadius: '8px',
-                            }}
-                            formatter={(value: number | undefined, name: string | undefined) => {
-                              if (value === undefined) return ['N/A', name ?? ''];
-                              if (name === 'cumulative_pl') return [`$${value.toFixed(2)}`, 'Cumulative P&L'];
-                              return [value, name ?? ''];
-                            }}
-                            labelFormatter={(label) => `Bet #${label}`}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="cumulative_pl"
-                            stroke="#10B981"
-                            strokeWidth={2}
-                            dot={false}
-                            fill="url(#colorPL)"
-                          />
-                          {/* Zero line */}
-                          <Line
-                            type="monotone"
-                            dataKey={() => 0}
-                            stroke="#6B7280"
-                            strokeWidth={1}
-                            strokeDasharray="5 5"
-                            dot={false}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </div>
-
-                    {/* Drawdown Chart */}
-                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                      <h3 className="text-lg font-semibold text-white mb-4">Drawdown Analysis</h3>
-                      <ResponsiveContainer width="100%" height={200}>
-                        <BarChart data={bankrollSimulation.data_points}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                          <XAxis
-                            dataKey="bet_number"
-                            stroke="#9CA3AF"
-                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                          />
-                          <YAxis
-                            stroke="#9CA3AF"
-                            tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                            tickFormatter={(value) => `${value}%`}
-                          />
-                          <Tooltip
-                            contentStyle={{
-                              backgroundColor: '#1F2937',
-                              border: '1px solid #374151',
-                              borderRadius: '8px',
-                            }}
-                            formatter={(value: number | undefined) => [`${value?.toFixed(2) ?? '0'}%`, 'Drawdown']}
-                            labelFormatter={(label) => `Bet #${label}`}
-                          />
-                          <Bar
-                            dataKey="drawdown_pct"
-                            fill="#EF4444"
-                            opacity={0.7}
-                            radius={[2, 2, 0, 0]}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-
-                    {/* Bet History Table */}
-                    <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                      <h3 className="text-lg font-semibold text-white mb-4">Bet History (Verify Each Bet)</h3>
-                      <div className="overflow-x-auto max-h-[500px]">
-                        <table className="w-full text-sm">
-                          <thead className="sticky top-0 bg-gray-900 z-10">
-                            <tr className="border-b border-gray-700">
-                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Date</th>
-                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Game</th>
-                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Book</th>
-                              <th className="text-left py-2 px-2 text-gray-400 text-xs">Bet</th>
-                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Entry</th>
-                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Close</th>
-                              <th className="text-center py-2 px-2 text-gray-400 text-xs">CLV</th>
-                              <th className="text-center py-2 px-2 text-gray-400 text-xs">Result</th>
-                              <th className="text-right py-2 px-2 text-gray-400 text-xs">P&L</th>
-                              <th className="text-right py-2 px-2 text-gray-400 text-xs">Running</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {bankrollSimulation.data_points.map((bet, idx) => (
-                              <tr key={idx} className="border-b border-gray-800 hover:bg-white/5">
-                                <td className="py-2 px-2 text-gray-400 text-xs whitespace-nowrap">
-                                  {bet.game_date}
-                                </td>
-                                <td className="py-2 px-2 text-white text-xs max-w-[150px] truncate" title={bet.game}>
-                                  {bet.game}
-                                </td>
-                                <td className="py-2 px-2 text-gray-300 text-xs max-w-[80px] truncate" title={bet.bookmaker}>
-                                  {bet.bookmaker}
-                                </td>
-                                <td className="py-2 px-2 text-xs">
-                                  <span className="text-purple-400">{bet.market}</span>
-                                  <span className="text-gray-500 ml-1">-</span>
-                                  <span className="text-white ml-1 max-w-[100px] truncate inline-block align-bottom" title={bet.outcome}>
-                                    {bet.outcome}
-                                  </span>
-                                </td>
-                                <td className="text-center py-2 px-2 text-blue-400 text-xs font-mono">
-                                  {bet.odds.toFixed(2)}
-                                </td>
-                                <td className="text-center py-2 px-2 text-gray-400 text-xs font-mono">
-                                  {bet.closing_odds.toFixed(2)}
-                                </td>
-                                <td className="text-center py-2 px-2 text-green-400 text-xs font-medium">
-                                  +{bet.clv}%
-                                </td>
-                                <td className="text-center py-2 px-2">
-                                  <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
-                                    bet.result === 'win'
-                                      ? 'bg-green-500/20 text-green-400'
-                                      : bet.result === 'loss'
-                                      ? 'bg-red-500/20 text-red-400'
-                                      : 'bg-gray-500/20 text-gray-400'
-                                  }`}>
-                                    {bet.result === 'win' ? 'W' : bet.result === 'loss' ? 'L' : 'P'}
-                                  </span>
-                                </td>
-                                <td className={`text-right py-2 px-2 font-medium text-xs ${
-                                  bet.profit >= 0 ? 'text-green-400' : 'text-red-400'
-                                }`}>
-                                  {bet.profit >= 0 ? '+' : ''}${bet.profit.toFixed(0)}
-                                </td>
-                                <td className={`text-right py-2 px-2 font-medium text-xs ${
-                                  bet.cumulative_pl >= 0 ? 'text-green-400' : 'text-red-400'
-                                }`}>
-                                  {bet.cumulative_pl >= 0 ? '+' : ''}${bet.cumulative_pl.toFixed(0)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                      <p className="text-xs text-gray-500 mt-3">
-                        Entry = odds when bet was placed | Close = closing odds before game | CLV = closing line value advantage
-                      </p>
-                    </div>
-                  </>
-                ) : (
-                  <div className="text-center py-12 text-gray-400">
-                    <div className="text-6xl mb-4">📊</div>
-                    <p className="text-lg mb-2">No simulation data available</p>
-                    <p className="text-sm">Settled bets are needed to run the bankroll simulation</p>
-                  </div>
-                )}
-              </div>
-            ) : gamesView === 'my-bets' ? (
-              // My Bets View
-              <div className="space-y-6">
-                {/* Summary Cards */}
-                {userBetsSummary && (
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                      <div className="text-xs text-gray-400 mb-1 uppercase">Pending</div>
-                      <div className="text-2xl font-bold text-yellow-400">{userBetsSummary.pending}</div>
-                    </div>
-                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                      <div className="text-xs text-gray-400 mb-1 uppercase">Record</div>
-                      <div className="text-2xl font-bold text-white">
-                        {userBetsSummary.wins}-{userBetsSummary.losses}
-                      </div>
-                    </div>
-                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                      <div className="text-xs text-gray-400 mb-1 uppercase">Win Rate</div>
-                      <div className="text-2xl font-bold text-blue-400">{userBetsSummary.win_rate}%</div>
-                    </div>
-                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                      <div className="text-xs text-gray-400 mb-1 uppercase">Profit</div>
-                      <div className={`text-2xl font-bold ${userBetsSummary.total_profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {userBetsSummary.total_profit >= 0 ? '+' : ''}${userBetsSummary.total_profit}
-                      </div>
-                    </div>
-                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
-                      <div className="text-xs text-gray-400 mb-1 uppercase">ROI</div>
-                      <div className={`text-2xl font-bold ${userBetsSummary.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {userBetsSummary.roi >= 0 ? '+' : ''}{userBetsSummary.roi}%
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Add Bet Button */}
-                <div className="flex justify-end">
-                  <button
-                    onClick={() => setShowAddBetForm(!showAddBetForm)}
-                    className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg border border-green-500/50 transition-all"
-                  >
-                    {showAddBetForm ? 'Cancel' : '+ Add Bet'}
-                  </button>
-                </div>
-
-                {/* Add Bet Form */}
-                {showAddBetForm && (
-                  <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-                    <h3 className="text-lg font-semibold text-white mb-4">Add New Bet</h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                      <input
-                        type="text"
-                        placeholder="Game (e.g., Bulls @ Celtics)"
-                        value={newBet.game_description}
-                        onChange={(e) => setNewBet({ ...newBet, game_description: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      />
-                      <input
-                        type="datetime-local"
-                        value={newBet.game_date}
-                        onChange={(e) => setNewBet({ ...newBet, game_date: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      />
-                      <select
-                        value={newBet.bookmaker}
-                        onChange={(e) => setNewBet({ ...newBet, bookmaker: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      >
-                        <option value="DraftKings">DraftKings</option>
-                        <option value="FanDuel">FanDuel</option>
-                        <option value="BetMGM">BetMGM</option>
-                        <option value="Caesars">Caesars</option>
-                        <option value="theScore Bet">theScore Bet</option>
-                      </select>
-                      <select
-                        value={newBet.market_type}
-                        onChange={(e) => setNewBet({ ...newBet, market_type: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      >
-                        <option value="h2h">Moneyline</option>
-                        <option value="spreads">Spread</option>
-                        <option value="totals">Totals</option>
-                      </select>
-                      <input
-                        type="text"
-                        placeholder="Bet (e.g., Bulls -1.5)"
-                        value={newBet.bet_description}
-                        onChange={(e) => setNewBet({ ...newBet, bet_description: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      />
-                      <input
-                        type="number"
-                        placeholder="Odds (e.g., +140 or -110)"
-                        value={newBet.odds}
-                        onChange={(e) => setNewBet({ ...newBet, odds: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      />
-                      <input
-                        type="number"
-                        placeholder="Stake"
-                        value={newBet.stake}
-                        onChange={(e) => setNewBet({ ...newBet, stake: e.target.value })}
-                        className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      />
-                      <button
-                        onClick={handleAddBet}
-                        className="px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-lg font-medium transition-all"
-                      >
-                        Add Bet
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Bets Table */}
-                {loadingUserBets ? (
-                  <div className="text-center py-12">
-                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-yellow-500 mx-auto"></div>
-                  </div>
-                ) : userBets.length > 0 ? (
-                  <div className="bg-white/5 rounded-lg border border-white/10 overflow-hidden">
-                    <table className="w-full text-sm">
-                      <thead className="bg-gray-900">
-                        <tr className="border-b border-gray-700">
-                          <th className="text-left py-3 px-4 text-gray-400">Date</th>
-                          <th className="text-left py-3 px-4 text-gray-400">Game</th>
-                          <th className="text-left py-3 px-4 text-gray-400">Bet</th>
-                          <th className="text-center py-3 px-4 text-gray-400">Book</th>
-                          <th className="text-center py-3 px-4 text-gray-400">Odds</th>
-                          <th className="text-center py-3 px-4 text-gray-400">Stake</th>
-                          <th className="text-center py-3 px-4 text-gray-400">Status</th>
-                          <th className="text-right py-3 px-4 text-gray-400">P&L</th>
-                          <th className="text-center py-3 px-4 text-gray-400">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {userBets.map((bet) => (
-                          <tr key={bet.id} className="border-b border-gray-800 hover:bg-white/5">
-                            <td className="py-3 px-4 text-gray-400">
-                              {new Date(bet.game_date).toLocaleDateString()}
-                            </td>
-                            <td className="py-3 px-4 text-white">{bet.game_description}</td>
-                            <td className="py-3 px-4">
-                              <span className="text-purple-400">{bet.market_type}</span>
-                              <span className="text-white ml-2">{bet.bet_description}</span>
-                            </td>
-                            <td className="text-center py-3 px-4 text-gray-300">{bet.bookmaker}</td>
-                            <td className="text-center py-3 px-4 text-blue-400 font-mono">
-                              {bet.odds > 0 ? '+' : ''}{bet.odds}
-                            </td>
-                            <td className="text-center py-3 px-4 text-white">${bet.stake}</td>
-                            <td className="text-center py-3 px-4">
-                              <span className={`px-2 py-1 rounded text-xs font-medium ${
-                                bet.result === 'win' ? 'bg-green-500/20 text-green-400' :
-                                bet.result === 'loss' ? 'bg-red-500/20 text-red-400' :
-                                bet.result === 'push' ? 'bg-gray-500/20 text-gray-400' :
-                                'bg-yellow-500/20 text-yellow-400'
-                              }`}>
-                                {bet.result.toUpperCase()}
-                              </span>
-                            </td>
-                            <td className={`text-right py-3 px-4 font-medium ${
-                              bet.profit_loss === null ? 'text-gray-500' :
-                              bet.profit_loss >= 0 ? 'text-green-400' : 'text-red-400'
-                            }`}>
-                              {bet.profit_loss !== null ? `${bet.profit_loss >= 0 ? '+' : ''}$${bet.profit_loss.toFixed(0)}` : '-'}
-                            </td>
-                            <td className="text-center py-3 px-4">
-                              {bet.result === 'pending' ? (
-                                <div className="flex gap-1 justify-center">
-                                  <button
-                                    onClick={() => handleSettleBet(bet.id, 'win')}
-                                    className="px-2 py-1 text-xs bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded"
-                                  >
-                                    W
-                                  </button>
-                                  <button
-                                    onClick={() => handleSettleBet(bet.id, 'loss')}
-                                    className="px-2 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded"
-                                  >
-                                    L
-                                  </button>
-                                  <button
-                                    onClick={() => handleSettleBet(bet.id, 'push')}
-                                    className="px-2 py-1 text-xs bg-gray-500/20 hover:bg-gray-500/30 text-gray-400 rounded"
-                                  >
-                                    P
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteBet(bet.id)}
-                                    className="px-2 py-1 text-xs bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded"
-                                  >
-                                    X
-                                  </button>
+            {(gamesView === 'recent' || gamesView === 'history') && (
+              <>
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-gray-700/50">
+                      {['Game', 'Time', 'Avg CLV', 'Snapshots', 'Closing Lines', 'Status'].map((h, i) => (
+                        <th key={h} className={`py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider ${i === 0 || i === 1 ? 'text-left' : 'text-center'}`}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayedGames.map((game, index) => (
+                      <React.Fragment key={game.game_id}>
+                        <tr
+                          onClick={() => {
+                            if (gamesView === 'history') {
+                              setExpandedGameId(expandedGameId === game.game_id ? null : game.game_id);
+                            } else {
+                              handleGameClick(game);
+                            }
+                          }}
+                          className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200 cursor-pointer"
+                          style={{ animationDelay: `${index * 30}ms` }}
+                          title={gamesView === 'history' ? 'Click to view analysis' : 'Click to view detailed betting lines'}
+                        >
+                          <td className="py-4 px-4">
+                            <div className="font-medium text-white">
+                              <div>{game.away_team} @ {game.home_team}</div>
+                              {game.home_score !== null && game.away_score !== null && (
+                                <div className="text-sm mt-1">
+                                  <span className="text-gray-400">Final: </span>
+                                  <span className={`font-bold ${game.winner === 'away' ? 'text-green-400' : 'text-gray-300'}`}>{game.away_score}</span>
+                                  <span className="text-gray-500"> - </span>
+                                  <span className={`font-bold ${game.winner === 'home' ? 'text-green-400' : 'text-gray-300'}`}>{game.home_score}</span>
                                 </div>
-                              ) : (
-                                <span className="text-gray-500 text-xs">Settled</span>
                               )}
+                            </div>
+                          </td>
+                          <td className="py-4 px-4 text-gray-300 text-sm">
+                            {new Date(game.commence_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          </td>
+                          <td className="text-center py-4 px-4">
+                            {game.avg_clv !== null ? (
+                              <span className={`font-bold text-lg ${game.avg_clv > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}>
+                                {game.avg_clv > 0 ? '+' : ''}{game.avg_clv.toFixed(2)}%
+                              </span>
+                            ) : (
+                              <span className="text-gray-500 text-sm">N/A</span>
+                            )}
+                          </td>
+                          <td className="text-center py-4 px-4">
+                            <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">{game.snapshots_count}</span>
+                          </td>
+                          <td className="text-center py-4 px-4">
+                            <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-purple-500/20 text-purple-400 border border-purple-500/30">{game.closing_lines_count}</span>
+                          </td>
+                          <td className="text-center py-4 px-4">
+                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${game.completed ? 'bg-gray-700/50 text-gray-300 border border-gray-600/50' : 'bg-green-500/20 text-green-400 border border-green-500/30'}`}>
+                              {game.completed ? 'Completed' : 'Upcoming'}
+                            </span>
+                          </td>
+                        </tr>
+                        {gamesView === 'history' && expandedGameId === game.game_id && (
+                          <tr className="bg-gray-800/50">
+                            <td colSpan={6} className="p-6">
+                              <GameAnalysis gameId={game.game_id} />
                             </td>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+                {gamesView === 'history' && historyGames.length === 0 && (
                   <div className="text-center py-12 text-gray-400">
-                    <div className="text-6xl mb-4">🎰</div>
-                    <p className="text-lg mb-2">No bets tracked yet</p>
-                    <p className="text-sm">Click "+ Add Bet" to start tracking your bets</p>
+                    <p className="text-lg mb-2">No completed games with CLV data yet</p>
+                    <p className="text-sm">Games will appear here once they're completed and have closing line data</p>
                   </div>
                 )}
-              </div>
-            ) : gamesView === 'best-ev' ? (
-              // Best +EV Opportunities Table
-              <table className="w-full">
-                <thead>
-                  <tr className="border-b border-gray-700/50">
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Game
-                    </th>
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Market
-                    </th>
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Outcome
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Current Line
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Predicted Movement
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Direction
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Confidence
-                    </th>
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Bookmaker
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      EV Score
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {bestOpportunities.map((opp, index) => (
-                    <tr
-                      key={index}
-                      className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200"
-                      style={{ animationDelay: `${index * 30}ms` }}
-                    >
-                      <td className="py-4 px-4">
-                        <span className="font-medium text-white text-sm">
-                          {opp.away_team} @ {opp.home_team}
-                        </span>
-                        <div className="text-xs text-gray-500 mt-1">
-                          {new Date(opp.commence_time).toLocaleString('en-US', {
-                            month: 'short',
-                            day: 'numeric',
-                            hour: 'numeric',
-                            minute: '2-digit',
-                          })}
-                        </div>
-                      </td>
-                      <td className="py-4 px-4">
-                        <span className="px-2 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                          {opp.market_type}
-                        </span>
-                      </td>
-                      <td className="py-4 px-4">
-                        <span className="text-sm font-medium text-white">{opp.outcome_name}</span>
-                      </td>
-                      <td className="text-center py-4 px-4">
-                        <span className="text-sm font-mono text-blue-400">{opp.current_line}</span>
-                      </td>
-                      <td className="text-center py-4 px-4">
-                        <div className="flex items-center justify-center gap-1">
-                          <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                            {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
-                          </span>
-                          {opp.was_constrained && (
-                            <span
-                              className="text-yellow-400 text-xs"
-                              title="Prediction capped to realistic range based on historical data"
-                            >
-                              ⚠️
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="text-center py-4 px-4">
-                        <span className={`px-2 py-1 rounded text-xs font-medium border ${
-                          opp.predicted_direction === 'UP'
-                            ? 'bg-green-500/20 text-green-400 border-green-500/30'
-                            : opp.predicted_direction === 'DOWN'
-                            ? 'bg-red-500/20 text-red-400 border-red-500/30'
-                            : 'bg-gray-500/20 text-gray-400 border-gray-500/30'
-                        }`}>
-                          {opp.predicted_direction}
-                        </span>
-                      </td>
-                      <td className="text-center py-4 px-4">
-                        <span className="text-sm font-medium text-cyan-400">
-                          {(opp.confidence * 100).toFixed(0)}%
-                        </span>
-                      </td>
-                      <td className="py-4 px-4">
-                        <span className="text-sm text-gray-300">{opp.bookmaker_name}</span>
-                      </td>
-                      <td className="text-center py-4 px-4">
-                        <span className="px-2 py-1 rounded text-sm font-bold bg-green-500/20 text-green-400 border border-green-500/30">
-                          {opp.ev_score.toFixed(2)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              // Regular Games Table
-              <table className="w-full">
-                <thead>
-                  <tr className="border-b border-gray-700/50">
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Game
-                    </th>
-                    <th className="text-left py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Time
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Avg CLV
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Snapshots
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Closing Lines
-                    </th>
-                    <th className="text-center py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider">
-                      Status
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(gamesView === 'recent' ? games : historyGames).map((game, index) => (
-                  <React.Fragment key={game.game_id}>
-                    <tr
-                      onClick={() => {
-                        if (gamesView === 'history') {
-                          setExpandedGameId(expandedGameId === game.game_id ? null : game.game_id);
-                        } else {
-                          handleGameClick(game);
-                        }
-                      }}
-                      className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200 cursor-pointer"
-                      style={{ animationDelay: `${index * 30}ms` }}
-                      title={gamesView === 'history' ? 'Click to view analysis' : 'Click to view detailed betting lines'}
-                    >
-                    <td className="py-4 px-4">
-                      <div className="font-medium text-white">
-                        <div>{game.away_team} @ {game.home_team}</div>
-                        {game.home_score !== null && game.away_score !== null && (
-                          <div className="text-sm mt-1">
-                            <span className="text-gray-400">Final: </span>
-                            <span className={`font-bold ${game.winner === 'away' ? 'text-green-400' : 'text-gray-300'}`}>
-                              {game.away_score}
-                            </span>
-                            <span className="text-gray-500"> - </span>
-                            <span className={`font-bold ${game.winner === 'home' ? 'text-green-400' : 'text-gray-300'}`}>
-                              {game.home_score}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </td>
-                    <td className="py-4 px-4 text-gray-300 text-sm">
-                      {new Date(game.commence_time).toLocaleString('en-US', {
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      {game.avg_clv !== null ? (
-                        <span
-                          className={`font-bold text-lg ${
-                            game.avg_clv > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'
-                          }`}
-                        >
-                          {game.avg_clv > 0 ? '+' : ''}
-                          {game.avg_clv.toFixed(2)}%
-                        </span>
-                      ) : (
-                        <span className="text-gray-500 text-sm">N/A</span>
-                      )}
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                        {game.snapshots_count}
-                      </span>
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-purple-500/20 text-purple-400 border border-purple-500/30">
-                        {game.closing_lines_count}
-                      </span>
-                    </td>
-                    <td className="text-center py-4 px-4">
-                      <span
-                        className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${
-                          game.completed
-                            ? 'bg-gray-700/50 text-gray-300 border border-gray-600/50'
-                            : 'bg-green-500/20 text-green-400 border border-green-500/30'
-                        }`}
-                      >
-                        {game.completed ? 'Completed' : 'Upcoming'}
-                      </span>
-                    </td>
-                  </tr>
-                  {gamesView === 'history' && expandedGameId === game.game_id && (
-                    <tr className="bg-gray-800/50">
-                      <td colSpan={6} className="p-6">
-                        <GameAnalysis gameId={game.game_id} />
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
-                  ))}
-                </tbody>
-              </table>
-            )}
-            {gamesView === 'history' && historyGames.length === 0 && (
-              <div className="text-center py-12 text-gray-400">
-                <p className="text-lg mb-2">No completed games with CLV data yet</p>
-                <p className="text-sm">Games will appear here once they're completed and have closing line data</p>
-              </div>
-            )}
-            {gamesView === 'best-ev' && bestOpportunities.length === 0 && (
-              <div className="text-center py-12 text-gray-400">
-                <p className="text-lg mb-2">No +EV opportunities available</p>
-                <p className="text-sm">Opportunities will appear here when the ML model predicts favorable betting conditions</p>
-              </div>
+              </>
             )}
           </div>
         </GlassCard>
