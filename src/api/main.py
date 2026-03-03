@@ -32,7 +32,7 @@ from src.api.schemas import (
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team, UserBet
+from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, PredictionMarketArb, Sport, Team, UserBet
 
 # Load environment variables
 load_dotenv()
@@ -790,6 +790,7 @@ async def get_bankroll_simulation(
     bookmaker_filter: str = None,
     market_filter: str = None,
     clv_threshold: float = None,
+    source: str = "best_ev",
 ):
     """Get bankroll simulation data with P&L curves and drawdown analysis.
 
@@ -802,38 +803,95 @@ async def get_bankroll_simulation(
         bookmaker_filter: Only include bets from this bookmaker
         market_filter: Only include bets from this market type (h2h, spreads, totals)
         clv_threshold: Minimum CLV% to include bet in simulation
+        source: Data source - 'all' (all tracked bets) or 'best_ev' (Best EV+ picks only)
     """
     db = get_db()
 
     try:
-        # Get all settled opportunities ordered by settlement date
-        stmt = (
-            select(OpportunityPerformance, Game, DailyCLVReport)
-            .join(Game, Game.id == OpportunityPerformance.game_id)
-            .join(DailyCLVReport, DailyCLVReport.id == OpportunityPerformance.report_id)
-            .where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
-            .order_by(OpportunityPerformance.settled_at.asc())
-        )
+        if source == "best_ev":
+            # Query BestEVPick table for Best EV+ tracked picks
+            stmt = (
+                select(BestEVPick, Game)
+                .join(Game, Game.id == BestEVPick.game_id)
+                .where(BestEVPick.result.in_(["win", "loss", "push"]))
+                .order_by(BestEVPick.settled_at.asc())
+            )
+            if bookmaker_filter:
+                stmt = stmt.where(BestEVPick.bookmaker == bookmaker_filter)
+            if market_filter:
+                stmt = stmt.where(BestEVPick.market_type == market_filter)
 
-        # Apply filters
-        if bookmaker_filter:
-            stmt = stmt.where(OpportunityPerformance.bookmaker == bookmaker_filter)
-        if market_filter:
-            stmt = stmt.where(OpportunityPerformance.market_type == market_filter)
-        if clv_threshold is not None:
-            stmt = stmt.where(OpportunityPerformance.clv_percentage >= clv_threshold)
+            raw_results = db.execute(stmt).all()
 
-        results = db.execute(stmt).all()
+            if not raw_results:
+                return {
+                    "has_data": False,
+                    "source": "best_ev",
+                    "message": "No settled Best EV+ picks found. Picks are saved daily at 9 AM. Check back after picks have been tracked and games have completed.",
+                    "data_points": [],
+                    "summary": {},
+                    "by_bookmaker": {},
+                    "by_market": {},
+                }
 
-        if not results:
-            return {
-                "has_data": False,
-                "message": "No settled bets found for simulation",
-                "data_points": [],
-                "summary": {},
-                "by_bookmaker": {},
-                "by_market": {},
-            }
+            # Normalize to unified format for simulation loop
+            results = []
+            for pick, game in raw_results:
+                results.append({
+                    "bookmaker": pick.bookmaker,
+                    "market_type": pick.market_type,
+                    "outcome_name": pick.outcome_name,
+                    "entry_odds": float(pick.entry_odds),
+                    "clv_percentage": float(pick.ev_score),  # Use EV score as proxy for CLV
+                    "result": pick.result,
+                    "profit_loss": float(pick.profit_loss) if pick.profit_loss else None,
+                    "settled_at": pick.settled_at,
+                    "game": game,
+                    "report_date": pick.report_date,
+                })
+        else:
+            # Default: query OpportunityPerformance (all tracked CLV-based opportunities)
+            stmt = (
+                select(OpportunityPerformance, Game, DailyCLVReport)
+                .join(Game, Game.id == OpportunityPerformance.game_id)
+                .join(DailyCLVReport, DailyCLVReport.id == OpportunityPerformance.report_id)
+                .where(OpportunityPerformance.result.in_(["win", "loss", "push"]))
+                .order_by(OpportunityPerformance.settled_at.asc())
+            )
+            if bookmaker_filter:
+                stmt = stmt.where(OpportunityPerformance.bookmaker == bookmaker_filter)
+            if market_filter:
+                stmt = stmt.where(OpportunityPerformance.market_type == market_filter)
+            if clv_threshold is not None:
+                stmt = stmt.where(OpportunityPerformance.clv_percentage >= clv_threshold)
+
+            raw_results = db.execute(stmt).all()
+
+            if not raw_results:
+                return {
+                    "has_data": False,
+                    "source": "all",
+                    "message": "No settled bets found for simulation",
+                    "data_points": [],
+                    "summary": {},
+                    "by_bookmaker": {},
+                    "by_market": {},
+                }
+
+            results = []
+            for opp, game, report in raw_results:
+                results.append({
+                    "bookmaker": opp.bookmaker,
+                    "market_type": opp.market_type,
+                    "outcome_name": opp.outcome_name,
+                    "entry_odds": opp.entry_odds,
+                    "clv_percentage": opp.clv_percentage,
+                    "result": opp.result,
+                    "profit_loss": opp.profit_loss,
+                    "settled_at": opp.settled_at,
+                    "game": game,
+                    "report_date": report.report_date if report else None,
+                })
 
         # Initialize bet sizer based on strategy
         try:
@@ -864,7 +922,7 @@ async def get_bankroll_simulation(
         bet_sizes = []
 
         # Pre-fetch all teams to avoid N+1 queries inside the loop
-        sim_team_ids = list({tid for _, game, _ in results for tid in (game.home_team_id, game.away_team_id)})
+        sim_team_ids = list({tid for r in results for tid in (r["game"].home_team_id, r["game"].away_team_id)})
         sim_teams_map = {
             t.id: t
             for t in db.execute(select(Team).where(Team.id.in_(sim_team_ids))).scalars().all()
@@ -874,12 +932,22 @@ async def get_bankroll_simulation(
         by_bookmaker = {}
         by_market = {}
 
-        for opp, game, report in results:
+        for row in results:
+            game = row["game"]
+            opp_bookmaker = row["bookmaker"]
+            opp_market_type = row["market_type"]
+            opp_outcome_name = row["outcome_name"]
+            opp_entry_odds = row["entry_odds"]
+            opp_clv_percentage = row["clv_percentage"]
+            opp_result = row["result"]
+            opp_settled_at = row["settled_at"]
+            opp_report_date = row["report_date"]
+
             # Calculate bet size using the chosen strategy
             context = BetContext(
                 bankroll=current_bankroll,
-                odds=opp.entry_odds,
-                clv_percentage=opp.clv_percentage,
+                odds=opp_entry_odds,
+                clv_percentage=opp_clv_percentage,
                 ml_confidence=0.6,  # Default confidence
                 max_fraction=max_bet_percent / 100,
             )
@@ -889,10 +957,10 @@ async def get_bankroll_simulation(
             bet_sizes.append(actual_bet_size)
 
             # Calculate profit/loss for this bet
-            if opp.result == "win":
-                profit = actual_bet_size * (opp.entry_odds - 1)
+            if opp_result == "win":
+                profit = actual_bet_size * (opp_entry_odds - 1)
                 win_count += 1
-            elif opp.result == "loss":
+            elif opp_result == "loss":
                 profit = -actual_bet_size
                 loss_count += 1
             else:  # push
@@ -919,61 +987,63 @@ async def get_bankroll_simulation(
                     max_drawdown_pct = (current_drawdown / peak_bankroll) * 100
 
             # Track by bookmaker
-            if opp.bookmaker not in by_bookmaker:
-                by_bookmaker[opp.bookmaker] = {
+            if opp_bookmaker not in by_bookmaker:
+                by_bookmaker[opp_bookmaker] = {
                     "bets": 0, "wins": 0, "losses": 0, "pushes": 0,
                     "profit": 0.0, "wagered": 0.0, "clv_sum": 0.0
                 }
-            by_bookmaker[opp.bookmaker]["bets"] += 1
-            by_bookmaker[opp.bookmaker]["wagered"] += actual_bet_size
-            by_bookmaker[opp.bookmaker]["profit"] += profit
-            by_bookmaker[opp.bookmaker]["clv_sum"] += opp.clv_percentage
-            if opp.result == "win":
-                by_bookmaker[opp.bookmaker]["wins"] += 1
-            elif opp.result == "loss":
-                by_bookmaker[opp.bookmaker]["losses"] += 1
+            by_bookmaker[opp_bookmaker]["bets"] += 1
+            by_bookmaker[opp_bookmaker]["wagered"] += actual_bet_size
+            by_bookmaker[opp_bookmaker]["profit"] += profit
+            by_bookmaker[opp_bookmaker]["clv_sum"] += opp_clv_percentage
+            if opp_result == "win":
+                by_bookmaker[opp_bookmaker]["wins"] += 1
+            elif opp_result == "loss":
+                by_bookmaker[opp_bookmaker]["losses"] += 1
             else:
-                by_bookmaker[opp.bookmaker]["pushes"] += 1
+                by_bookmaker[opp_bookmaker]["pushes"] += 1
 
             # Track by market
-            if opp.market_type not in by_market:
-                by_market[opp.market_type] = {
+            if opp_market_type not in by_market:
+                by_market[opp_market_type] = {
                     "bets": 0, "wins": 0, "losses": 0, "pushes": 0,
                     "profit": 0.0, "wagered": 0.0, "clv_sum": 0.0
                 }
-            by_market[opp.market_type]["bets"] += 1
-            by_market[opp.market_type]["wagered"] += actual_bet_size
-            by_market[opp.market_type]["profit"] += profit
-            by_market[opp.market_type]["clv_sum"] += opp.clv_percentage
-            if opp.result == "win":
-                by_market[opp.market_type]["wins"] += 1
-            elif opp.result == "loss":
-                by_market[opp.market_type]["losses"] += 1
+            by_market[opp_market_type]["bets"] += 1
+            by_market[opp_market_type]["wagered"] += actual_bet_size
+            by_market[opp_market_type]["profit"] += profit
+            by_market[opp_market_type]["clv_sum"] += opp_clv_percentage
+            if opp_result == "win":
+                by_market[opp_market_type]["wins"] += 1
+            elif opp_result == "loss":
+                by_market[opp_market_type]["losses"] += 1
             else:
-                by_market[opp.market_type]["pushes"] += 1
+                by_market[opp_market_type]["pushes"] += 1
 
             # Get team names from pre-fetched map
             home_team = sim_teams_map.get(game.home_team_id)
             away_team = sim_teams_map.get(game.away_team_id)
 
+            date_str = opp_settled_at.isoformat() if opp_settled_at else (
+                opp_report_date.isoformat() if opp_report_date else datetime.now(timezone.utc).isoformat()
+            )
             data_points.append({
-                "date": opp.settled_at.isoformat() if opp.settled_at else report.report_date.isoformat(),
+                "date": date_str,
                 "game_date": game.commence_time.strftime("%Y-%m-%d") if game.commence_time else None,
                 "bet_number": len(data_points) + 1,
                 "cumulative_pl": round(cumulative_pl, 2),
                 "bankroll": round(current_bankroll, 2),
                 "drawdown": round(current_drawdown, 2),
                 "drawdown_pct": round((current_drawdown / peak_bankroll) * 100 if peak_bankroll > 0 else 0, 2),
-                "result": opp.result,
+                "result": opp_result,
                 "profit": round(profit, 2),
                 "bet_size": round(actual_bet_size, 2),
                 "game": f"{away_team.name if away_team else 'Unknown'} @ {home_team.name if home_team else 'Unknown'}",
-                "bookmaker": opp.bookmaker,
-                "outcome": opp.outcome_name,
-                "market": opp.market_type,
-                "odds": opp.entry_odds,
-                "closing_odds": opp.closing_odds,
-                "clv": round(opp.clv_percentage, 2),
+                "bookmaker": opp_bookmaker,
+                "outcome": opp_outcome_name,
+                "market": opp_market_type,
+                "odds": opp_entry_odds,
+                "clv": round(opp_clv_percentage, 2),
             })
 
         total_bets = win_count + loss_count + push_count
@@ -1007,6 +1077,7 @@ async def get_bankroll_simulation(
 
         return {
             "has_data": True,
+            "source": source,
             "data_points": data_points,
             "summary": {
                 "starting_bankroll": starting_bankroll,
@@ -1500,6 +1571,259 @@ async def get_user_bets_summary():
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+# ============================================================================
+# Prediction Market Arbitrage Endpoints
+# ============================================================================
+
+
+@app.get("/api/arb-opportunities")
+async def get_arb_opportunities(
+    min_spread: float = 0.0,
+    source: str = None,
+    limit: int = 100,
+):
+    """
+    Get active arbitrage opportunities between sportsbooks and prediction markets.
+
+    Args:
+        min_spread: Minimum arb spread in percentage points to include
+        source: Filter by source ('kalshi' or 'polymarket')
+        limit: Maximum number of results
+    """
+    db = get_db()
+    try:
+        from src.models.database import PredictionMarketArb as _ArbModel
+        stmt = (
+            select(_ArbModel)
+            .where(_ArbModel.is_active == True)  # noqa: E712
+            .order_by(_ArbModel.arb_spread.desc())
+        )
+        if min_spread > 0:
+            stmt = stmt.where(_ArbModel.arb_spread >= min_spread)
+        if source:
+            stmt = stmt.where(_ArbModel.market_source == source)
+        stmt = stmt.limit(limit)
+
+        records = db.execute(stmt).scalars().all()
+
+        return {
+            "opportunities": [
+                {
+                    "id": r.id,
+                    "event_title": r.event_title,
+                    "market_source": r.market_source,
+                    "sportsbook_name": r.sportsbook_name,
+                    "sportsbook_odds": float(r.sportsbook_odds),
+                    "pm_implied_prob": round(float(r.pm_implied_prob) * 100, 2),
+                    "pm_implied_odds": float(r.pm_implied_odds),
+                    "arb_spread": round(float(r.arb_spread), 2),
+                    "market_url": r.market_url,
+                    "timestamp": r.timestamp.isoformat(),
+                    "game_id": r.game_id,
+                }
+                for r in records
+            ],
+            "total": len(records),
+            "min_spread": min_spread,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching arb opportunities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/arb-history")
+async def get_arb_history(
+    days: int = 7,
+    source: str = None,
+    min_spread: float = 1.0,
+):
+    """
+    Get historical arbitrage data for charting.
+
+    Returns opportunities grouped by day with average spread metrics.
+    """
+    db = get_db()
+    try:
+        from src.models.database import PredictionMarketArb as _ArbModel
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        stmt = (
+            select(_ArbModel)
+            .where(_ArbModel.timestamp >= cutoff)
+            .where(_ArbModel.arb_spread >= min_spread)
+            .order_by(_ArbModel.timestamp.asc())
+        )
+        if source:
+            stmt = stmt.where(_ArbModel.market_source == source)
+
+        records = db.execute(stmt).scalars().all()
+
+        # Group by day
+        by_day: dict = {}
+        for r in records:
+            day_key = r.timestamp.strftime("%Y-%m-%d")
+            if day_key not in by_day:
+                by_day[day_key] = {"spreads": [], "count": 0}
+            by_day[day_key]["spreads"].append(float(r.arb_spread))
+            by_day[day_key]["count"] += 1
+
+        history = [
+            {
+                "date": day,
+                "count": data["count"],
+                "avg_spread": round(sum(data["spreads"]) / len(data["spreads"]), 2),
+                "max_spread": round(max(data["spreads"]), 2),
+            }
+            for day, data in sorted(by_day.items())
+        ]
+
+        return {"history": history, "days": days, "total_records": len(records)}
+
+    except Exception as e:
+        logger.error(f"Error fetching arb history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/arb/refresh")
+async def refresh_arb_opportunities():
+    """
+    Manually trigger a fresh poll of Kalshi and Polymarket for arb opportunities.
+
+    Marks all existing active arb records as inactive, then runs fresh poll.
+    """
+    try:
+        _run_arb_poll()
+        return {"status": "ok", "message": "Arb opportunities refreshed successfully"}
+    except Exception as e:
+        logger.error(f"Error refreshing arb opportunities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _run_arb_poll():
+    """
+    Core arb polling logic — called by scheduler and manual refresh endpoint.
+
+    Fetches live markets from Kalshi and Polymarket, computes arb spreads
+    against current OddsSnapshot data, and stores results in PredictionMarketArb.
+    """
+    from src.collectors.kalshi_client import KalshiClient
+    from src.collectors.polymarket_client import PolymarketClient
+    from src.collectors.arb_calculator import find_arb_opportunities, build_sportsbook_odds_from_snapshots
+    from src.models.database import PredictionMarketArb as _ArbModel
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Mark all existing active arb records as stale
+        stale_stmt = select(_ArbModel).where(_ArbModel.is_active == True)  # noqa: E712
+        stale_records = db.execute(stale_stmt).scalars().all()
+        for rec in stale_records:
+            rec.is_active = False
+
+        # Get recent OddsSnapshots for upcoming games to use as sportsbook reference
+        cutoff_time = now - timedelta(hours=2)
+        snap_stmt = (
+            select(OddsSnapshot, Game, Bookmaker)
+            .join(Game, Game.id == OddsSnapshot.game_id)
+            .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
+            .where(Game.commence_time > now)
+            .where(OddsSnapshot.timestamp >= cutoff_time)
+        )
+        snap_results = db.execute(snap_stmt).all()
+
+        sportsbook_data = []
+        for snap, game, bookmaker in snap_results:
+            home_team_rec = db.execute(select(Team).where(Team.id == game.home_team_id)).scalar_one_or_none()
+            away_team_rec = db.execute(select(Team).where(Team.id == game.away_team_id)).scalar_one_or_none()
+            home_name = home_team_rec.name if home_team_rec else "Home"
+            away_name = away_team_rec.name if away_team_rec else "Away"
+
+            sportsbook_data.append({
+                "event_title": f"{away_name} vs {home_name}",
+                "sportsbook_name": bookmaker.name,
+                "outcomes": snap.outcomes,
+            })
+
+        sb_odds = build_sportsbook_odds_from_snapshots(sportsbook_data)
+
+        new_records = []
+
+        # Kalshi
+        try:
+            kalshi = KalshiClient()
+            kalshi_markets_raw = kalshi.get_sports_markets(limit=200)
+            kalshi_markets = [kalshi.parse_market_odds(m) for m in kalshi_markets_raw]
+            kalshi_markets = [m for m in kalshi_markets if m is not None]
+            kalshi_opps = find_arb_opportunities(sb_odds, kalshi_markets, source="kalshi", min_spread=0.5)
+            new_records.extend(kalshi_opps)
+        except Exception as e:
+            logger.warning(f"Kalshi poll failed: {e}")
+
+        # Polymarket
+        try:
+            poly = PolymarketClient()
+            poly_markets_raw = poly.get_sports_markets(max_pages=3)
+            poly_markets = [poly.parse_market_odds(m) for m in poly_markets_raw]
+            poly_markets = [m for m in poly_markets if m is not None]
+            poly_opps = find_arb_opportunities(sb_odds, poly_markets, source="polymarket", min_spread=0.5)
+            new_records.extend(poly_opps)
+        except Exception as e:
+            logger.warning(f"Polymarket poll failed: {e}")
+
+        # Persist new arb records
+        for opp in new_records:
+            rec = _ArbModel(
+                event_title=opp["event_title"][:300],
+                market_source=opp["market_source"],
+                sportsbook_name=opp["sportsbook_name"][:100],
+                sportsbook_odds=opp["sportsbook_odds"],
+                pm_implied_prob=opp["pm_implied_prob"],
+                pm_implied_odds=opp["pm_implied_odds"],
+                arb_spread=opp["arb_spread"],
+                market_url=opp.get("market_url", "")[:500] if opp.get("market_url") else None,
+                is_active=True,
+                timestamp=now,
+            )
+            db.add(rec)
+
+        db.commit()
+        logger.info(f"Arb poll complete: {len(new_records)} new opportunities saved")
+
+    except Exception as e:
+        logger.error(f"Arb poll error: {e}", exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ============================================================================
+# APScheduler — Background Polling
+# ============================================================================
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    _scheduler = BackgroundScheduler(daemon=True)
+
+    # Poll Kalshi + Polymarket every 5 minutes
+    _scheduler.add_job(_run_arb_poll, "interval", minutes=5, id="arb_poll", replace_existing=True)
+
+    _scheduler.start()
+    logger.info("APScheduler started: arb polling every 5 minutes")
+
+except ImportError:
+    logger.warning(
+        "APScheduler not installed — arb background polling disabled. "
+        "Install with: pip install apscheduler"
+    )
+except Exception as _sched_err:
+    logger.error(f"Scheduler startup error: {_sched_err}")
 
 
 if __name__ == "__main__":

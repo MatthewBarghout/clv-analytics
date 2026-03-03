@@ -25,6 +25,7 @@ interface BankrollDataPoint {
 
 interface BankrollSimulation {
   has_data: boolean;
+  source?: string;
   message?: string;
   data_points: BankrollDataPoint[];
   summary: {
@@ -68,6 +69,8 @@ export const BankrollSimulator: React.FC = () => {
   const [simBookmakerFilter, setSimBookmakerFilter] = useState<string | null>(null);
   const [simMarketFilter, setSimMarketFilter] = useState<string | null>(null);
   const [simClvThreshold, setSimClvThreshold] = useState<number | null>(null);
+  // Default to Best EV+ picks — aligned with the Best EV tab
+  const [simSource, setSimSource] = useState<'best_ev' | 'all'>('best_ev');
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -80,6 +83,7 @@ export const BankrollSimulator: React.FC = () => {
     bookmakerFilter: string | null;
     marketFilter: string | null;
     clvThreshold: number | null;
+    source: string;
   }) => {
     try {
       setLoadingSimulation(true);
@@ -89,6 +93,7 @@ export const BankrollSimulator: React.FC = () => {
         strategy: params.strategy,
         fraction_percent: params.fractionPercent.toString(),
         max_bet_percent: params.maxBetPercent.toString(),
+        source: params.source,
       });
       if (params.bookmakerFilter) urlParams.append('bookmaker_filter', params.bookmakerFilter);
       if (params.marketFilter) urlParams.append('market_filter', params.marketFilter);
@@ -119,15 +124,48 @@ export const BankrollSimulator: React.FC = () => {
         bookmakerFilter: simBookmakerFilter,
         marketFilter: simMarketFilter,
         clvThreshold: simClvThreshold,
+        source: simSource,
       });
     }, 500);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [simBetSize, simStartingBankroll, simStrategy, simFractionPercent, simMaxBetPercent, simBookmakerFilter, simMarketFilter, simClvThreshold, fetchBankrollSimulation]);
+  }, [simBetSize, simStartingBankroll, simStrategy, simFractionPercent, simMaxBetPercent, simBookmakerFilter, simMarketFilter, simClvThreshold, simSource, fetchBankrollSimulation]);
 
   return (
     <div className="space-y-6">
+      {/* Data Source Toggle */}
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-gray-400 font-medium">Data Source:</span>
+        <div className="flex bg-white/5 rounded-lg p-1 border border-white/10">
+          <button
+            onClick={() => setSimSource('best_ev')}
+            className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
+              simSource === 'best_ev'
+                ? 'bg-gradient-to-r from-green-500/30 to-emerald-500/30 text-white border border-green-500/50'
+                : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            Best EV+ Picks Only
+          </button>
+          <button
+            onClick={() => setSimSource('all')}
+            className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
+              simSource === 'all'
+                ? 'bg-white/20 text-white border border-white/30'
+                : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            All Tracked Bets
+          </button>
+        </div>
+        {simSource === 'best_ev' && (
+          <span className="text-xs text-green-400 bg-green-500/10 px-2 py-1 rounded border border-green-500/20">
+            Aligned with Best EV+ tab
+          </span>
+        )}
+      </div>
+
       {/* Controls */}
       <div className="bg-white/5 rounded-lg p-4 border border-white/10 space-y-4">
         <div className="flex flex-wrap gap-4 items-center">
@@ -382,12 +420,17 @@ export const BankrollSimulator: React.FC = () => {
 
           {/* Bet History Table */}
           <div className="bg-white/5 rounded-lg p-6 border border-white/10">
-            <h3 className="text-lg font-semibold text-white mb-4">Bet History (Verify Each Bet)</h3>
+            <h3 className="text-lg font-semibold text-white mb-1">Bet History</h3>
+            <p className="text-xs text-gray-500 mb-4">
+              {bankrollSimulation.source === 'best_ev'
+                ? 'Showing Best EV+ tracked picks only — same picks displayed in the Best EV+ tab'
+                : 'Showing all CLV-tracked opportunities'}
+            </p>
             <div className="overflow-x-auto max-h-[500px]">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-gray-900 z-10">
                   <tr className="border-b border-gray-700">
-                    {['Date', 'Game', 'Book', 'Bet', 'Entry', 'Close', 'CLV', 'Result', 'P&L', 'Running'].map((h) => (
+                    {['Date', 'Game', 'Book', 'Bet', 'Entry', 'EV/CLV', 'Result', 'P&L', 'Running'].map((h) => (
                       <th key={h} className={`py-2 px-2 text-gray-400 text-xs ${h === 'Date' || h === 'Game' || h === 'Book' || h === 'Bet' ? 'text-left' : h === 'P&L' || h === 'Running' ? 'text-right' : 'text-center'}`}>{h}</th>
                     ))}
                   </tr>
@@ -404,8 +447,9 @@ export const BankrollSimulator: React.FC = () => {
                         <span className="text-white ml-1 max-w-[100px] truncate inline-block align-bottom" title={bet.outcome}>{bet.outcome}</span>
                       </td>
                       <td className="text-center py-2 px-2 text-blue-400 text-xs font-mono">{bet.odds.toFixed(2)}</td>
-                      <td className="text-center py-2 px-2 text-gray-400 text-xs font-mono">{bet.closing_odds.toFixed(2)}</td>
-                      <td className="text-center py-2 px-2 text-green-400 text-xs font-medium">+{bet.clv}%</td>
+                      <td className="text-center py-2 px-2 text-green-400 text-xs font-medium">
+                        {bet.clv >= 0 ? '+' : ''}{bet.clv}%
+                      </td>
                       <td className="text-center py-2 px-2">
                         <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${bet.result === 'win' ? 'bg-green-500/20 text-green-400' : bet.result === 'loss' ? 'bg-red-500/20 text-red-400' : 'bg-gray-500/20 text-gray-400'}`}>
                           {bet.result === 'win' ? 'W' : bet.result === 'loss' ? 'L' : 'P'}
@@ -422,16 +466,23 @@ export const BankrollSimulator: React.FC = () => {
                 </tbody>
               </table>
             </div>
-            <p className="text-xs text-gray-500 mt-3">
-              Entry = odds when bet was placed | Close = closing odds before game | CLV = closing line value advantage
-            </p>
           </div>
         </>
       ) : (
         <div className="text-center py-12 text-gray-400">
           <div className="text-6xl mb-4">📊</div>
           <p className="text-lg mb-2">No simulation data available</p>
-          <p className="text-sm">Settled bets are needed to run the bankroll simulation</p>
+          {bankrollSimulation?.message ? (
+            <p className="text-sm max-w-md mx-auto">{bankrollSimulation.message}</p>
+          ) : simSource === 'best_ev' ? (
+            <p className="text-sm">
+              No settled Best EV+ picks found yet. Picks are saved daily and settled after games complete.
+              <br />
+              <span className="text-gray-500">Switch to "All Tracked Bets" to see historical CLV-based data.</span>
+            </p>
+          ) : (
+            <p className="text-sm">Settled bets are needed to run the bankroll simulation</p>
+          )}
         </div>
       )}
     </div>

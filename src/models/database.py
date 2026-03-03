@@ -1,12 +1,14 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import List
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     func,
 )
@@ -497,4 +499,106 @@ class UserBet(Base):
         return (
             f"<UserBet(id={self.id}, bet='{self.bet_description}', "
             f"odds={self.odds}, result={self.result})>"
+        )
+
+
+class PredictionMarketArb(Base):
+    """Tracks arbitrage opportunities between sportsbooks and prediction markets (Kalshi/Polymarket)."""
+
+    __tablename__ = "prediction_market_arb"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Optional link to a game if matched
+    game_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("games.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Market identification
+    event_title: Mapped[str] = mapped_column(String(300), nullable=False)
+    market_source: Mapped[str] = mapped_column(String(20), nullable=False)  # "kalshi" or "polymarket"
+    market_url: Mapped[str] = mapped_column(String(500), nullable=True)
+
+    # Sportsbook side
+    sportsbook_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    sportsbook_odds: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)  # decimal odds
+
+    # Prediction market side
+    pm_implied_prob: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)  # 0.0 to 1.0
+    pm_implied_odds: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)  # 1 / pm_implied_prob
+
+    # Arb metrics
+    arb_spread: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)  # percentage, positive = arb exists
+
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationship
+    game: Mapped["Game"] = relationship("Game")
+
+    __table_args__ = (
+        Index("ix_pm_arb_timestamp_active", "timestamp", "is_active"),
+        Index("ix_pm_arb_source_spread", "market_source", "arb_spread"),
+        Index("ix_pm_arb_game_id", "game_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PredictionMarketArb(id={self.id}, source='{self.market_source}', "
+            f"event='{self.event_title[:40]}', spread={self.arb_spread:.2f}%)>"
+        )
+
+
+class BestEVPick(Base):
+    """Tracks the daily best EV+ picks selected by the ML model for performance measurement."""
+
+    __tablename__ = "best_ev_picks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to game
+    game_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("games.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # Pick metadata
+    report_date: Mapped[date] = mapped_column(Date, nullable=False)
+    bookmaker: Mapped[str] = mapped_column(String(50), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(20), nullable=False)  # h2h, spreads, totals
+    outcome_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Odds and ML scores at time of pick
+    entry_odds: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)  # decimal odds
+    ev_score: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
+    confidence: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    predicted_delta: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)
+
+    # Settlement (filled after game completes)
+    result: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="pending"
+    )  # win, loss, push, pending
+    profit_loss: Mapped[float] = mapped_column(Numeric(10, 2), nullable=True)
+    settled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Metadata
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationship
+    game: Mapped["Game"] = relationship("Game")
+
+    __table_args__ = (
+        Index("ix_best_ev_picks_report_date", "report_date"),
+        Index("ix_best_ev_picks_result_date", "result", "report_date"),
+        Index("ix_best_ev_picks_game_id", "game_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BestEVPick(id={self.id}, game_id={self.game_id}, "
+            f"date={self.report_date}, ev_score={self.ev_score:.2f}, result={self.result})>"
         )

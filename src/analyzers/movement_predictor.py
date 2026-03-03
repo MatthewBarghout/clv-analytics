@@ -171,10 +171,11 @@ class LineMovementPredictor:
                 "Movement statistics not found. Using conservative default caps. "
                 "Run scripts/analyze_movement_patterns.py to generate statistics."
             )
+            # Tightened caps: reduce over-zealous predictions
             return {
-                'h2h': 0.10,
-                'spreads': 0.05,
-                'totals': 0.05,
+                'h2h': 0.08,
+                'spreads': 0.04,
+                'totals': 0.04,
             }
 
         try:
@@ -182,9 +183,13 @@ class LineMovementPredictor:
                 all_stats = json.load(f)
 
             # Extract 95th percentile caps
+            # Apply tighter caps: use p95 from data but enforce hard maximums
+            hard_caps = {'h2h': 0.08, 'spreads': 0.04, 'totals': 0.04}
             caps = {}
             for market_type, stats in all_stats.items():
-                caps[market_type] = stats['p95']
+                data_cap = stats['p95']
+                max_cap = hard_caps.get(market_type, 0.08)
+                caps[market_type] = min(data_cap, max_cap)
 
             logger.info(f"Loaded movement caps: {caps}")
             return caps

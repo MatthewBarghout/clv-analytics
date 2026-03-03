@@ -81,7 +81,7 @@ dmypy.json
 migrations/versions/*.pyc
 
 # ML Models (regenerate with scripts/train_model.py)
-models/
+/models/
 
 # Frontend build
 frontend/dist/

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.analyzers.features import FeatureEngineer
 from src.analyzers.movement_predictor import LineMovementPredictor
-from src.models.database import Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Team
+from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Team
 
 # Load environment variables
 load_dotenv()
@@ -402,11 +402,13 @@ async def get_game_predictions(game_id: int):
 @router.get("/best-opportunities", response_model=List[EVOpportunity])
 async def get_best_opportunities(
     limit: int = 50,
-    min_confidence: float = 0.5,
+    min_confidence: float = 0.62,
+    min_ev_score: float = 2.0,
     bookmaker_filter: str = None,
     market_filter: str = None,
-    min_hours_to_game: float = None,
+    min_hours_to_game: float = 1.0,
     max_hours_to_game: float = None,
+    today_only: bool = True,
 ):
     """
     Get best +EV betting opportunities based on predicted line movement.
@@ -416,11 +418,13 @@ async def get_best_opportunities(
 
     Args:
         limit: Maximum number of opportunities to return
-        min_confidence: Minimum ML confidence threshold
+        min_confidence: Minimum ML confidence threshold (default 0.62)
+        min_ev_score: Minimum EV score to include (default 2.0)
         bookmaker_filter: Only include opportunities from this bookmaker
         market_filter: Only include opportunities from this market (h2h, spreads, totals)
-        min_hours_to_game: Minimum hours until game starts
+        min_hours_to_game: Minimum hours until game starts (default 1.0)
         max_hours_to_game: Maximum hours until game starts
+        today_only: If True, only return games commencing today (default True)
     """
     db = get_db()
 
@@ -437,6 +441,12 @@ async def get_best_opportunities(
             .where(Game.commence_time > now)
             .order_by(Game.commence_time)
         )
+
+        # Filter to today's games only when requested
+        if today_only:
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            stmt = stmt.where(Game.commence_time >= today_start).where(Game.commence_time < today_end)
 
         # Apply market filter
         if market_filter:
@@ -543,19 +553,24 @@ async def get_best_opportunities(
                 direction = movement_pred["predicted_direction"][0]
                 was_constrained = bool(movement_pred["was_constrained"][0])
 
-                # Only include high-confidence predictions of unfavorable movement
+                # Strict thresholds: skip low-confidence and marginal signals
+                MIN_MOVEMENT = 0.025  # Require meaningful line movement (was 0.01)
                 if confidence < min_confidence:
                     continue
 
                 # Calculate EV score (higher = better opportunity)
                 # Unfavorable movement (odds getting worse) = good betting opportunity NOW
-                if direction == "DOWN" and predicted_delta < -0.01:
+                if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
                     # Price dropping (getting worse for bettor) - bet now!
                     ev_score = abs(predicted_delta) * confidence * 100
-                elif direction == "UP" and predicted_delta > 0.01:
+                elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
                     # Price rising (getting worse for bettor on the other side)
                     ev_score = abs(predicted_delta) * confidence * 100
                 else:
+                    continue
+
+                # Apply minimum EV score filter
+                if ev_score < min_ev_score:
                     continue
 
                 # Calculate edge estimate
@@ -1045,3 +1060,322 @@ async def get_upcoming_opportunities(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+# ============================================================================
+# Best EV Pick Tracking Endpoints
+# ============================================================================
+
+
+@router.get("/best-ev-history")
+async def get_best_ev_history(days: int = 30):
+    """
+    Get historical Best EV picks with settled results.
+
+    Returns picks from the BestEVPick table for the past N days,
+    grouped by date with summary stats.
+    """
+    db = get_db()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        stmt = (
+            select(BestEVPick, Game)
+            .join(Game, Game.id == BestEVPick.game_id)
+            .where(BestEVPick.created_at >= cutoff)
+            .order_by(BestEVPick.report_date.desc(), BestEVPick.ev_score.desc())
+        )
+
+        results = db.execute(stmt).all()
+
+        if not results:
+            return {"picks": [], "summary": {"total_picks": 0}, "days": days}
+
+        # Pre-fetch teams
+        team_ids = list({tid for _, game in results for tid in (game.home_team_id, game.away_team_id)})
+        teams_map = {
+            t.id: t
+            for t in db.execute(select(Team).where(Team.id.in_(team_ids))).scalars().all()
+        }
+
+        picks = []
+        total_profit = 0.0
+        wins = losses = pushes = pending = 0
+
+        for pick, game in results:
+            home = teams_map.get(game.home_team_id)
+            away = teams_map.get(game.away_team_id)
+            if pick.result == "win":
+                wins += 1
+                total_profit += float(pick.profit_loss or 0)
+            elif pick.result == "loss":
+                losses += 1
+                total_profit += float(pick.profit_loss or 0)
+            elif pick.result == "push":
+                pushes += 1
+            else:
+                pending += 1
+
+            picks.append({
+                "id": pick.id,
+                "report_date": pick.report_date.isoformat(),
+                "game": f"{away.name if away else 'Unknown'} @ {home.name if home else 'Unknown'}",
+                "commence_time": game.commence_time.isoformat(),
+                "bookmaker": pick.bookmaker,
+                "market_type": pick.market_type,
+                "outcome_name": pick.outcome_name,
+                "entry_odds": float(pick.entry_odds),
+                "ev_score": float(pick.ev_score),
+                "confidence": float(pick.confidence),
+                "result": pick.result,
+                "profit_loss": float(pick.profit_loss) if pick.profit_loss is not None else None,
+                "settled_at": pick.settled_at.isoformat() if pick.settled_at else None,
+            })
+
+        settled = wins + losses + pushes
+        return {
+            "picks": picks,
+            "summary": {
+                "total_picks": len(picks),
+                "pending": pending,
+                "settled": settled,
+                "wins": wins,
+                "losses": losses,
+                "pushes": pushes,
+                "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0,
+                "total_profit": round(total_profit, 2),
+            },
+            "days": days,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting best EV history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.post("/save-daily-picks")
+async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
+    """
+    Save today's best EV picks to the BestEVPick tracking table.
+
+    Called daily (or manually) to snapshot today's top recommendations.
+    Skips picks already saved for today.
+    """
+
+    def _save_picks():
+        db = SessionLocal()
+        try:
+            model = get_model()
+            engineer = FeatureEngineer()
+            now = datetime.now(timezone.utc)
+            today = now.date()
+
+            # Check if picks already saved for today
+            existing = db.execute(
+                select(BestEVPick).where(BestEVPick.report_date == today)
+            ).scalars().first()
+            if existing:
+                logger.info(f"Best EV picks already saved for {today}, skipping")
+                return
+
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+
+            stmt = (
+                select(OddsSnapshot, Game)
+                .join(Game, Game.id == OddsSnapshot.game_id)
+                .where(Game.commence_time >= today_start)
+                .where(Game.commence_time < today_end)
+                .where(Game.commence_time > now)
+            )
+            results = db.execute(stmt).all()
+            if not results:
+                logger.info("No upcoming games today for Best EV picks")
+                return
+
+            bk_ids = list({snap.bookmaker_id for snap, _ in results})
+            bk_map = {
+                b.id: b
+                for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(bk_ids))).scalars().all()
+            }
+
+            candidates = []
+            for snapshot, game in results:
+                hours_to_game = (game.commence_time - now).total_seconds() / 3600
+                if hours_to_game < 1.0:
+                    continue
+                bookmaker = bk_map.get(snapshot.bookmaker_id)
+                day_of_week = game.commence_time.weekday()
+                is_weekend = day_of_week >= 5
+
+                for outcome in snapshot.outcomes:
+                    outcome_name = outcome.get("name")
+                    opening_price = outcome.get("price")
+                    opening_point = outcome.get("point", 0.0)
+                    if not outcome_name or opening_price is None:
+                        continue
+
+                    consensus_line = engineer.calculate_consensus_line(
+                        db, game.id, snapshot.market_type, outcome_name
+                    )
+                    line_spread = engineer.calculate_line_spread(
+                        db, game.id, snapshot.market_type, outcome_name
+                    )
+
+                    features = pd.DataFrame([{
+                        "bookmaker_id": snapshot.bookmaker_id,
+                        "market_type": snapshot.market_type,
+                        "hours_to_game": hours_to_game,
+                        "day_of_week": day_of_week,
+                        "is_weekend": is_weekend,
+                        "outcome_name": outcome_name,
+                        "opening_price": float(opening_price),
+                        "opening_point": float(opening_point) if opening_point is not None else 0.0,
+                        "consensus_line": consensus_line if consensus_line is not None else float(opening_price),
+                        "line_spread": line_spread if line_spread is not None else 0.0,
+                        "distance_from_consensus": float(opening_price) - consensus_line if consensus_line else 0.0,
+                        "is_outlier": abs(float(opening_price) - consensus_line) > 0.05 if consensus_line else False,
+                        "time_since_last_update": 0.0,
+                        "movement_velocity": 0.0,
+                        "updates_count": 1,
+                        "price_volatility_24h": 0.0,
+                        "cumulative_movement": 0.0,
+                        "movement_direction_changes": 0,
+                        "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
+                        "relative_to_pinnacle": 0.0,
+                        "books_moved_count": 0,
+                        "steam_move_signal": 0.0,
+                    }])
+
+                    try:
+                        pred = model.predict_movement(features)
+                        predicted_delta = float(pred["predicted_delta"][0])
+                        confidence = float(pred["confidence"][0])
+                        direction = pred["predicted_direction"][0]
+
+                        if confidence < 0.62:
+                            continue
+
+                        MIN_MOVEMENT = 0.025
+                        if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
+                            ev_score = abs(predicted_delta) * confidence * 100
+                        elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
+                            ev_score = abs(predicted_delta) * confidence * 100
+                        else:
+                            continue
+
+                        if ev_score < 2.0:
+                            continue
+
+                        candidates.append({
+                            "game_id": game.id,
+                            "bookmaker": bookmaker.name if bookmaker else "Unknown",
+                            "market_type": snapshot.market_type,
+                            "outcome_name": outcome_name,
+                            "entry_odds": float(opening_price),
+                            "ev_score": ev_score,
+                            "confidence": confidence,
+                            "predicted_delta": predicted_delta,
+                        })
+                    except Exception:
+                        continue
+
+            # Save top picks (up to 20)
+            candidates.sort(key=lambda x: x["ev_score"], reverse=True)
+            saved = 0
+            for c in candidates[:20]:
+                pick = BestEVPick(
+                    game_id=c["game_id"],
+                    report_date=today,
+                    bookmaker=c["bookmaker"],
+                    market_type=c["market_type"],
+                    outcome_name=c["outcome_name"],
+                    entry_odds=c["entry_odds"],
+                    ev_score=c["ev_score"],
+                    confidence=c["confidence"],
+                    predicted_delta=c["predicted_delta"],
+                    result="pending",
+                )
+                db.add(pick)
+                saved += 1
+
+            db.commit()
+            logger.info(f"Saved {saved} Best EV picks for {today}")
+
+        except Exception as e:
+            logger.error(f"Error saving daily picks: {e}", exc_info=True)
+            db.rollback()
+        finally:
+            db.close()
+
+    background_tasks.add_task(_save_picks)
+    return {"status": "scheduled", "message": "Daily Best EV picks are being saved in the background"}
+
+
+@router.post("/settle-picks")
+async def settle_best_ev_picks(background_tasks: BackgroundTasks):
+    """
+    Settle pending BestEVPick records against known BettingOutcome results.
+
+    Matches pending picks to completed game outcomes and records win/loss/push.
+    """
+
+    def _settle():
+        db = SessionLocal()
+        try:
+            # Get all pending picks for completed games
+            stmt = (
+                select(BestEVPick, Game, BettingOutcome)
+                .join(Game, Game.id == BestEVPick.game_id)
+                .outerjoin(BettingOutcome, BettingOutcome.game_id == BestEVPick.game_id)
+                .where(BestEVPick.result == "pending")
+                .where(BettingOutcome.completed == True)  # noqa: E712
+            )
+            results = db.execute(stmt).all()
+            settled_count = 0
+            now = datetime.now(timezone.utc)
+
+            for pick, game, outcome in results:
+                if outcome is None:
+                    continue
+
+                result = "pending"
+                profit_loss = None
+
+                if pick.market_type == "h2h":
+                    # Moneyline: compare outcome_name to winner
+                    home_team = db.execute(select(Team).where(Team.id == game.home_team_id)).scalar_one_or_none()
+                    away_team = db.execute(select(Team).where(Team.id == game.away_team_id)).scalar_one_or_none()
+
+                    picked_home = home_team and pick.outcome_name.lower() in home_team.name.lower()
+                    if (picked_home and outcome.winner == "home") or (not picked_home and outcome.winner == "away"):
+                        result = "win"
+                        profit_loss = round(100.0 * (float(pick.entry_odds) - 1), 2)
+                    elif outcome.winner == "push":
+                        result = "push"
+                        profit_loss = 0.0
+                    else:
+                        result = "loss"
+                        profit_loss = -100.0
+
+                # For spreads and totals, settlement is complex — mark as pending for now
+                # A full settlement engine would need the actual point line from the pick
+                if result != "pending":
+                    pick.result = result
+                    pick.profit_loss = profit_loss
+                    pick.settled_at = now
+                    settled_count += 1
+
+            db.commit()
+            logger.info(f"Settled {settled_count} Best EV picks")
+
+        except Exception as e:
+            logger.error(f"Error settling picks: {e}", exc_info=True)
+            db.rollback()
+        finally:
+            db.close()
+
+    background_tasks.add_task(_settle)
+    return {"status": "scheduled", "message": "Pick settlement running in background"}

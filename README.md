@@ -1,6 +1,6 @@
 # CLV Analytics Platform
 
-A quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, applies an ensemble ML model to predict line movement, and surfaces +EV opportunities with systematic bankroll management — the same feedback loop used by professional sharp bettors.
+A quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, applies an ensemble ML model to predict line movement, surfaces +EV opportunities with systematic bankroll management, and monitors live arbitrage between traditional sportsbooks and prediction markets (Kalshi, Polymarket).
 
 ---
 
@@ -22,19 +22,22 @@ Replicate this across hundreds of bets with disciplined sizing, and the edge com
 ```
 Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ──►  React Dashboard
                                     │
-                             ML Pipeline
-                          (XGBoost + RF Ensemble)
-                                    │
-                             Opportunity Engine
-                          (CLV + EV Calculation)
+                          ┌─────────┴─────────┐
+                     ML Pipeline          Arb Engine
+                  (XGBoost + RF)     (Kalshi + Polymarket)
+                          │
+                   Opportunity Engine
+                 (CLV + EV + Tracking)
 ```
 
 **Data Flow:**
-1. Scheduled collectors poll opening and closing lines from 4 major sportsbooks
-2. Lines stored in PostgreSQL time-series schema with composite indexes
-3. ML ensemble predicts line movement direction and magnitude
-4. CLV engine computes realized edge vs closing odds
-5. Dashboard surfaces opportunities, performance analytics, and bankroll projections
+1. Scheduled collectors poll opening and closing lines from multiple sportsbooks
+2. Background scheduler polls Kalshi and Polymarket every 5 minutes for prediction market prices
+3. Lines stored in PostgreSQL with composite indexes for time-series queries
+4. ML ensemble predicts line movement direction and magnitude
+5. CLV engine computes realized edge vs closing odds
+6. Arb calculator identifies spread between sportsbook and prediction market implied odds
+7. Dashboard surfaces opportunities, performance analytics, bankroll projections, and live arb feeds
 
 ---
 
@@ -47,7 +50,8 @@ Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ─�
 | ORM | SQLAlchemy 2.0 with eager-loaded joins (no N+1 queries) |
 | Database | PostgreSQL with composite indexes on hot query paths |
 | Migrations | Alembic |
-| ML | XGBoost + scikit-learn ensemble with walk-forward validation |
+| ML | XGBoost + scikit-learn ensemble, isotonic calibration, walk-forward validation |
+| Scheduling | APScheduler (background polling) + macOS launchd (collection windows) |
 
 **Frontend**
 | Component | Technology |
@@ -62,7 +66,6 @@ Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ─�
 | Component | Technology |
 |---|---|
 | Local DB | Docker Compose |
-| Scheduling | macOS launchd (10 AM / 6 PM ET collection windows) |
 | Dependencies | Poetry |
 
 ---
@@ -78,7 +81,7 @@ alembic upgrade head
 
 # 3. Configure environment
 cp .env.example .env
-# Set ODDS_API_KEY in .env
+# Set ODDS_API_KEY, KALSHI_API_KEY (optional) in .env
 
 # 4. Install Python dependencies
 poetry install
@@ -99,31 +102,83 @@ poetry run python -m scripts.train_movement_model
 
 ### Machine Learning — Line Movement Prediction
 
-Ensemble model combining XGBoost and Random Forest to forecast line movement direction and magnitude before games start.
+Ensemble model combining XGBoost and Random Forest to forecast line movement direction and magnitude before games start. Tightened thresholds reduce over-signaling; only high-confidence, high-EV opportunities surface.
 
-**Current Performance:**
-| Metric | Value |
+**Prediction Thresholds (revised):**
+| Parameter | Value |
 |---|---|
-| Direction Accuracy | 65.1% |
-| Baseline | 40.7% |
-| Improvement | +22.9% |
-| MAE (price movement) | 0.0496 |
-| R² Score | 0.58 |
+| Minimum confidence | 62% |
+| Minimum EV score | 2.0 |
+| Minimum predicted movement | ±2.5% (was ±1%) |
+| Minimum time to game | 1 hour |
+| Prediction cap (h2h) | ±8% (was ±10%) |
+| Prediction cap (spreads/totals) | ±4% (was ±5%) |
 
 **Top Predictive Features:**
-1. Consensus line — 13.9%
-2. Opening price — 12.1%
-3. Line spread — 8.4%
-4. Distance from consensus — 6.2%
-5. Hours to game — 4.7%
+1. Consensus line
+2. Opening price
+3. Line spread
+4. Distance from consensus
+5. Hours to game
 
 **Model Details:**
 - Temporal features: movement velocity, price volatility, cumulative drift, direction change counts
 - Bookmaker features: sharp book detection (Pinnacle weighting), steam move signals, relative positioning
-- Market-specific thresholds: h2h=0.02, spreads=0.01, totals=0.01
-- Per-market ensemble weights optimized via grid search
+- Per-market ensemble weights optimized via grid search on validation set
 - Walk-forward (expanding window) cross-validation for time-series integrity
-- Auto-retraining triggered when live accuracy degrades >10%
+
+### Best EV+ Opportunities
+
+Today-only filtered view of the highest-confidence, highest-EV picks from the current day's upcoming slate.
+
+- Filtered to today's games only (`today_only=true`)
+- Minimum confidence 62%, minimum EV score 2.0, at least 1 hour to game
+- Quarter-Kelly stake sizing recommendation per pick
+- "Save for Tracking" button snapshots today's picks to the `BestEVPick` table
+- Picks are settled automatically after games complete
+
+### Prediction Market Arbitrage — Markets Tab
+
+Live monitoring of spread between traditional sportsbook odds and prediction market (Kalshi, Polymarket) implied probabilities.
+
+- Polls Kalshi and Polymarket every 5 minutes via APScheduler
+- Auto-refreshes in the dashboard every 60 seconds
+- Color-coded by spread: green ≥2%, yellow 1–2%, gray <1%
+- Summary bar: total opportunities, strong arb count, best spread
+- 7-day historical trend chart of average and max spreads
+- Manual "Refresh Now" triggers a fresh backend poll
+
+**Arb logic:**
+```
+arb_spread = (PM implied probability − SB implied probability) × 100
+Positive spread = PM assigns higher probability than sportsbook → value on SB side
+```
+
+**Environment variable:**
+```
+KALSHI_API_KEY=<your-key>    # Required for Kalshi auth. Polymarket is public.
+```
+
+### Bankroll Simulation — Aligned with Best EV+
+
+Multi-strategy simulator with a critical alignment fix: the simulation defaults to **Best EV+ picks only**, ensuring the bankroll curve reflects the same bets displayed in the Best EV+ tab.
+
+**Data Source Toggle:**
+| Source | Description |
+|---|---|
+| Best EV+ Picks Only | Only picks saved via the daily Best EV+ snapshot (default) |
+| All Tracked Bets | Historical CLV-tracked opportunities from all reports |
+
+**Sizing Strategies:**
+| Strategy | Description |
+|---|---|
+| Fixed Unit | Flat dollar amount per bet |
+| Fractional | Fixed % of current bankroll |
+| Kelly Criterion | f* = (bp − q) / b — mathematically optimal |
+| Half Kelly | 50% Kelly for reduced variance |
+| Confidence-Weighted | Scale by ML model confidence score |
+
+**Risk Metrics:** Sharpe Ratio, Sortino Ratio, max drawdown, P&L curve, per-bookmaker and per-market breakdown.
 
 ### CLV Calculation Engine
 
@@ -137,45 +192,15 @@ clv = calc.calculate_clv(entry_odds=2.1, closing_odds=1.95)
 # Returns: +3.66%
 ```
 
-### Bankroll Simulation
-
-Multi-strategy simulator projects long-term performance using historical settled bets and ML-predicted opportunities.
-
-**Sizing Strategies:**
-| Strategy | Description |
-|---|---|
-| Fixed Unit | Flat dollar amount per bet |
-| Fractional | Fixed % of current bankroll |
-| Kelly Criterion | f* = (bp − q) / b — mathematically optimal |
-| Half Kelly | 50% Kelly for reduced variance |
-| Confidence-Weighted | Scale by ML model confidence score |
-
-**Risk Metrics:** Sharpe Ratio, Sortino Ratio, max drawdown, P&L curve, monthly breakdown
-
-**Filters:** Bookmaker, market type, minimum CLV threshold, date range
-
-Inputs are debounced (500ms) so the simulation fires once per input burst, not on every keystroke.
-
-### Opportunities Explorer
-
-Filterable table of all ML-detected +EV opportunities with full lifecycle tracking.
-
-- Filter by status, CLV%, bookmaker, market, date range
-- Sort by CLV, confidence, EV score, or date
-- Pagination for large datasets
-- Export to CSV
-- Track pending vs settled with outcome recording
-
 ### Daily Performance Reports
 
 Automated reports generated at 9 AM showing previous day's complete performance.
 
 **Report Contents:**
 - CLV analysis for all completed games
-- Top 10 opportunities by CLV percentage
+- Top opportunities by CLV percentage
 - Win/loss/push breakdown with profit calculations
 - ROI by bookmaker and market type
-- ML-predicted +EV opportunities for upcoming slate
 
 ### My Bets Tracker
 
@@ -184,19 +209,17 @@ Manual bet tracking interface with personal P&L dashboard.
 - Add bets with game, bookmaker, market type, odds, and stake
 - One-click settle as win / loss / push
 - Summary cards: record, win rate, total profit, ROI
-- Sortable bet history table
 
 ### Automated Data Collection
 
 ```
 2:00 AM   — Fetch final game scores
 3:00 AM   — Calculate ROI on tracked bets
-9:00 AM   — Generate daily CLV report
+9:00 AM   — Generate daily CLV report; save Best EV+ picks
 9:30 AM   — Track new opportunities from report
 10:30 AM  — Schedule closing line collection batches
+Every 5m  — Poll Kalshi + Polymarket for arb opportunities (APScheduler)
 ```
-
-Dynamic launchd scheduler creates collection batches 30 minutes before each game to capture closing lines with minimal latency. Handles rate limiting, retries, and stores three market types (moneyline, spreads, totals) across four books (Pinnacle, FanDuel, DraftKings, theScore Bet).
 
 ---
 
@@ -210,7 +233,8 @@ Dynamic launchd scheduler creates collection batches 30 minutes before each game
 | `GET` | `/api/games` | Game list with odds snapshots |
 | `GET` | `/api/bookmakers` | Bookmaker stats (cached 10 min) |
 | `GET` | `/api/clv-history` | CLV trend over time (cached 5 min) |
-| `GET` | `/api/reports` | Daily CLV reports |
+| `GET` | `/api/daily-reports` | Daily CLV reports |
+| `GET` | `/api/bankroll-simulation` | P&L simulation (`source=best_ev\|all`) |
 | `GET` | `/api/user-bets` | Personal bet tracking |
 
 ### ML Endpoints
@@ -218,18 +242,26 @@ Dynamic launchd scheduler creates collection batches 30 minutes before each game
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/ml/stats` | Model performance metrics |
-| `GET` | `/api/ml/predictions/{game_id}` | Predicted vs actual lines |
+| `GET` | `/api/ml/best-opportunities` | Today's top +EV picks (`today_only`, `min_ev_score`, `min_confidence`) |
+| `GET` | `/api/ml/best-ev-history` | Historical Best EV picks with settled results |
+| `POST` | `/api/ml/save-daily-picks` | Snapshot today's picks to tracking table |
+| `POST` | `/api/ml/settle-picks` | Settle pending picks against outcomes |
+| `GET` | `/api/ml/predictions/{game_id}` | Predicted vs actual line movement |
 | `POST` | `/api/ml/retrain` | Retrain with latest data |
-| `GET` | `/api/ml/feature-importance` | Feature rankings |
+| `GET` | `/api/ml/feature-importance` | Feature importance rankings |
 | `GET` | `/api/ml/opportunities` | All filterable ML opportunities |
-| `GET` | `/api/ml/upcoming-opportunities` | Games starting in next N hours |
-| `GET` | `/api/ml/best-opportunities` | Top +EV picks for bankroll sim |
+
+### Prediction Market Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/arb-opportunities` | Active arb opportunities (sorted by spread) |
+| `GET` | `/api/arb-history` | Historical arb data with date range filter |
+| `POST` | `/api/arb/refresh` | Manually trigger a fresh poll |
 
 ---
 
 ## Database Schema
-
-Designed for high-throughput analytical queries:
 
 ```
 Game ──── Team (home + away)
@@ -238,16 +270,22 @@ Game ──── Team (home + away)
  ├── ClosingLine (final line per bookmaker)
  └── BettingOutcome (win/loss/push result)
 
-DailyCLVReport ──── OpportunityPerformance (tracked bets per report)
+DailyCLVReport ──── OpportunityPerformance (CLV-tracked bets)
+
+BestEVPick (ML-selected daily picks with lifecycle tracking)
+
+PredictionMarketArb (Kalshi/Polymarket vs sportsbook spreads)
 
 UserBet (personal tracking, independent of ML pipeline)
 ```
 
 **Indexes (composite, on hot paths):**
-- `Game(completed, commence_time)` — active game filters
-- `OpportunityPerformance(report_id, game_id, result)` — report expansion queries
-- `OpportunityPerformance(settled_at, result)` — settlement lookups
-- `UserBet(result, game_date)` — personal bet summary queries
+- `Game(completed, commence_time)`
+- `OpportunityPerformance(report_id, game_id, result)`
+- `OpportunityPerformance(settled_at, result)`
+- `BestEVPick(report_date)`, `BestEVPick(result, report_date)`
+- `PredictionMarketArb(timestamp, is_active)`, `PredictionMarketArb(market_source, arb_spread)`
+- `UserBet(result, game_date)`
 
 ---
 
@@ -256,17 +294,20 @@ UserBet (personal tracking, independent of ML pipeline)
 ```
 src/
 ├── api/
-│   ├── main.py               # Core FastAPI app — CLV, games, reports, user bets
-│   └── ml_endpoints.py       # ML router — predictions, opportunities, retraining
+│   ├── main.py               # Core FastAPI app — CLV, games, reports, arb endpoints
+│   └── ml_endpoints.py       # ML router — predictions, opportunities, Best EV tracking
 ├── analyzers/
 │   ├── clv_calculator.py     # CLV calculation logic
 │   ├── features.py           # ML feature engineering (temporal + bookmaker)
-│   ├── movement_predictor.py # Ensemble line movement model (per-market weights)
+│   ├── movement_predictor.py # Ensemble model with tightened prediction caps
 │   ├── bet_settlement.py     # Bet outcome tracking
 │   └── bet_sizing.py         # Kelly, fractional, confidence-weighted sizing
 ├── collectors/
 │   ├── odds_api_client.py    # The Odds API client
 │   ├── odds_proccessor.py    # Processing & storage pipeline
+│   ├── kalshi_client.py      # Kalshi prediction market REST API client
+│   ├── polymarket_client.py  # Polymarket CLOB API client (public)
+│   ├── arb_calculator.py     # Arb spread calculation and opportunity detection
 │   └── nba_scores_client.py  # NBA.com scores fetcher
 ├── models/
 │   └── database.py           # SQLAlchemy models + composite indexes
@@ -275,24 +316,26 @@ src/
 frontend/src/
 ├── Dashboard.tsx             # Orchestrator — state, fetching, tab routing
 └── components/
-    ├── MLStats.tsx           # ML model performance + feature importance chart
-    ├── CLVOverview.tsx       # Market breakdown + CLV trend over time
-    ├── BookmakerPerformance.tsx  # Bookmaker comparison table
-    ├── DailyReports.tsx      # Daily reports with opportunity expansion (cached)
-    ├── BankrollSimulator.tsx # Full simulation UI with debounced fetching
-    ├── MyBets.tsx            # Personal bet tracking dashboard
-    ├── OpportunitiesExplorer.tsx # Filterable opportunities table
-    ├── GameDetailsModal.tsx  # Game odds snapshot detail view
-    ├── GameAnalysis.tsx      # Per-game CLV analysis
-    ├── GlassCard.tsx         # Reusable card component
-    ├── TimeRangeSelector.tsx # Date range filter control
-    └── AnimatedCounter.tsx   # Animated metric display
+    ├── MLStats.tsx                # ML model performance + feature importance chart
+    ├── CLVOverview.tsx            # Market breakdown + CLV trend over time
+    ├── BookmakerPerformance.tsx   # Bookmaker comparison table
+    ├── DailyReports.tsx           # Daily reports with opportunity expansion
+    ├── BankrollSimulator.tsx      # Simulation UI with source toggle + debounce
+    ├── BestEVOpportunities.tsx    # Today's best picks with Kelly sizing
+    ├── ArbOpportunities.tsx       # Live Kalshi/Polymarket arb tab
+    ├── MyBets.tsx                 # Personal bet tracking dashboard
+    ├── OpportunitiesExplorer.tsx  # Filterable opportunities table
+    ├── GameDetailsModal.tsx       # Game odds snapshot detail view
+    ├── GameAnalysis.tsx           # Per-game CLV analysis
+    ├── GlassCard.tsx              # Reusable card component
+    ├── TimeRangeSelector.tsx      # Date range filter control
+    └── AnimatedCounter.tsx        # Animated metric display
 
 scripts/
 ├── collect_odds.py                  # Opening + closing line collection
 ├── schedule_game_batches.py         # Dynamic launchd batch scheduler
 ├── analyze_daily_clv.py             # Daily report generation
-├── fetch_game_scores.py             # NBA score ingestion
+├── fetch_game_scores.py             # Score ingestion
 ├── track_opportunity_performance.py # Bet lifecycle tracking
 ├── update_report_profit_stats.py    # ROI calculations
 ├── train_movement_model.py          # Walk-forward model training
@@ -308,41 +351,28 @@ launchd/                    # macOS scheduling plists
 ## Performance Optimizations
 
 ### Backend
-- **N+1 elimination** — All ORM loops use pre-fetched bulk dictionaries (`SELECT ... WHERE id IN (...)`) instead of per-row queries; endpoints that previously ran 100–1000+ queries now run 2–5
-- **In-memory TTL cache** — Stats, bookmaker data, and CLV history cached in-process with configurable TTL (5–10 min); repeat calls return in <1ms
-- **Composite indexes** — Added on all major filter + sort columns used in analytical queries
-- **Efficient aggregation** — `statistics.median()` replaces sorted array indexing; single-pass accumulators replace multi-pass generator chains; `SELECT COUNT(*)` replaces `len(execute().all())`
+- **N+1 elimination** — All ORM loops use pre-fetched bulk dictionaries instead of per-row queries
+- **In-memory TTL cache** — Stats, bookmaker data, and CLV history cached in-process (5–10 min TTL)
+- **Composite indexes** — Added on all major filter + sort columns in analytical queries
+- **Efficient aggregation** — `statistics.median()`, single-pass accumulators, `SELECT COUNT(*)`
 
 ### Frontend
-- **Component splitting** — Dashboard refactored from a 2,168-line monolith into 6 self-contained components; React only re-renders the affected component on state changes
-- **Memoization** — `React.memo` on all display components; `useMemo` on all sort/map/chart-data computations; `useCallback` on all event handlers
-- **Debounced simulation** — Bankroll sim API call fires 500ms after the last input change, not on every keystroke
-- **Opportunity cache** — Expanded report rows cache fetched opportunities in a `Map` ref; re-expanding never triggers a duplicate network request
+- **Component splitting** — Dashboard split into 8 self-contained components
+- **Memoization** — `React.memo` on all display components; `useMemo` on sort/chart computations
+- **Debounced simulation** — Bankroll sim fires 500ms after last input change
+- **Opportunity cache** — Expanded report rows cache in `Map` ref — no duplicate requests
 
 ---
 
-## Roadmap
+## Changelog
 
-- [x] Automated odds collection (opening + closing lines)
-- [x] PostgreSQL time-series schema with proper indexing
-- [x] CLV calculation engine
-- [x] Ensemble ML model (XGBoost + Random Forest)
-- [x] Walk-forward validation for time-series integrity
-- [x] Advanced temporal + bookmaker features
-- [x] Kelly Criterion and multi-strategy position sizing
-- [x] Dynamic game-time batch scheduling
-- [x] Comprehensive opportunities explorer
-- [x] Auto-retraining on performance degradation
-- [x] Bankroll simulation with multi-strategy support
-- [x] Daily automated reports with full ROI tracking
-- [x] N+1 query elimination + composite indexes
-- [x] In-memory TTL caching on analytical endpoints
-- [x] Frontend component split + full memoization
-- [ ] Kalshi + Polymarket scraping — prediction market arbitrage detection
-- [ ] Live odds WebSocket feed with real-time alerts
-- [ ] Multi-sport expansion (NFL, NHL, MLB)
+### Latest Release
+- **Prediction Market Arbitrage:** Live Kalshi + Polymarket scraping, 5-minute background polling, Markets tab with pulsing indicator when opportunities exist
+- **ML Accuracy Improvements:** Raised minimum movement threshold to ±2.5%, confidence floor to 62%, EV score floor to 2.0; tightened prediction caps (h2h: ±8%, spreads/totals: ±4%) to eliminate low-conviction noise
+- **Best EV+ / Bankroll Alignment:** Best EV+ tab shows today-only picks; bankroll sim defaults to Best EV+ picks as data source, ensuring 1:1 alignment between what you see and what is simulated
+- **BestEVPick Tracking:** Daily picks saved to dedicated table with lifecycle settlement against game outcomes
 
 ---
 
 **Stack:** Python · TypeScript · React · PostgreSQL · FastAPI · XGBoost · Docker
-**Concepts:** Time-series analytics · Market efficiency · Statistical edge detection · Quantitative position sizing · Automated systems
+**Concepts:** Time-series analytics · Market efficiency · Statistical edge detection · Quantitative position sizing · Prediction market arbitrage · Automated systems

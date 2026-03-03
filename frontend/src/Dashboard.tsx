@@ -9,6 +9,8 @@ import { BookmakerPerformance } from './components/BookmakerPerformance';
 import { DailyReports } from './components/DailyReports';
 import { BankrollSimulator } from './components/BankrollSimulator';
 import { MyBets } from './components/MyBets';
+import { BestEVOpportunities } from './components/BestEVOpportunities';
+import { ArbOpportunities } from './components/ArbOpportunities';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -86,7 +88,7 @@ interface EVOpportunity {
 
 const API_BASE = 'http://localhost:8000/api';
 
-type GamesView = 'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets';
+type GamesView = 'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets' | 'markets';
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
@@ -105,11 +107,12 @@ export default function Dashboard() {
   const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
   const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
   const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
+  const [arbCount, setArbCount] = useState<number>(0);
 
   const fetchData = useCallback(async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes] =
+      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes, arbRes] =
         await Promise.all([
           fetch(`${API_BASE}/stats`),
           fetch(`${API_BASE}/bookmakers`),
@@ -117,14 +120,15 @@ export default function Dashboard() {
           fetch(`${API_BASE}/games?limit=20`),
           fetch(`${API_BASE}/ml/stats`),
           fetch(`${API_BASE}/ml/feature-importance`),
-          fetch(`${API_BASE}/ml/best-opportunities?limit=50&min_ev_score=0`),
+          fetch(`${API_BASE}/ml/best-opportunities?today_only=true&limit=20&min_ev_score=2.0&min_confidence=0.62`),
+          fetch(`${API_BASE}/arb-opportunities?min_spread=1.0&limit=5`),
         ]);
 
       if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok || !gamesRes.ok) {
         throw new Error('Failed to fetch data');
       }
 
-      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData] =
+      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData, arbData] =
         await Promise.all([
           statsRes.json(),
           bookmakersRes.json(),
@@ -133,6 +137,7 @@ export default function Dashboard() {
           mlStatsRes.ok ? mlStatsRes.json() : null,
           featureImportanceRes.ok ? featureImportanceRes.json() : [],
           opportunitiesRes.ok ? opportunitiesRes.json() : [],
+          arbRes.ok ? arbRes.json() : { total: 0 },
         ]);
 
       setStats(statsData);
@@ -141,7 +146,8 @@ export default function Dashboard() {
       setGames(gamesData);
       setMlStats(mlStatsData);
       setFeatureImportance(featureImportanceData);
-      setBestOpportunities(opportunitiesData);
+      setBestOpportunities(Array.isArray(opportunitiesData) ? opportunitiesData : []);
+      setArbCount(arbData?.total ?? 0);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -279,14 +285,25 @@ export default function Dashboard() {
             </h2>
             <div className="flex items-center gap-4">
               <div className="flex gap-2 flex-wrap">
-                {(['recent', 'history', 'best-ev', 'daily-reports', 'bankroll-sim', 'my-bets'] as const).map((view) => {
-                  const labels: Record<GamesView, string> = {
+                {(['recent', 'history', 'best-ev', 'daily-reports', 'bankroll-sim', 'my-bets', 'markets'] as const).map((view) => {
+                  const labels: Record<GamesView, React.ReactNode> = {
                     recent: 'Recent',
                     history: `History (${historyGames.length})`,
                     'best-ev': `Best +EV (${bestOpportunities.length})`,
                     'daily-reports': 'Daily Reports',
                     'bankroll-sim': 'Bankroll Sim',
                     'my-bets': 'My Bets',
+                    'markets': (
+                      <span className="flex items-center gap-1.5">
+                        Markets
+                        {arbCount > 0 && (
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                          </span>
+                        )}
+                      </span>
+                    ),
                   };
                   const activeClass: Record<GamesView, string> = {
                     recent: 'bg-white/20 text-white border border-white/30',
@@ -295,10 +312,11 @@ export default function Dashboard() {
                     'daily-reports': 'bg-gradient-to-r from-blue-500/30 to-cyan-500/30 text-white border border-blue-500/50',
                     'bankroll-sim': 'bg-gradient-to-r from-purple-500/30 to-pink-500/30 text-white border border-purple-500/50',
                     'my-bets': 'bg-gradient-to-r from-yellow-500/30 to-orange-500/30 text-white border border-yellow-500/50',
+                    'markets': 'bg-gradient-to-r from-cyan-500/30 to-teal-500/30 text-white border border-cyan-500/50',
                   };
 
-                  // Hide best-ev tab when no data
-                  if (view === 'best-ev' && (!mlStats?.is_trained || bestOpportunities.length === 0)) return null;
+                  // Hide best-ev tab when model not trained
+                  if (view === 'best-ev' && !mlStats?.is_trained) return null;
 
                   return (
                     <button
@@ -315,8 +333,8 @@ export default function Dashboard() {
                   );
                 })}
               </div>
-              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && gamesView !== 'daily-reports' && (
-                <div className="text-sm text-gray-400">💡 Click any game to view detailed betting lines</div>
+              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && gamesView !== 'daily-reports' && gamesView !== 'markets' && (
+                <div className="text-sm text-gray-400">Click any game to view detailed betting lines</div>
               )}
             </div>
           </div>
@@ -329,58 +347,10 @@ export default function Dashboard() {
             {gamesView === 'my-bets' && <MyBets />}
 
             {gamesView === 'best-ev' && (
-              bestOpportunities.length > 0 ? (
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b border-gray-700/50">
-                      {['Game', 'Market', 'Outcome', 'Current Line', 'Predicted Movement', 'Direction', 'Confidence', 'Bookmaker', 'EV Score'].map((h, i) => (
-                        <th key={h} className={`py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider ${i <= 2 || i === 7 ? 'text-left' : 'text-center'}`}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bestOpportunities.map((opp, index) => (
-                      <tr key={index} className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200" style={{ animationDelay: `${index * 30}ms` }}>
-                        <td className="py-4 px-4">
-                          <span className="font-medium text-white text-sm">{opp.away_team} @ {opp.home_team}</span>
-                          <div className="text-xs text-gray-500 mt-1">
-                            {new Date(opp.commence_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
-                          </div>
-                        </td>
-                        <td className="py-4 px-4">
-                          <span className="px-2 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">{opp.market_type}</span>
-                        </td>
-                        <td className="py-4 px-4"><span className="text-sm font-medium text-white">{opp.outcome_name}</span></td>
-                        <td className="text-center py-4 px-4"><span className="text-sm font-mono text-blue-400">{opp.current_line}</span></td>
-                        <td className="text-center py-4 px-4">
-                          <div className="flex items-center justify-center gap-1">
-                            <span className={`text-sm font-mono font-bold ${opp.predicted_movement > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                              {opp.predicted_movement > 0 ? '+' : ''}{opp.predicted_movement.toFixed(3)}
-                            </span>
-                            {opp.was_constrained && <span className="text-yellow-400 text-xs" title="Prediction capped to realistic range">⚠️</span>}
-                          </div>
-                        </td>
-                        <td className="text-center py-4 px-4">
-                          <span className={`px-2 py-1 rounded text-xs font-medium border ${opp.predicted_direction === 'UP' ? 'bg-green-500/20 text-green-400 border-green-500/30' : opp.predicted_direction === 'DOWN' ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-gray-500/20 text-gray-400 border-gray-500/30'}`}>
-                            {opp.predicted_direction}
-                          </span>
-                        </td>
-                        <td className="text-center py-4 px-4"><span className="text-sm font-medium text-cyan-400">{(opp.confidence * 100).toFixed(0)}%</span></td>
-                        <td className="py-4 px-4"><span className="text-sm text-gray-300">{opp.bookmaker_name}</span></td>
-                        <td className="text-center py-4 px-4">
-                          <span className="px-2 py-1 rounded text-sm font-bold bg-green-500/20 text-green-400 border border-green-500/30">{opp.ev_score.toFixed(2)}</span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <div className="text-center py-12 text-gray-400">
-                  <p className="text-lg mb-2">No +EV opportunities available</p>
-                  <p className="text-sm">Opportunities appear when the ML model predicts favorable betting conditions</p>
-                </div>
-              )
+              <BestEVOpportunities startingBankroll={10000} />
             )}
+
+            {gamesView === 'markets' && <ArbOpportunities />}
 
             {(gamesView === 'recent' || gamesView === 'history') && (
               <>
