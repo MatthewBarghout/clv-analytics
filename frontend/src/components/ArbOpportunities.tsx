@@ -16,7 +16,7 @@ const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
 interface ArbOpportunity {
   id: number;
   event_title: string;
-  market_source: 'kalshi' | 'polymarket';
+  market_source: 'kalshi';
   sportsbook_name: string;
   sportsbook_odds: number;
   pm_implied_prob: number;   // already %, e.g. 52.3
@@ -58,10 +58,8 @@ function spreadColor(spread: number): string {
   return 'text-gray-400 bg-gray-500/15 border-gray-500/25';
 }
 
-function sourceColor(source: string): string {
-  return source === 'kalshi'
-    ? 'text-blue-400 bg-blue-500/20 border-blue-500/30'
-    : 'text-purple-400 bg-purple-500/20 border-purple-500/30';
+function sourceColor(_source: string): string {
+  return 'text-blue-400 bg-blue-500/20 border-blue-500/30';
 }
 
 export const ArbOpportunities = React.memo(function ArbOpportunities() {
@@ -170,7 +168,6 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
             >
               <option value="">All</option>
               <option value="kalshi">Kalshi</option>
-              <option value="polymarket">Polymarket</option>
             </select>
           </div>
           <div className="flex items-center gap-2">
@@ -215,8 +212,8 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
           <div className="text-5xl mb-4">🔄</div>
           <p className="text-lg text-gray-400 mb-2">No active arbitrage opportunities</p>
           <p className="text-sm text-gray-500">
-            The system polls Kalshi and Polymarket every 5 minutes. Opportunities appear
-            when prediction markets diverge from sportsbook lines.
+            The system polls Kalshi every 5 minutes. Opportunities appear
+            when prediction market odds diverge from sportsbook lines.
           </p>
         </div>
       ) : (

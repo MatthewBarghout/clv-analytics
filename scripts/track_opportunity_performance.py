@@ -142,7 +142,7 @@ def settle_moneyline_bet(
         result = "loss"
 
     # Calculate P/L
-    profit_loss = BetSettlement.calculate_profit(
+    profit_loss = BetSettlement.calculate_profit_decimal(
         performance.bet_amount,
         performance.entry_odds,
         result
@@ -205,7 +205,7 @@ def settle_spread_bet(
         result = "push"
 
     # Calculate P/L
-    profit_loss = BetSettlement.calculate_profit(
+    profit_loss = BetSettlement.calculate_profit_decimal(
         performance.bet_amount,
         performance.entry_odds,
         result
@@ -262,7 +262,7 @@ def settle_totals_bet(
             result = "push"
 
     # Calculate P/L
-    profit_loss = BetSettlement.calculate_profit(
+    profit_loss = BetSettlement.calculate_profit_decimal(
         performance.bet_amount,
         performance.entry_odds,
         result

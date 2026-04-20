@@ -1692,7 +1692,7 @@ async def get_arb_history(
 @app.post("/api/arb/refresh")
 async def refresh_arb_opportunities():
     """
-    Manually trigger a fresh poll of Kalshi and Polymarket for arb opportunities.
+    Manually trigger a fresh poll of Kalshi for arb opportunities.
 
     Marks all existing active arb records as inactive, then runs fresh poll.
     """
@@ -1708,11 +1708,10 @@ def _run_arb_poll():
     """
     Core arb polling logic — called by scheduler and manual refresh endpoint.
 
-    Fetches live markets from Kalshi and Polymarket, computes arb spreads
-    against current OddsSnapshot data, and stores results in PredictionMarketArb.
+    Fetches live markets from Kalshi, computes arb spreads against current
+    OddsSnapshot data, and stores results in PredictionMarketArb.
     """
     from src.collectors.kalshi_client import KalshiClient
-    from src.collectors.polymarket_client import PolymarketClient
     from src.collectors.arb_calculator import find_arb_opportunities, build_sportsbook_odds_from_snapshots
     from src.models.database import PredictionMarketArb as _ArbModel
 
@@ -1765,17 +1764,6 @@ def _run_arb_poll():
         except Exception as e:
             logger.warning(f"Kalshi poll failed: {e}")
 
-        # Polymarket
-        try:
-            poly = PolymarketClient()
-            poly_markets_raw = poly.get_sports_markets(max_pages=3)
-            poly_markets = [poly.parse_market_odds(m) for m in poly_markets_raw]
-            poly_markets = [m for m in poly_markets if m is not None]
-            poly_opps = find_arb_opportunities(sb_odds, poly_markets, source="polymarket", min_spread=0.5)
-            new_records.extend(poly_opps)
-        except Exception as e:
-            logger.warning(f"Polymarket poll failed: {e}")
-
         # Persist new arb records
         for opp in new_records:
             rec = _ArbModel(
@@ -1811,7 +1799,7 @@ try:
 
     _scheduler = BackgroundScheduler(daemon=True)
 
-    # Poll Kalshi + Polymarket every 5 minutes
+    # Poll Kalshi every 5 minutes
     _scheduler.add_job(_run_arb_poll, "interval", minutes=5, id="arb_poll", replace_existing=True)
 
     _scheduler.start()

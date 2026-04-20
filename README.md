@@ -1,6 +1,6 @@
 # CLV Analytics Platform
 
-A quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, applies an ensemble ML model to predict line movement, surfaces +EV opportunities with systematic bankroll management, and monitors live arbitrage between traditional sportsbooks and prediction markets (Kalshi, Polymarket).
+A quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, applies an ensemble ML model to predict line movement, surfaces +EV opportunities with systematic bankroll management, and monitors live arbitrage between traditional sportsbooks and the Kalshi prediction market.
 
 ---
 
@@ -23,8 +23,8 @@ Replicate this across hundreds of bets with disciplined sizing, and the edge com
 Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ──►  React Dashboard
                                     │
                           ┌─────────┴─────────┐
-                     ML Pipeline          Arb Engine
-                  (XGBoost + RF)     (Kalshi + Polymarket)
+                     ML Pipeline         Arb Engine
+                  (XGBoost + RF)        (Kalshi)
                           │
                    Opportunity Engine
                  (CLV + EV + Tracking)
@@ -32,7 +32,7 @@ Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ─�
 
 **Data Flow:**
 1. Scheduled collectors poll opening and closing lines from multiple sportsbooks
-2. Background scheduler polls Kalshi and Polymarket every 5 minutes for prediction market prices
+2. Background scheduler polls Kalshi every 5 minutes for prediction market prices
 3. Lines stored in PostgreSQL with composite indexes for time-series queries
 4. ML ensemble predicts line movement direction and magnitude
 5. CLV engine computes realized edge vs closing odds
@@ -139,9 +139,11 @@ Today-only filtered view of the highest-confidence, highest-EV picks from the cu
 
 ### Prediction Market Arbitrage — Markets Tab
 
-Live monitoring of spread between traditional sportsbook odds and prediction market (Kalshi, Polymarket) implied probabilities.
+Live monitoring of spread between traditional sportsbook odds and Kalshi prediction market implied probabilities.
 
-- Polls Kalshi and Polymarket every 5 minutes via APScheduler
+- Polls Kalshi every 5 minutes via APScheduler (series-based fetch for NBA, NFL, MLB, NHL, NCAAB, NCAAF, Soccer, MMA)
+- Falls back to keyword scan if all series are off-season
+- Uses bid/ask midpoint for more accurate probability estimates (better than bid-only)
 - Auto-refreshes in the dashboard every 60 seconds
 - Color-coded by spread: green ≥2%, yellow 1–2%, gray <1%
 - Summary bar: total opportunities, strong arb count, best spread
@@ -150,13 +152,13 @@ Live monitoring of spread between traditional sportsbook odds and prediction mar
 
 **Arb logic:**
 ```
-arb_spread = (PM implied probability − SB implied probability) × 100
-Positive spread = PM assigns higher probability than sportsbook → value on SB side
+arb_spread = (Kalshi implied probability − SB implied probability) × 100
+Positive spread = Kalshi assigns higher probability than sportsbook → value on SB side
 ```
 
 **Environment variable:**
 ```
-KALSHI_API_KEY=<your-key>    # Required for Kalshi auth. Polymarket is public.
+KALSHI_API_KEY=<your-key>    # Required for Kalshi auth
 ```
 
 ### Bankroll Simulation — Aligned with Best EV+
@@ -218,7 +220,7 @@ Manual bet tracking interface with personal P&L dashboard.
 9:00 AM   — Generate daily CLV report; save Best EV+ picks
 9:30 AM   — Track new opportunities from report
 10:30 AM  — Schedule closing line collection batches
-Every 5m  — Poll Kalshi + Polymarket for arb opportunities (APScheduler)
+Every 5m  — Poll Kalshi for arb opportunities (APScheduler)
 ```
 
 ---
@@ -274,7 +276,7 @@ DailyCLVReport ──── OpportunityPerformance (CLV-tracked bets)
 
 BestEVPick (ML-selected daily picks with lifecycle tracking)
 
-PredictionMarketArb (Kalshi/Polymarket vs sportsbook spreads)
+PredictionMarketArb (Kalshi vs sportsbook spreads)
 
 UserBet (personal tracking, independent of ML pipeline)
 ```
@@ -305,8 +307,7 @@ src/
 ├── collectors/
 │   ├── odds_api_client.py    # The Odds API client
 │   ├── odds_proccessor.py    # Processing & storage pipeline
-│   ├── kalshi_client.py      # Kalshi prediction market REST API client
-│   ├── polymarket_client.py  # Polymarket CLOB API client (public)
+│   ├── kalshi_client.py      # Kalshi prediction market REST API client (series + keyword fetch)
 │   ├── arb_calculator.py     # Arb spread calculation and opportunity detection
 │   └── nba_scores_client.py  # NBA.com scores fetcher
 ├── models/
@@ -322,7 +323,7 @@ frontend/src/
     ├── DailyReports.tsx           # Daily reports with opportunity expansion
     ├── BankrollSimulator.tsx      # Simulation UI with source toggle + debounce
     ├── BestEVOpportunities.tsx    # Today's best picks with Kelly sizing
-    ├── ArbOpportunities.tsx       # Live Kalshi/Polymarket arb tab
+    ├── ArbOpportunities.tsx       # Live Kalshi arb tab
     ├── MyBets.tsx                 # Personal bet tracking dashboard
     ├── OpportunitiesExplorer.tsx  # Filterable opportunities table
     ├── GameDetailsModal.tsx       # Game odds snapshot detail view
@@ -367,7 +368,7 @@ launchd/                    # macOS scheduling plists
 ## Changelog
 
 ### Latest Release
-- **Prediction Market Arbitrage:** Live Kalshi + Polymarket scraping, 5-minute background polling, Markets tab with pulsing indicator when opportunities exist
+- **Prediction Market Arbitrage:** Live Kalshi scraping with series-based market fetch (NBA/NFL/MLB/NHL/etc.), 5-minute background polling, bid/ask midpoint probability estimates, Markets tab with pulsing indicator when opportunities exist
 - **ML Accuracy Improvements:** Raised minimum movement threshold to ±2.5%, confidence floor to 62%, EV score floor to 2.0; tightened prediction caps (h2h: ±8%, spreads/totals: ±4%) to eliminate low-conviction noise
 - **Best EV+ / Bankroll Alignment:** Best EV+ tab shows today-only picks; bankroll sim defaults to Best EV+ picks as data source, ensuring 1:1 alignment between what you see and what is simulated
 - **BestEVPick Tracking:** Daily picks saved to dedicated table with lifecycle settlement against game outcomes

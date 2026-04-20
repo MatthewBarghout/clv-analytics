@@ -31,6 +31,17 @@ class BetSettlement:
             return (100 / abs(american_odds)) + 1
 
     @staticmethod
+    def calculate_profit_decimal(bet_amount: float, decimal_odds: float, result: str) -> float:
+        """Calculate profit/loss using decimal odds (as stored in entry_odds column)."""
+        if result == "push":
+            return 0.0
+        elif result == "loss":
+            return -bet_amount
+        elif result == "win":
+            return bet_amount * (decimal_odds - 1)
+        return 0.0
+
+    @staticmethod
     def calculate_profit(bet_amount: float, american_odds: float, result: str) -> float:
         """
         Calculate profit/loss for a bet.

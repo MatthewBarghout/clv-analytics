@@ -17,6 +17,21 @@ logger = logging.getLogger(__name__)
 KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
 REQUEST_TIMEOUT = 10  # seconds
 
+# Known Kalshi sports series tickers — fetched directly rather than
+# scanning all open markets for keyword matches.
+SPORTS_SERIES = [
+    "KXNBA",     # NBA game outcomes
+    "KXNFL",     # NFL game outcomes
+    "KXMLB",     # MLB game outcomes
+    "KXNHL",     # NHL game outcomes
+    "KXNCAAB",   # College basketball
+    "KXNCAAF",   # College football
+    "KXSOCCER",  # Soccer
+    "KXMMA",     # MMA/UFC
+    "KXNBAPTS",  # NBA player points props
+    "KXNFLPTS",  # NFL player points props
+]
+
 
 class KalshiClient:
     """Client for the Kalshi prediction market API."""
@@ -49,53 +64,99 @@ class KalshiClient:
         """
         Fetch active sports markets from Kalshi.
 
-        Returns a list of market dicts with:
-          - ticker, title, yes_bid, yes_ask, no_bid, no_ask, close_time
+        First attempts targeted fetch by known sports series tickers.
+        Falls back to keyword-filtered scan of all open markets if series
+        fetch yields nothing (e.g. off-season).
+
+        Returns a list of market dicts.
         """
+        markets = self._fetch_by_series()
+        if markets:
+            return markets
+        return self._fetch_by_keyword(limit=limit)
+
+    def _fetch_by_series(self) -> List[Dict]:
+        """Fetch markets from known sports series tickers directly."""
+        all_markets: List[Dict] = []
+        for series_ticker in SPORTS_SERIES:
+            try:
+                data = self._get(f"/series/{series_ticker}/markets", params={
+                    "status": "open",
+                    "limit": 100,
+                })
+                markets = data.get("markets", [])
+                all_markets.extend(markets)
+                logger.debug(f"Kalshi series {series_ticker}: {len(markets)} markets")
+            except Exception as e:
+                logger.debug(f"Kalshi series {series_ticker} unavailable: {e}")
+                continue
+
+        if all_markets:
+            logger.info(f"Kalshi: fetched {len(all_markets)} markets via series tickers")
+        return all_markets
+
+    def _fetch_by_keyword(self, limit: int = 200) -> List[Dict]:
+        """Fallback: scan all open markets and filter by sports keywords."""
         try:
             data = self._get("/markets", params={
                 "limit": limit,
                 "status": "open",
-                "series_ticker": None,
             })
             markets = data.get("markets", [])
 
             sports_markets = []
             for m in markets:
-                # Filter for sports-related markets by checking category or title keywords
                 category = (m.get("category") or "").lower()
                 title = (m.get("title") or "").lower()
                 if any(kw in category or kw in title for kw in
                        ["nba", "nfl", "mlb", "nhl", "soccer", "sport", "football",
-                        "basketball", "baseball", "hockey", "tennis", "golf"]):
+                        "basketball", "baseball", "hockey", "tennis", "golf", "mma", "ufc"]):
                     sports_markets.append(m)
 
-            logger.info(f"Kalshi: fetched {len(sports_markets)} sports markets")
+            logger.info(f"Kalshi: fetched {len(sports_markets)} sports markets via keyword scan")
             return sports_markets
 
         except Exception as e:
-            logger.error(f"Error fetching Kalshi sports markets: {e}")
+            logger.error(f"Error fetching Kalshi markets by keyword: {e}")
             return []
+
+    def get_market(self, ticker: str) -> Optional[Dict]:
+        """Fetch a single market by its ticker. Returns the market dict or None."""
+        try:
+            data = self._get(f"/markets/{ticker}")
+            return data.get("market")
+        except Exception as e:
+            logger.error(f"Kalshi: failed to fetch market {ticker}: {e}")
+            return None
 
     def parse_market_odds(self, market: Dict) -> Optional[Dict]:
         """
         Parse a Kalshi market dict into a standardized odds record.
 
+        Uses midpoint of bid/ask for a more accurate probability estimate
+        than bid alone. Falls back to bid-only if ask is unavailable.
+
         Returns dict with:
           - title, ticker, yes_implied_prob, no_implied_prob,
-            yes_implied_odds, no_implied_odds, market_url, close_time
+            yes_implied_odds, no_implied_odds, market_url, close_time,
+            volume, open_interest
         Returns None if insufficient data.
         """
         try:
-            yes_bid = market.get("yes_bid")  # cents (0-100)
+            yes_bid = market.get("yes_bid")
+            yes_ask = market.get("yes_ask")
             no_bid = market.get("no_bid")
+            no_ask = market.get("no_ask")
 
             if yes_bid is None or no_bid is None:
                 return None
 
-            # Convert cents to probability (0.0 - 1.0)
-            yes_prob = float(yes_bid) / 100.0
-            no_prob = float(no_bid) / 100.0
+            # Midpoint of bid/ask gives a cleaner probability estimate
+            yes_cents = (float(yes_bid) + float(yes_ask)) / 2.0 if yes_ask is not None else float(yes_bid)
+            no_cents = (float(no_bid) + float(no_ask)) / 2.0 if no_ask is not None else float(no_bid)
+
+            yes_prob = yes_cents / 100.0
+            no_prob = no_cents / 100.0
 
             if yes_prob <= 0 or no_prob <= 0:
                 return None
@@ -109,6 +170,8 @@ class KalshiClient:
                 "no_implied_odds": round(1.0 / no_prob, 4),
                 "market_url": f"https://kalshi.com/markets/{market.get('ticker', '')}",
                 "close_time": market.get("close_time"),
+                "volume": market.get("volume", 0),
+                "open_interest": market.get("open_interest", 0),
             }
         except Exception as e:
             logger.debug(f"Kalshi parse error for market {market.get('ticker')}: {e}")
