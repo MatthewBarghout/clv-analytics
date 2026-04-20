@@ -23,6 +23,7 @@ numpy = "^1.26.0"
 xgboost = "^2.0.0"
 matplotlib = "^3.10.8"
 apscheduler = "^3.11.2"
+cryptography = "^46.0.7"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
