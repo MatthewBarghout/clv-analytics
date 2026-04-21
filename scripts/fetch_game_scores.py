@@ -2,8 +2,11 @@
 """
 Fetch Game Scores and Store Betting Outcomes
 
-Automatically fetches final scores for completed NBA games and stores them
+Fetches final scores for completed games across all sports and stores them
 in the betting_outcomes table for bet settlement.
+
+- NBA: uses NBA.com API (free, no quota cost)
+- MLB: uses MLB Stats API (free, no quota cost, statsapi.mlb.com)
 
 Usage:
     poetry run python scripts/fetch_game_scores.py              # Fetch scores for recent games
@@ -20,8 +23,9 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+from src.collectors.mlb_scores_client import MLBScoresClient
 from src.collectors.nba_scores_client import NBAScoresClient
-from src.models.database import BettingOutcome, Game, Team
+from src.models.database import BettingOutcome, Game, Sport, Team
 
 # Setup logging
 logging.basicConfig(
@@ -35,27 +39,25 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-def fetch_and_store_score(session, game: Game, nba_client: NBAScoresClient, scores_cache: list) -> bool:
+
+def fetch_and_store_score(session, game: Game, scores_cache: list) -> bool:
     """
-    Fetch score for a single game and store in database.
+    Match a game against a scores cache and store the BettingOutcome.
 
     Args:
         session: SQLAlchemy session
         game: Game object to fetch score for
-        nba_client: NBA.com scores client
-        scores_cache: Cached list of scores from NBA.com API
+        scores_cache: Normalized list of score dicts (home_team, away_team, home_score, away_score)
 
     Returns:
-        True if score was fetched and stored successfully
+        True if score was matched and stored successfully
     """
     try:
-        # Get team names
         home_team = session.get(Team, game.home_team_id)
         away_team = session.get(Team, game.away_team_id)
 
         logger.info(f"Fetching score for Game {game.id}: {away_team.name} @ {home_team.name}")
 
-        # Find matching game by team names (case-insensitive partial match)
         for score in scores_cache:
             if not score.get("completed"):
                 continue
@@ -63,7 +65,6 @@ def fetch_and_store_score(session, game: Game, nba_client: NBAScoresClient, scor
             home_name = score.get("home_team", "")
             away_name = score.get("away_team", "")
 
-            # Case-insensitive partial matching
             home_match = (
                 home_name and home_team.name and
                 (home_name.lower() in home_team.name.lower() or home_team.name.lower() in home_name.lower())
@@ -78,40 +79,39 @@ def fetch_and_store_score(session, game: Game, nba_client: NBAScoresClient, scor
                 away_score = score.get("away_score")
 
                 if home_score is not None and away_score is not None:
-                    # Check if outcome already exists
+                    home_score = int(home_score)
+                    away_score = int(away_score)
+
                     existing = session.execute(
                         select(BettingOutcome).where(BettingOutcome.game_id == game.id)
                     ).scalar_one_or_none()
 
                     if existing:
-                        # Update existing outcome
                         existing.completed = True
-                        existing.home_score = int(home_score)
-                        existing.away_score = int(away_score)
-                        existing.total_points = int(home_score) + int(away_score)
-                        existing.point_differential = int(home_score) - int(away_score)
+                        existing.home_score = home_score
+                        existing.away_score = away_score
+                        existing.total_points = home_score + away_score
+                        existing.point_differential = home_score - away_score
                         existing.winner = "home" if home_score > away_score else "away" if away_score > home_score else "push"
-                        logger.info(f"  ✓ Updated existing outcome: {away_team.name} {away_score} @ {home_team.name} {home_score}")
+                        logger.info(f"  Updated: {away_team.name} {away_score} @ {home_team.name} {home_score}")
                     else:
-                        # Create new outcome
                         outcome = BettingOutcome(
                             game_id=game.id,
                             completed=True,
-                            home_score=int(home_score),
-                            away_score=int(away_score),
-                            total_points=int(home_score) + int(away_score),
-                            point_differential=int(home_score) - int(away_score),
+                            home_score=home_score,
+                            away_score=away_score,
+                            total_points=home_score + away_score,
+                            point_differential=home_score - away_score,
                             winner="home" if home_score > away_score else "away" if away_score > home_score else "push"
                         )
                         session.add(outcome)
-                        logger.info(f"  ✓ Stored score: {away_team.name} {away_score} @ {home_team.name} {home_score} (Winner: {outcome.winner})")
+                        logger.info(f"  Stored: {away_team.name} {away_score} @ {home_team.name} {home_score} (Winner: {'home' if home_score > away_score else 'away' if away_score > home_score else 'push'})")
 
-                    # Mark game as completed
                     game.completed = True
                     session.commit()
                     return True
 
-        logger.warning(f"  ✗ No score found for Game {game.id}")
+        logger.warning(f"  No score found for Game {game.id}")
         return False
 
     except Exception as e:
@@ -122,7 +122,7 @@ def fetch_and_store_score(session, game: Game, nba_client: NBAScoresClient, scor
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Fetch game scores from NBA.com")
+    parser = argparse.ArgumentParser(description="Fetch game scores across all sports")
     parser.add_argument(
         "--days",
         type=int,
@@ -137,75 +137,95 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate environment
     if not DATABASE_URL:
         logger.error("DATABASE_URL not found in environment")
         sys.exit(1)
 
     logger.info("=" * 70)
-    logger.info("GAME SCORE FETCHING STARTED (NBA.com API)")
+    logger.info("GAME SCORE FETCHING STARTED")
     logger.info("=" * 70)
 
-    # Initialize
     engine = create_engine(DATABASE_URL)
     Session = sessionmaker(bind=engine)
     session = Session()
     nba_client = NBAScoresClient()
+    mlb_client = MLBScoresClient()
 
     try:
         if args.game_id:
-            # Fetch specific game
             game = session.get(Game, args.game_id)
             if not game:
                 logger.error(f"Game {args.game_id} not found")
                 sys.exit(1)
 
-            # Fetch scores for the game's date
+            sport = session.get(Sport, game.sport_id)
+            sport_key = sport.key if sport else "basketball_nba"
             game_date = game.commence_time.date()
-            scores = nba_client.get_scores_for_date_range(
-                datetime.combine(game_date, datetime.min.time()),
-                days=1
-            )
+            start = datetime.combine(game_date, datetime.min.time())
 
-            fetch_and_store_score(session, game, nba_client, scores)
+            if sport_key == "baseball_mlb":
+                scores = mlb_client.get_scores_for_date_range(start, days=1)
+            else:
+                scores = nba_client.get_scores_for_date_range(start, days=1)
+
+            fetch_and_store_score(session, game, scores)
+
         else:
-            # Fetch recent games
             cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
 
-            # Find completed games without scores
             stmt = (
-                select(Game)
+                select(Game, Sport)
+                .join(Sport, Sport.id == Game.sport_id)
                 .outerjoin(BettingOutcome, BettingOutcome.game_id == Game.id)
                 .where(
                     Game.commence_time >= cutoff,
                     Game.commence_time < datetime.now(timezone.utc),
-                    BettingOutcome.id.is_(None)  # No outcome record yet
+                    BettingOutcome.id.is_(None)
                 )
                 .order_by(Game.commence_time.desc())
             )
 
-            games = session.execute(stmt).scalars().all()
+            rows = session.execute(stmt).all()
+            games_by_sport: dict[str, list] = {}
+            for game, sport in rows:
+                games_by_sport.setdefault(sport.key, []).append(game)
 
-            logger.info(f"Found {len(games)} completed games without scores (last {args.days} days)")
+            total_games = sum(len(g) for g in games_by_sport.values())
+            logger.info(f"Found {total_games} games without scores (last {args.days} days)")
 
-            if not games:
+            if not total_games:
                 logger.info("No games to process")
                 return
 
-            # Fetch scores from NBA.com for the date range
-            logger.info(f"Fetching scores from NBA.com for last {args.days} days...")
             start_date = datetime.now(timezone.utc) - timedelta(days=args.days)
-            scores = nba_client.get_scores_for_date_range(start_date, days=args.days)
-            logger.info(f"Retrieved {len(scores)} completed games from NBA.com")
+            scores_caches: dict[str, list] = {}
 
-            # Match and store scores
+            if "basketball_nba" in games_by_sport:
+                n = len(games_by_sport["basketball_nba"])
+                logger.info(f"Fetching NBA scores from NBA.com ({n} games)...")
+                scores = nba_client.get_scores_for_date_range(start_date, days=args.days)
+                scores_caches["basketball_nba"] = scores
+                logger.info(f"Retrieved {len(scores)} completed NBA games")
+
+            if "baseball_mlb" in games_by_sport:
+                n = len(games_by_sport["baseball_mlb"])
+                logger.info(f"Fetching MLB scores from MLB Stats API ({n} games)...")
+                scores = mlb_client.get_scores_for_date_range(start_date, days=args.days)
+                scores_caches["baseball_mlb"] = scores
+                logger.info(f"Retrieved {len(scores)} completed MLB games")
+
             success_count = 0
-            for game in games:
-                if fetch_and_store_score(session, game, nba_client, scores):
-                    success_count += 1
+            for sport_key, games in games_by_sport.items():
+                cache = scores_caches.get(sport_key, [])
+                if not cache:
+                    logger.warning(f"No score data available for {sport_key} — skipping")
+                    continue
+                for game in games:
+                    if fetch_and_store_score(session, game, cache):
+                        success_count += 1
 
             logger.info("=" * 70)
-            logger.info(f"SUMMARY: Fetched scores for {success_count}/{len(games)} games")
+            logger.info(f"SUMMARY: Fetched scores for {success_count}/{total_games} games")
             logger.info("=" * 70)
 
     except Exception as e:

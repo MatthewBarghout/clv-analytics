@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from src.analyzers.clv_calculator import CLVCalculator
 from src.analyzers.bet_sizing import (
@@ -1226,10 +1226,11 @@ async def get_game_score(game_id: int):
     db = get_db()
 
     try:
-        # Get game details
+        away_team_alias = aliased(Team)
         stmt = (
-            select(Game, Team, Sport)
+            select(Game, Team, away_team_alias, Sport)
             .join(Team, Team.id == Game.home_team_id)
+            .join(away_team_alias, away_team_alias.id == Game.away_team_id)
             .join(Sport, Sport.id == Game.sport_id)
             .where(Game.id == game_id)
         )
@@ -1238,10 +1239,7 @@ async def get_game_score(game_id: int):
         if not result:
             raise HTTPException(status_code=404, detail="Game not found")
 
-        game, home_team, sport = result
-
-        # Get away team
-        away_team = db.query(Team).filter(Team.id == game.away_team_id).first()
+        game, home_team, away_team, sport = result
 
         # Fetch scores from Odds API
         api_key = os.getenv("ODDS_API_KEY")

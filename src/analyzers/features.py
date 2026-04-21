@@ -509,6 +509,8 @@ class FeatureEngineer:
                     "price_movement": price_movement,
                     "point_movement": point_movement,
                     "directional_movement": direction,
+                    # Sorting key for chronological split — not a model feature
+                    "snapshot_timestamp": snapshot.timestamp,
                 }
                 data_rows.append(row)
 
@@ -532,22 +534,12 @@ class FeatureEngineer:
         self, df: pd.DataFrame, test_size: float = 0.2
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
         """
-        Split data into training and test sets for movement prediction.
+        Split data chronologically: train on the past, test on the future.
 
-        Args:
-            df: DataFrame with features and targets
-            test_size: Proportion of data to use for testing (default 0.2)
-
-        Returns:
-            Tuple of (X_train, X_test, y_train_regression, y_train_classification)
-            where y_train_regression has price/point movement columns
-            and y_train_classification is directional_movement
+        Sorts by snapshot_timestamp so no future data can leak into training.
+        test_size is the fraction of the most-recent records held out for test.
         """
-        from sklearn.model_selection import train_test_split
-
-        # Separate features and targets
         feature_cols = [
-            # Base features
             "bookmaker_id",
             "market_type",
             "hours_to_game",
@@ -560,36 +552,36 @@ class FeatureEngineer:
             "line_spread",
             "distance_from_consensus",
             "is_outlier",
-            # Temporal features
             "time_since_last_update",
             "movement_velocity",
             "updates_count",
             "price_volatility_24h",
             "cumulative_movement",
             "movement_direction_changes",
-            # Bookmaker features
             "bookmaker_is_sharp",
             "relative_to_pinnacle",
             "books_moved_count",
             "steam_move_signal",
         ]
 
-        # Filter to only columns that exist in the dataframe
         feature_cols = [col for col in feature_cols if col in df.columns]
 
-        X = df[feature_cols]
-        y_regression = df[["price_movement", "point_movement"]]
-        y_classification = df["directional_movement"]
+        # Sort chronologically so the split is always past→future
+        df_sorted = df.sort_values("snapshot_timestamp").reset_index(drop=True)
 
-        # Split data
-        X_train, X_test, y_reg_train, y_reg_test = train_test_split(
-            X, y_regression, test_size=test_size, random_state=42
-        )
+        cutoff = int(len(df_sorted) * (1 - test_size))
+        train_df = df_sorted.iloc[:cutoff]
+        test_df = df_sorted.iloc[cutoff:]
 
-        # Also split classification target with same indices
-        y_class_train = y_classification.iloc[X_train.index]
-        y_class_test = y_classification.iloc[X_test.index]
+        X_train = train_df[feature_cols]
+        X_test = test_df[feature_cols]
+        y_reg_train = train_df[["price_movement", "point_movement"]]
+        y_reg_test = test_df[["price_movement", "point_movement"]]
+        y_class_train = train_df["directional_movement"]
+        y_class_test = test_df["directional_movement"]
 
+        split_date = df_sorted.iloc[cutoff]["snapshot_timestamp"]
+        logger.info(f"Chronological split date: {split_date}")
         logger.info(f"Training set size: {len(X_train)}")
         logger.info(f"Test set size: {len(X_test)}")
 

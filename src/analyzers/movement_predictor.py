@@ -7,6 +7,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
@@ -18,6 +19,7 @@ from sklearn.metrics import (
     r2_score,
 )
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier, XGBRegressor
 
 from src.models.database import Game, OddsSnapshot
@@ -120,9 +122,14 @@ class LineMovementPredictor:
             min_samples_split=5,
             min_samples_leaf=2,
             max_features='sqrt',
+            class_weight='balanced',
             random_state=42,
             n_jobs=-1,
         )
+
+        # Calibrated wrappers — fitted after base classifiers; used in predict_movement
+        self.xgb_calibrated: Optional[CalibratedClassifierCV] = None
+        self.rf_calibrated: Optional[CalibratedClassifierCV] = None
 
         self.preprocessor: Optional[ColumnTransformer] = None
         self.label_encoder: Optional[LabelEncoder] = None
@@ -277,11 +284,10 @@ class LineMovementPredictor:
         self.preprocessor = self._create_preprocessor()
         X_train_processed = self.preprocessor.fit_transform(X_train)
 
-        # Train XGBoost regression model
+        # Train regression models on full training data
         logger.info("Training XGBoost regression model...")
         self.xgb_regression.fit(X_train_processed, y_reg_train["price_movement"])
 
-        # Train Random Forest regression model
         logger.info("Training Random Forest regression model...")
         self.rf_regression.fit(X_train_processed, y_reg_train["price_movement"])
 
@@ -289,13 +295,52 @@ class LineMovementPredictor:
         self.label_encoder = LabelEncoder()
         y_class_encoded = self.label_encoder.fit_transform(y_class_train)
 
-        # Train XGBoost classification model
-        logger.info("Training XGBoost classification model...")
-        self.xgb_classification.fit(X_train_processed, y_class_encoded)
+        # sample_weight compensates for STAY class (~20%) being underrepresented vs UP/DOWN (~40% each)
+        xgb_sample_weight = compute_sample_weight('balanced', y_class_encoded)
 
-        # Train Random Forest classification model
+        # Base classifiers — trained on full data, used by evaluate_classification for comparison
+        logger.info("Training XGBoost classification model...")
+        self.xgb_classification.fit(X_train_processed, y_class_encoded, sample_weight=xgb_sample_weight)
+
         logger.info("Training Random Forest classification model...")
         self.rf_classification.fit(X_train_processed, y_class_encoded)
+
+        # Calibrated classifiers — 5-fold CV trains on 4 folds, calibrates isotonic on 5th (×5)
+        # Used in predict_movement so confidence scores reflect actual win rates
+        logger.info("Fitting isotonic calibration layers (5-fold CV)...")
+        self.xgb_calibrated = CalibratedClassifierCV(
+            XGBClassifier(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                reg_alpha=self.reg_alpha,
+                reg_lambda=self.reg_lambda,
+                min_child_weight=self.min_child_weight,
+                subsample=self.subsample,
+                colsample_bytree=self.colsample_bytree,
+                random_state=42,
+                n_jobs=-1,
+            ),
+            cv=5,
+            method='isotonic',
+        )
+        self.xgb_calibrated.fit(X_train_processed, y_class_encoded, sample_weight=xgb_sample_weight)
+
+        self.rf_calibrated = CalibratedClassifierCV(
+            RandomForestClassifier(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                max_features='sqrt',
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1,
+            ),
+            cv=5,
+            method='isotonic',
+        )
+        self.rf_calibrated.fit(X_train_processed, y_class_encoded)
 
         logger.info("Ensemble training completed")
         logger.info(f"Number of features after preprocessing: {X_train_processed.shape[1]}")
@@ -414,12 +459,9 @@ class LineMovementPredictor:
         predicted_delta = np.array(constrained_deltas)
         was_constrained = np.array(was_constrained)
 
-        # Get predictions from both classification models
-        xgb_direction_encoded = self.xgb_classification.predict(X_processed)
-        xgb_direction_proba = self.xgb_classification.predict_proba(X_processed)
-
-        rf_direction_encoded = self.rf_classification.predict(X_processed)
-        rf_direction_proba = self.rf_classification.predict_proba(X_processed)
+        # Use calibrated classifiers so confidence scores reflect true win rates
+        xgb_direction_proba = self.xgb_calibrated.predict_proba(X_processed)
+        rf_direction_proba = self.rf_calibrated.predict_proba(X_processed)
 
         # Ensemble classification predictions with per-market weights
         ensemble_proba = np.zeros_like(xgb_direction_proba)
@@ -643,6 +685,8 @@ class LineMovementPredictor:
             "xgb_classification": self.xgb_classification,
             "rf_regression": self.rf_regression,
             "rf_classification": self.rf_classification,
+            "xgb_calibrated": self.xgb_calibrated,
+            "rf_calibrated": self.rf_calibrated,
             "preprocessor": self.preprocessor,
             "label_encoder": self.label_encoder,
             "feature_names": self.feature_names,
@@ -676,6 +720,8 @@ class LineMovementPredictor:
         self.xgb_classification = model_data["xgb_classification"]
         self.rf_regression = model_data["rf_regression"]
         self.rf_classification = model_data["rf_classification"]
+        self.xgb_calibrated = model_data["xgb_calibrated"]
+        self.rf_calibrated = model_data["rf_calibrated"]
         self.preprocessor = model_data["preprocessor"]
         self.label_encoder = model_data["label_encoder"]
         self.feature_names = model_data["feature_names"]

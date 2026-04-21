@@ -572,6 +572,7 @@ class BestEVPick(Base):
 
     # Odds and ML scores at time of pick
     entry_odds: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)  # decimal odds
+    point_line: Mapped[float] = mapped_column(Numeric(8, 2), nullable=True)  # spread or total line; null for h2h
     ev_score: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
     confidence: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
     predicted_delta: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)

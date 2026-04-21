@@ -270,9 +270,9 @@ async def get_game_predictions(game_id: int):
         model = get_model()
         engineer = FeatureEngineer()
 
-        # Get all snapshots for this game
+        # Get all snapshots for this game, joining bookmaker so no per-row query is needed
         stmt = (
-            select(OddsSnapshot, ClosingLine, Game)
+            select(OddsSnapshot, ClosingLine, Game, Bookmaker)
             .outerjoin(
                 ClosingLine,
                 (ClosingLine.game_id == OddsSnapshot.game_id)
@@ -280,6 +280,7 @@ async def get_game_predictions(game_id: int):
                 & (ClosingLine.market_type == OddsSnapshot.market_type),
             )
             .join(Game, Game.id == OddsSnapshot.game_id)
+            .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
             .where(OddsSnapshot.game_id == game_id)
         )
 
@@ -293,7 +294,7 @@ async def get_game_predictions(game_id: int):
 
         predictions = []
 
-        for snapshot, closing_line, game in results:
+        for snapshot, closing_line, game, bookmaker in results:
             outcome_predictions = []
 
             # Calculate base features
@@ -374,11 +375,6 @@ async def get_game_predictions(game_id: int):
                     was_constrained=bool(movement_pred["was_constrained"][0]),
                     unconstrained_movement=float(movement_pred["unconstrained_delta"][0]),
                 ))
-
-            # Get bookmaker name (bookmakers_map may not exist here; use direct query only once)
-            bookmaker = db.execute(
-                select(Bookmaker).where(Bookmaker.id == snapshot.bookmaker_id)
-            ).scalar_one_or_none()
 
             predictions.append(SnapshotMovementPrediction(
                 snapshot_id=snapshot.id,
@@ -509,7 +505,15 @@ async def get_best_opportunities(
                     db, game.id, snapshot.market_type, outcome_name
                 )
 
-                # Create features - with new temporal/bookmaker features set to defaults
+                temporal = engineer.calculate_temporal_features(
+                    db, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, snapshot.timestamp,
+                )
+                bk_features = engineer.calculate_bookmaker_features(
+                    db, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, float(opening_price),
+                )
+
                 features = pd.DataFrame([{
                     "bookmaker_id": snapshot.bookmaker_id,
                     "market_type": snapshot.market_type,
@@ -531,18 +535,16 @@ async def get_best_opportunities(
                         if consensus_line is not None
                         else False
                     ),
-                    # Temporal features - defaults for live prediction
-                    "time_since_last_update": 0.0,
-                    "movement_velocity": 0.0,
-                    "updates_count": 1,
-                    "price_volatility_24h": 0.0,
-                    "cumulative_movement": 0.0,
-                    "movement_direction_changes": 0,
-                    # Bookmaker features
-                    "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
-                    "relative_to_pinnacle": 0.0,
-                    "books_moved_count": 0,
-                    "steam_move_signal": 0.0,
+                    "time_since_last_update": temporal["time_since_last_update"],
+                    "movement_velocity": temporal["movement_velocity"],
+                    "updates_count": temporal["updates_count"],
+                    "price_volatility_24h": temporal["price_volatility_24h"],
+                    "cumulative_movement": temporal["cumulative_movement"],
+                    "movement_direction_changes": temporal["movement_direction_changes"],
+                    "bookmaker_is_sharp": bk_features["bookmaker_is_sharp"],
+                    "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
+                    "books_moved_count": bk_features["books_moved_count"],
+                    "steam_move_signal": bk_features["steam_move_signal"],
                 }])
 
                 # Predict movement
@@ -955,7 +957,15 @@ async def get_upcoming_opportunities(
                         db, game.id, snapshot.market_type, outcome_name
                     )
 
-                    # Create features with defaults for new features
+                    temporal = engineer.calculate_temporal_features(
+                        db, game.id, snapshot.bookmaker_id,
+                        snapshot.market_type, outcome_name, snapshot.timestamp,
+                    )
+                    bk_features = engineer.calculate_bookmaker_features(
+                        db, game.id, snapshot.bookmaker_id,
+                        snapshot.market_type, outcome_name, float(opening_price),
+                    )
+
                     features = pd.DataFrame([{
                         "bookmaker_id": snapshot.bookmaker_id,
                         "market_type": snapshot.market_type,
@@ -977,18 +987,16 @@ async def get_upcoming_opportunities(
                             if consensus_line is not None
                             else False
                         ),
-                        # Default temporal features
-                        "time_since_last_update": 0.0,
-                        "movement_velocity": 0.0,
-                        "updates_count": 1,
-                        "price_volatility_24h": 0.0,
-                        "cumulative_movement": 0.0,
-                        "movement_direction_changes": 0,
-                        # Default bookmaker features
-                        "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
-                        "relative_to_pinnacle": 0.0,
-                        "books_moved_count": 0,
-                        "steam_move_signal": 0.0,
+                        "time_since_last_update": temporal["time_since_last_update"],
+                        "movement_velocity": temporal["movement_velocity"],
+                        "updates_count": temporal["updates_count"],
+                        "price_volatility_24h": temporal["price_volatility_24h"],
+                        "cumulative_movement": temporal["cumulative_movement"],
+                        "movement_direction_changes": temporal["movement_direction_changes"],
+                        "bookmaker_is_sharp": bk_features["bookmaker_is_sharp"],
+                        "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
+                        "books_moved_count": bk_features["books_moved_count"],
+                        "steam_move_signal": bk_features["steam_move_signal"],
                     }])
 
                     try:
@@ -1224,6 +1232,15 @@ async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
                         db, game.id, snapshot.market_type, outcome_name
                     )
 
+                    temporal = engineer.calculate_temporal_features(
+                        db, game.id, snapshot.bookmaker_id,
+                        snapshot.market_type, outcome_name, snapshot.timestamp,
+                    )
+                    bk_features = engineer.calculate_bookmaker_features(
+                        db, game.id, snapshot.bookmaker_id,
+                        snapshot.market_type, outcome_name, float(opening_price),
+                    )
+
                     features = pd.DataFrame([{
                         "bookmaker_id": snapshot.bookmaker_id,
                         "market_type": snapshot.market_type,
@@ -1237,16 +1254,16 @@ async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
                         "line_spread": line_spread if line_spread is not None else 0.0,
                         "distance_from_consensus": float(opening_price) - consensus_line if consensus_line else 0.0,
                         "is_outlier": abs(float(opening_price) - consensus_line) > 0.05 if consensus_line else False,
-                        "time_since_last_update": 0.0,
-                        "movement_velocity": 0.0,
-                        "updates_count": 1,
-                        "price_volatility_24h": 0.0,
-                        "cumulative_movement": 0.0,
-                        "movement_direction_changes": 0,
-                        "bookmaker_is_sharp": 1.0 if bookmaker and bookmaker.key.lower() == "pinnacle" else 0.0,
-                        "relative_to_pinnacle": 0.0,
-                        "books_moved_count": 0,
-                        "steam_move_signal": 0.0,
+                        "time_since_last_update": temporal["time_since_last_update"],
+                        "movement_velocity": temporal["movement_velocity"],
+                        "updates_count": temporal["updates_count"],
+                        "price_volatility_24h": temporal["price_volatility_24h"],
+                        "cumulative_movement": temporal["cumulative_movement"],
+                        "movement_direction_changes": temporal["movement_direction_changes"],
+                        "bookmaker_is_sharp": bk_features["bookmaker_is_sharp"],
+                        "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
+                        "books_moved_count": bk_features["books_moved_count"],
+                        "steam_move_signal": bk_features["steam_move_signal"],
                     }])
 
                     try:
@@ -1275,6 +1292,7 @@ async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
                             "market_type": snapshot.market_type,
                             "outcome_name": outcome_name,
                             "entry_odds": float(opening_price),
+                            "point_line": float(opening_point) if opening_point else None,
                             "ev_score": ev_score,
                             "confidence": confidence,
                             "predicted_delta": predicted_delta,
@@ -1293,6 +1311,7 @@ async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
                     market_type=c["market_type"],
                     outcome_name=c["outcome_name"],
                     entry_odds=c["entry_odds"],
+                    point_line=c["point_line"],
                     ev_score=c["ev_score"],
                     confidence=c["confidence"],
                     predicted_delta=c["predicted_delta"],
@@ -1325,7 +1344,6 @@ async def settle_best_ev_picks(background_tasks: BackgroundTasks):
     def _settle():
         db = SessionLocal()
         try:
-            # Get all pending picks for completed games
             stmt = (
                 select(BestEVPick, Game, BettingOutcome)
                 .join(Game, Game.id == BestEVPick.game_id)
@@ -1334,6 +1352,14 @@ async def settle_best_ev_picks(background_tasks: BackgroundTasks):
                 .where(BettingOutcome.completed == True)  # noqa: E712
             )
             results = db.execute(stmt).all()
+
+            # Pre-fetch all teams to avoid N+1 queries
+            team_ids = list({tid for _, game, _ in results for tid in (game.home_team_id, game.away_team_id)})
+            teams_map = {
+                t.id: t
+                for t in db.execute(select(Team).where(Team.id.in_(team_ids))).scalars().all()
+            }
+
             settled_count = 0
             now = datetime.now(timezone.utc)
 
@@ -1343,13 +1369,11 @@ async def settle_best_ev_picks(background_tasks: BackgroundTasks):
 
                 result = "pending"
                 profit_loss = None
+                home_team = teams_map.get(game.home_team_id)
+                picked_home = bool(home_team and pick.outcome_name.lower() in home_team.name.lower())
 
                 if pick.market_type == "h2h":
-                    # Moneyline: compare outcome_name to winner
-                    home_team = db.execute(select(Team).where(Team.id == game.home_team_id)).scalar_one_or_none()
-                    away_team = db.execute(select(Team).where(Team.id == game.away_team_id)).scalar_one_or_none()
-
-                    picked_home = home_team and pick.outcome_name.lower() in home_team.name.lower()
+                    # Win if the picked team won outright
                     if (picked_home and outcome.winner == "home") or (not picked_home and outcome.winner == "away"):
                         result = "win"
                         profit_loss = round(100.0 * (float(pick.entry_odds) - 1), 2)
@@ -1360,8 +1384,38 @@ async def settle_best_ev_picks(background_tasks: BackgroundTasks):
                         result = "loss"
                         profit_loss = -100.0
 
-                # For spreads and totals, settlement is complex — mark as pending for now
-                # A full settlement engine would need the actual point line from the pick
+                elif pick.market_type == "spreads" and pick.point_line is not None:
+                    # Cover margin: how much the picked team beat the spread by.
+                    # point_differential = home_score - away_score, so away margin is its negative.
+                    team_margin = outcome.point_differential if picked_home else -outcome.point_differential
+                    cover_margin = team_margin + float(pick.point_line)
+                    if cover_margin > 0:
+                        result = "win"
+                        profit_loss = round(100.0 * (float(pick.entry_odds) - 1), 2)
+                    elif cover_margin == 0:
+                        result = "push"
+                        profit_loss = 0.0
+                    else:
+                        result = "loss"
+                        profit_loss = -100.0
+
+                elif pick.market_type == "totals" and pick.point_line is not None:
+                    # Over/Under: compare actual total to the line
+                    total = outcome.total_points
+                    line = float(pick.point_line)
+                    betting_over = pick.outcome_name.lower() == "over"
+                    if total is None:
+                        continue
+                    if total == line:
+                        result = "push"
+                        profit_loss = 0.0
+                    elif (betting_over and total > line) or (not betting_over and total < line):
+                        result = "win"
+                        profit_loss = round(100.0 * (float(pick.entry_odds) - 1), 2)
+                    else:
+                        result = "loss"
+                        profit_loss = -100.0
+
                 if result != "pending":
                     pick.result = result
                     pick.profit_loss = profit_loss
