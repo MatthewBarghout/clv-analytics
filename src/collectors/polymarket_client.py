@@ -80,6 +80,76 @@ class PolymarketClient:
         logger.info(f"Polymarket: fetched {len(all_markets)} active sports markets")
         return all_markets
 
+    def get_market_price(self, question_keyword: str) -> Optional[Dict]:
+        """
+        Search for a market by keyword and return pricing for the best match.
+
+        Returns {question, yes_price, no_price, volume} or None if no liquid match found.
+        """
+        try:
+            data = self._get("/markets", {"q": question_keyword, "limit": 5})
+            markets = data if isinstance(data, list) else []
+            for m in markets:
+                if float(m.get("liquidityNum") or m.get("liquidity") or 0) < 100:
+                    continue
+                outcome_prices = m.get("outcomePrices")
+                if isinstance(outcome_prices, str):
+                    import json
+                    outcome_prices = json.loads(outcome_prices)
+                if not outcome_prices or len(outcome_prices) < 2:
+                    continue
+                try:
+                    yes_price = float(outcome_prices[0])
+                    no_price = float(outcome_prices[1])
+                except (ValueError, TypeError):
+                    continue
+                if yes_price <= 0 or no_price <= 0:
+                    continue
+                return {
+                    "question": m.get("question", ""),
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "volume": float(m.get("volume") or 0),
+                }
+        except Exception as e:
+            logger.error(f"Polymarket get_market_price failed for '{question_keyword}': {e}")
+        return None
+
+    def get_active_markets(self, limit: int = 50) -> List[Dict]:
+        """
+        Return a list of active markets with basic pricing info.
+
+        Returns list of {ticker, question, yes_price, no_price}.
+        """
+        import json
+        try:
+            data = self._get("/markets", {"active": "true", "limit": limit})
+            markets = data if isinstance(data, list) else []
+            result = []
+            for m in markets:
+                outcome_prices = m.get("outcomePrices")
+                if isinstance(outcome_prices, str):
+                    outcome_prices = json.loads(outcome_prices)
+                if not outcome_prices or len(outcome_prices) < 2:
+                    continue
+                try:
+                    yes_price = float(outcome_prices[0])
+                    no_price = float(outcome_prices[1])
+                except (ValueError, TypeError):
+                    continue
+                if yes_price <= 0 or no_price <= 0:
+                    continue
+                result.append({
+                    "ticker": m.get("conditionId", m.get("slug", "")),
+                    "question": m.get("question", ""),
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Polymarket get_active_markets failed: {e}")
+            return []
+
     def parse_market_odds(self, market: Dict) -> Optional[Dict]:
         """
         Parse a Polymarket market dict into a standardized odds record.

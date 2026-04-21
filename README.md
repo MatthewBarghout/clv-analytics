@@ -1,19 +1,19 @@
 # CLV Analytics Platform
 
-A quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, applies an ensemble ML model to predict line movement, surfaces +EV opportunities with systematic bankroll management, and monitors live arbitrage between traditional sportsbooks and the Kalshi prediction market.
+A production-grade quantitative sports betting analytics system built to detect and exploit Closing Line Value (CLV) in real-time. The platform ingests live odds from multiple sportsbooks, runs an ensemble ML model to predict line movement, surfaces +EV opportunities with systematic bankroll management, monitors live arbitrage between sportsbooks and prediction markets, and operates a paper trading engine that cross-references Kalshi prices against Polymarket and Metaculus forecasts.
 
 ---
 
 ## What is CLV?
 
-Closing Line Value measures whether you secured better odds than the market's final assessment. Consistently beating the closing line is the single most reliable indicator of long-term profitability in sports betting — equivalent to consistently buying below fair value in financial markets.
+Closing Line Value measures whether you secured better odds than the market's final consensus. Consistently beating the closing line is the single most reliable indicator of long-term profitability in sports betting — equivalent to consistently buying below fair value in financial markets.
 
 **Example:**
 - You bet Lakers +200 (3.00 decimal) at 10:00 AM
 - Line closes at +180 (2.80 decimal)
 - Your CLV: **+2.38%** — you outpriced the market
 
-Replicate this across hundreds of bets with disciplined sizing, and the edge compounds.
+Replicate this across hundreds of bets with disciplined sizing and the edge compounds.
 
 ---
 
@@ -22,22 +22,22 @@ Replicate this across hundreds of bets with disciplined sizing, and the edge com
 ```
 Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ──►  React Dashboard
                                     │
-                          ┌─────────┴─────────┐
-                     ML Pipeline         Arb Engine
-                  (XGBoost + RF)        (Kalshi)
-                          │
-                   Opportunity Engine
-                 (CLV + EV + Tracking)
+                 ┌──────────────────┼───────────────────────┐
+            ML Pipeline         Arb Engine          PM Signal Engine
+         (XGBoost + RF)         (Kalshi)        (Kalshi × Polymarket
+                │                                   × Metaculus)
+       Opportunity Engine
+     (CLV + EV + Tracking)
 ```
 
-**Data Flow:**
-1. Scheduled collectors poll opening and closing lines from multiple sportsbooks
-2. Background scheduler polls Kalshi every 5 minutes for prediction market prices
-3. Lines stored in PostgreSQL with composite indexes for time-series queries
+**Data flow:**
+1. launchd collectors pull opening lines at 10 AM and closing lines before games
+2. APScheduler polls Kalshi every 5 minutes for arb spreads
+3. APScheduler polls Kalshi every 10 minutes for cross-platform signal generation
 4. ML ensemble predicts line movement direction and magnitude
 5. CLV engine computes realized edge vs closing odds
-6. Arb calculator identifies spread between sportsbook and prediction market implied odds
-7. Dashboard surfaces opportunities, performance analytics, bankroll projections, and live arb feeds
+6. Best EV+ picks are snapshotted at 11 AM and settled at 3 AM
+7. Paper trades are opened on signal, settled when Kalshi markets resolve
 
 ---
 
@@ -46,21 +46,21 @@ Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ─�
 **Backend**
 | Component | Technology |
 |---|---|
-| API | FastAPI (Python) with in-memory TTL caching |
-| ORM | SQLAlchemy 2.0 with eager-loaded joins (no N+1 queries) |
-| Database | PostgreSQL with composite indexes on hot query paths |
+| API | FastAPI + in-memory TTL caching |
+| ORM | SQLAlchemy 2.0 — explicit JOINs, bulk-fetched dicts, no N+1 queries |
+| Database | PostgreSQL — composite indexes on all hot filter/sort paths |
 | Migrations | Alembic |
-| ML | XGBoost + scikit-learn ensemble, isotonic calibration, walk-forward validation |
-| Scheduling | APScheduler (background polling) + macOS launchd (collection windows) |
+| ML | XGBoost + scikit-learn ensemble, isotonic calibration, walk-forward CV |
+| Scheduling | APScheduler (in-process, polling) + macOS launchd (collection windows) |
 
 **Frontend**
 | Component | Technology |
 |---|---|
-| UI | React 18 + TypeScript |
+| UI | React 18 + TypeScript (strict) |
 | Build | Vite |
 | Charts | Recharts |
 | Styling | Tailwind CSS |
-| Performance | React.memo + useMemo + useCallback throughout; 500ms debounce on sim inputs |
+| Performance | `React.memo` + `useMemo` + `useCallback` throughout; 500ms debounce on sim inputs |
 
 **Infrastructure**
 | Component | Technology |
@@ -76,18 +76,18 @@ Odds API  ──►  Collector  ──►  PostgreSQL  ──►  FastAPI  ─�
 # 1. Start database
 docker-compose up -d
 
-# 2. Run migrations
-alembic upgrade head
+# 2. Apply migrations
+poetry run alembic upgrade head
 
 # 3. Configure environment
 cp .env.example .env
-# Set ODDS_API_KEY, KALSHI_API_KEY (optional) in .env
+# Set ODDS_API_KEY, KALSHI_API_KEY, DATABASE_URL
 
-# 4. Install Python dependencies
+# 4. Install dependencies
 poetry install
 
-# 5. (Optional) Train ML model — enables predictions
-poetry run python -m scripts.train_movement_model
+# 5. (Optional) Train ML model — required to enable predictions
+poetry run python -m scripts.train_movement_model --walk-forward
 
 # 6. Launch backend + frontend
 ./start.sh
@@ -98,195 +98,266 @@ poetry run python -m scripts.train_movement_model
 
 ---
 
-## Key Features
+## Features
 
 ### Machine Learning — Line Movement Prediction
 
-Ensemble model combining XGBoost and Random Forest to forecast line movement direction and magnitude before games start. Tightened thresholds reduce over-signaling; only high-confidence, high-EV opportunities surface.
+Ensemble of XGBoost and Random Forest predicting line movement direction and magnitude before game time. Both classifiers are wrapped in `CalibratedClassifierCV` (isotonic, 5-fold) to produce calibrated probability estimates. Class imbalance is corrected via balanced sample weights so the model doesn't ignore "STAY" signals.
 
-**Prediction Thresholds (revised):**
-| Parameter | Value |
-|---|---|
-| Minimum confidence | 62% |
-| Minimum EV score | 2.0 |
-| Minimum predicted movement | ±2.5% (was ±1%) |
-| Minimum time to game | 1 hour |
-| Prediction cap (h2h) | ±8% (was ±10%) |
-| Prediction cap (spreads/totals) | ±4% (was ±5%) |
+**Current thresholds (do not loosen without walk-forward evidence):**
+| Parameter | Value | Rationale |
+|---|---|---|
+| Minimum confidence | 62% | Calibrated probability floor |
+| Minimum EV score | 2.0 | Filters noise before surfacing picks |
+| Minimum predicted movement | ±2.5% | Below this is within model uncertainty |
+| Minimum time to game | 1 hour | Line has already moved if less |
+| Prediction cap (h2h) | ±8% | Prevents over-sized signals |
+| Prediction cap (spreads/totals) | ±4% | Tighter due to noisier markets |
 
-**Top Predictive Features:**
-1. Consensus line
-2. Opening price
-3. Line spread
-4. Distance from consensus
-5. Hours to game
+**Current validated accuracy (walk-forward, 5 chronological folds):**
+- 56.6% ± 0.7% vs 40.1% baseline
+- Consistent across all folds — model generalizes across time
 
-**Model Details:**
-- Temporal features: movement velocity, price volatility, cumulative drift, direction change counts
-- Bookmaker features: sharp book detection (Pinnacle weighting), steam move signals, relative positioning
-- Per-market ensemble weights optimized via grid search on validation set
-- Walk-forward (expanding window) cross-validation for time-series integrity
+**Feature groups:**
+- *Temporal:* movement velocity, price volatility, cumulative drift, direction change count
+- *Bookmaker:* sharp-book positioning (Pinnacle), steam move signals, consensus distance, relative spread
+
+**Training:**
+```bash
+poetry run python -m scripts.train_movement_model --walk-forward
+```
 
 ### Best EV+ Opportunities
 
-Today-only filtered view of the highest-confidence, highest-EV picks from the current day's upcoming slate.
+Today-only filtered view of the highest-confidence picks from the day's upcoming slate. Cards grouped by sport with Quarter-Kelly stake sizing.
 
-- Filtered to today's games only (`today_only=true`)
-- Minimum confidence 62%, minimum EV score 2.0, at least 1 hour to game
-- Quarter-Kelly stake sizing recommendation per pick
-- "Save for Tracking" button snapshots today's picks to the `BestEVPick` table
-- Picks are settled automatically after games complete
+- Filters: today's games only, confidence ≥ 62%, EV score ≥ 2.0, ≥ 1 hour to game
+- Deduplicates on `(game_id, market_type, outcome_name)` — multiple bookmaker snapshots collapse to one card keeping the highest EV
+- "Save for Tracking" snapshots today's picks to `BestEVPick` with lifecycle tracking
+- Settlement runs automatically at 3 AM after scores are ingested
+
+### Best EV+ Lifecycle
+
+```
+10:00 AM  — Opening odds collected (launchd)
+11:00 AM  — save_daily_picks() snapshots top picks → BestEVPick (result=pending)
+  2:00 AM — fetch_game_scores() ingests final scores
+  3:00 AM — settle_picks() settles all pending picks → BestEVPick (result=win/loss/push)
+```
+
+All three market types settle correctly:
+- **h2h** — compares outcome to `BettingOutcome.winner`
+- **spreads** — `cover_margin = team_margin + point_line`; positive = win
+- **totals** — `BettingOutcome.total_points` vs `point_line`
 
 ### Prediction Market Arbitrage — Markets Tab
 
-Live monitoring of spread between traditional sportsbook odds and Kalshi prediction market implied probabilities.
+Live monitoring of spread between traditional sportsbook implied probabilities and Kalshi.
 
-- Polls Kalshi every 5 minutes via APScheduler (series-based fetch for NBA, NFL, MLB, NHL, NCAAB, NCAAF, Soccer, MMA)
-- Falls back to keyword scan if all series are off-season
-- Uses bid/ask midpoint for more accurate probability estimates (better than bid-only)
-- Auto-refreshes in the dashboard every 60 seconds
-- Color-coded by spread: green ≥2%, yellow 1–2%, gray <1%
-- Summary bar: total opportunities, strong arb count, best spread
+- Polls Kalshi every 5 minutes via APScheduler
+- Series-based fetch (KXNBAGAME, KXMLBGAME, KXNHLGAME, KXNFLGAME, KXNBAPTS, KXNBAREB, KXMMA, KXSOCCER) with keyword scan fallback when all series are off-season
+- Bid/ask midpoint used for probability estimates (more accurate than bid-only)
+- Auto-refreshes every 60 seconds; manual "Refresh Now" triggers a fresh backend poll
+- Color-coded: green ≥ 2%, yellow 1–2%, gray < 1%
 - 7-day historical trend chart of average and max spreads
-- Manual "Refresh Now" triggers a fresh backend poll
 
-**Arb logic:**
 ```
-arb_spread = (Kalshi implied probability − SB implied probability) × 100
-Positive spread = Kalshi assigns higher probability than sportsbook → value on SB side
+arb_spread = (Kalshi implied prob − SB implied prob) × 100
+Positive spread → Kalshi assigns higher probability than sportsbook
 ```
 
-**Environment variable:**
+### Prediction Market Paper Trading — Pred Markets Tab
+
+Cross-platform signal engine that compares Kalshi prices against Polymarket and Metaculus, opens simulated trades on divergence, and settles them when markets resolve.
+
+**Signal generation (every 10 minutes):**
+1. Fetch all active Kalshi sports markets
+2. For each market, query Polymarket (gamma-api.polymarket.com) and Metaculus for the same event
+3. Compute weighted fair value: Polymarket 45%, Metaculus 35%, Kalshi momentum 20%
+4. If `max(edge_YES, edge_NO) > 6%` → open a paper trade
+5. Skip if an open position already exists for that ticker
+
+**Fair value redistribution:** if a source is unavailable (returns None), its weight is redistributed proportionally to the present sources so the estimate stays calibrated.
+
+**Position sizing (Quarter-Kelly):**
 ```
-KALSHI_API_KEY=<your-key>    # Required for Kalshi auth
+size = (edge / (1 − entry_price)) × 0.25 × $1000
+Clamped: $25 minimum, $200 maximum
 ```
 
-### Bankroll Simulation — Aligned with Best EV+
+**Settlement (daily 3:15 AM):**
+- Fetches Kalshi market status via API
+- Settles when `status == "finalized"` and `result` is `"yes"` or `"no"`
+- WIN pnl: `(1.0 − entry_price) × (size_usd / entry_price)`
+- LOSS pnl: `−size_usd`
 
-Multi-strategy simulator with a critical alignment fix: the simulation defaults to **Best EV+ picks only**, ensuring the bankroll curve reflects the same bets displayed in the Best EV+ tab.
+**Dashboard (Pred Markets tab):**
+- Stats bar: total trades, open positions, win rate, total P&L
+- Open positions table: ticker, event, side, entry price, size, strategy
+- Trade history table: same columns + resolution, realized P&L, entry/exit dates
+- Recent signals table: Kalshi vs Polymarket vs Metaculus with divergence score
 
-**Data Source Toggle:**
+No API keys required — Polymarket and Metaculus are public APIs.
+
+### Multi-Sport Collection
+
+| Sport | Key | Score Source |
+|---|---|---|
+| NBA | `basketball_nba` | NBA.com API (free) |
+| MLB | `baseball_mlb` | MLB Stats API — statsapi.mlb.com (free) |
+
+NFL to be added when preseason begins (August). Adding a new sport requires one line in `collect_odds.py` and routing in `fetch_game_scores.py` — no DB migrations, no model changes.
+
+### Bankroll Simulation
+
+Multi-strategy simulator aligned 1:1 with Best EV+ picks.
+
+**Data source toggle:**
 | Source | Description |
 |---|---|
-| Best EV+ Picks Only | Only picks saved via the daily Best EV+ snapshot (default) |
-| All Tracked Bets | Historical CLV-tracked opportunities from all reports |
+| Best EV+ Picks Only | Only picks saved via the daily 11 AM snapshot (default) |
+| All Tracked Bets | Historical CLV opportunities from all reports |
 
-**Sizing Strategies:**
+**Sizing strategies:**
 | Strategy | Description |
 |---|---|
 | Fixed Unit | Flat dollar amount per bet |
-| Fractional | Fixed % of current bankroll |
-| Kelly Criterion | f* = (bp − q) / b — mathematically optimal |
+| Fractional Kelly | Fixed % of current bankroll |
+| Full Kelly | f* = (bp − q) / b |
 | Half Kelly | 50% Kelly for reduced variance |
-| Confidence-Weighted | Scale by ML model confidence score |
+| Confidence-Weighted | Scales stake by ML model confidence |
 
-**Risk Metrics:** Sharpe Ratio, Sortino Ratio, max drawdown, P&L curve, per-bookmaker and per-market breakdown.
+Risk metrics: Sharpe ratio, Sortino ratio, max drawdown, P&L curve, per-bookmaker and per-market breakdown.
 
 ### CLV Calculation Engine
 
-Converts decimal odds to implied probabilities, computes entry vs closing edge, and aggregates by bookmaker and market type to identify the sharpest books and best entry windows.
+Converts decimal odds to implied probabilities, computes entry vs closing edge, and aggregates across bookmakers and market types.
 
 ```python
 from src.analyzers.clv_calculator import CLVCalculator
 
-calc = CLVCalculator()
-clv = calc.calculate_clv(entry_odds=2.1, closing_odds=1.95)
+clv = CLVCalculator().calculate_clv(entry_odds=2.1, closing_odds=1.95)
 # Returns: +3.66%
 ```
 
-### Daily Performance Reports
+### Daily Reports
 
-Automated reports generated at 9 AM showing previous day's complete performance.
+Automated report covering all completed games from the prior day.
 
-**Report Contents:**
-- CLV analysis for all completed games
-- Top opportunities by CLV percentage
+- CLV analysis across all bookmakers and market types
+- Top opportunities ranked by CLV percentage
 - Win/loss/push breakdown with profit calculations
-- ROI by bookmaker and market type
+- ROI by bookmaker, ROI by market type
 
 ### My Bets Tracker
 
-Manual bet tracking interface with personal P&L dashboard.
+Manual bet tracking with personal P&L dashboard.
 
 - Add bets with game, bookmaker, market type, odds, and stake
 - One-click settle as win / loss / push
-- Summary cards: record, win rate, total profit, ROI
+- Summary: record, win rate, total profit, ROI
 
-### Automated Data Collection
+---
+
+## Automated Schedule
 
 ```
-2:00 AM   — Fetch final game scores
-3:00 AM   — Calculate ROI on tracked bets
-9:00 AM   — Generate daily CLV report; save Best EV+ picks
-9:30 AM   — Track new opportunities from report
-10:30 AM  — Schedule closing line collection batches
-Every 5m  — Poll Kalshi for arb opportunities (APScheduler)
+10:00 AM  — Collect opening odds (NBA + MLB)           launchd
+11:00 AM  — Snapshot Best EV+ picks                    launchd
+ 2:00 AM  — Fetch game scores (NBA + MLB)              launchd
+ 3:00 AM  — Settle Best EV+ picks                      launchd
+ 3:15 AM  — Settle paper trades                        APScheduler
+ Every 5m — Poll Kalshi for arb opportunities          APScheduler
+Every 10m — Collect PM prices + generate signals       APScheduler
 ```
+
+---
+
+## Environment Variables
+
+```bash
+ODDS_API_KEY=<required>       # The Odds API — odds ingestion
+KALSHI_API_KEY=<required>     # Kalshi RSA key ID (KALSHI_KEY_ID)
+KALSHI_PRIVATE_KEY=<required> # Kalshi RSA private key PEM
+DATABASE_URL=<postgres dsn>   # e.g. postgresql://user:pass@localhost/clv
+```
+
+Polymarket and Metaculus are public APIs — no keys needed.
 
 ---
 
 ## API Reference
 
-### Core Endpoints
+### Core
 
 | Method | Endpoint | Description |
 |---|---|---|
+| `GET` | `/api/health` | Health check |
 | `GET` | `/api/stats` | CLV statistics (cached 5 min) |
-| `GET` | `/api/games` | Game list with odds snapshots |
-| `GET` | `/api/bookmakers` | Bookmaker stats (cached 10 min) |
+| `GET` | `/api/games` | Games with odds snapshots |
+| `GET` | `/api/bookmakers` | Bookmaker performance (cached 10 min) |
 | `GET` | `/api/clv-history` | CLV trend over time (cached 5 min) |
 | `GET` | `/api/daily-reports` | Daily CLV reports |
 | `GET` | `/api/bankroll-simulation` | P&L simulation (`source=best_ev\|all`) |
-| `GET` | `/api/user-bets` | Personal bet tracking |
+| `GET` | `/api/user-bets` | Personal bet list |
+| `POST` | `/api/user-bets` | Add a bet |
+| `PATCH` | `/api/user-bets/{id}` | Settle a bet |
 
-### ML Endpoints
+### ML
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/ml/stats` | Model performance metrics |
-| `GET` | `/api/ml/best-opportunities` | Today's top +EV picks (`today_only`, `min_ev_score`, `min_confidence`) |
-| `GET` | `/api/ml/best-ev-history` | Historical Best EV picks with settled results |
-| `POST` | `/api/ml/save-daily-picks` | Snapshot today's picks to tracking table |
-| `POST` | `/api/ml/settle-picks` | Settle pending picks against outcomes |
-| `GET` | `/api/ml/predictions/{game_id}` | Predicted vs actual line movement |
-| `POST` | `/api/ml/retrain` | Retrain with latest data |
+| `GET` | `/api/ml/best-opportunities` | Today's top +EV picks (`today_only`, `min_ev_score`, `min_hours_to_game`) |
+| `GET` | `/api/ml/best-ev-history` | Historical Best EV picks with outcomes |
+| `POST` | `/api/ml/save-daily-picks` | Snapshot today's picks |
+| `POST` | `/api/ml/settle-picks` | Settle pending picks |
+| `POST` | `/api/ml/retrain` | Retrain model with latest data |
 | `GET` | `/api/ml/feature-importance` | Feature importance rankings |
-| `GET` | `/api/ml/opportunities` | All filterable ML opportunities |
+| `GET` | `/api/ml/predictions/{game_id}` | Predicted vs actual line movement |
+| `GET` | `/api/ml/opportunities` | Filterable full opportunity list |
 
-### Prediction Market Endpoints
+### Prediction Markets
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/arb-opportunities` | Active arb opportunities (sorted by spread) |
-| `GET` | `/api/arb-history` | Historical arb data with date range filter |
-| `POST` | `/api/arb/refresh` | Manually trigger a fresh poll |
+| `GET` | `/api/arb-opportunities` | Active Kalshi arb opps (sorted by spread) |
+| `GET` | `/api/arb-history` | Historical arb data |
+| `POST` | `/api/arb/refresh` | Trigger fresh Kalshi poll |
+| `GET` | `/api/paper-trades` | Paper trade list (`is_open`, `strategy_tag`, `limit`) |
+| `GET` | `/api/paper-trades/stats` | Aggregate stats (win rate, P&L, by-strategy, by-month) |
+| `GET` | `/api/cross-platform-signals` | Recent signals sorted by divergence (`min_divergence`) |
 
 ---
 
 ## Database Schema
 
 ```
-Game ──── Team (home + away)
- │
- ├── OddsSnapshot (time-series per bookmaker)
- ├── ClosingLine (final line per bookmaker)
- └── BettingOutcome (win/loss/push result)
+Sport ──── Team ──── Game
+                      │
+                      ├── OddsSnapshot      (time-series per bookmaker)
+                      ├── ClosingLine        (final line per bookmaker)
+                      └── BettingOutcome     (win/loss/push result)
 
-DailyCLVReport ──── OpportunityPerformance (CLV-tracked bets)
+DailyCLVReport ──── OpportunityPerformance  (CLV-tracked bet outcomes)
 
-BestEVPick (ML-selected daily picks with lifecycle tracking)
-
-PredictionMarketArb (Kalshi vs sportsbook spreads)
-
-UserBet (personal tracking, independent of ML pipeline)
+BestEVPick                                  (daily ML picks, lifecycle: pending → settled)
+PredictionMarketArb                         (Kalshi vs sportsbook spreads)
+KalshiMarketPrice                           (time-series price snapshots per ticker)
+CrossPlatformSignal                         (Kalshi × Polymarket × Metaculus divergence)
+PaperTrade                                  (simulated trades from signal engine)
+UserBet                                     (personal tracking, independent of ML)
 ```
 
-**Indexes (composite, on hot paths):**
-- `Game(completed, commence_time)`
-- `OpportunityPerformance(report_id, game_id, result)`
-- `OpportunityPerformance(settled_at, result)`
-- `BestEVPick(report_date)`, `BestEVPick(result, report_date)`
-- `PredictionMarketArb(timestamp, is_active)`, `PredictionMarketArb(market_source, arb_spread)`
+**Key composite indexes:**
+- `Game(completed, commence_time)`, `Game(sport_id, commence_time)`
+- `OddsSnapshot(game_id, bookmaker_id, market_type, timestamp)` — unique constraint
+- `BestEVPick(result, report_date)`, `BestEVPick(game_id)`
+- `PredictionMarketArb(timestamp, is_active)`, `(market_source, arb_spread)`
+- `KalshiMarketPrice(market_ticker, timestamp)`
+- `CrossPlatformSignal(kalshi_ticker, timestamp)`, `(divergence_score)`
+- `PaperTrade(market_ticker, is_open)`, `(strategy_tag, resolution_result)`
+- `OpportunityPerformance(report_id, game_id, result)`, `(settled_at, result)`
 - `UserBet(result, game_date)`
 
 ---
@@ -296,84 +367,91 @@ UserBet (personal tracking, independent of ML pipeline)
 ```
 src/
 ├── api/
-│   ├── main.py               # Core FastAPI app — CLV, games, reports, arb endpoints
-│   └── ml_endpoints.py       # ML router — predictions, opportunities, Best EV tracking
+│   ├── main.py                  # Core FastAPI app — CLV, arb, paper trades, bankroll
+│   ├── ml_endpoints.py          # ML router — predictions, Best EV+ lifecycle
+│   └── schemas.py               # Pydantic response schemas
 ├── analyzers/
-│   ├── clv_calculator.py     # CLV calculation logic
-│   ├── features.py           # ML feature engineering (temporal + bookmaker)
-│   ├── movement_predictor.py # Ensemble model with tightened prediction caps
-│   ├── bet_settlement.py     # Bet outcome tracking
-│   └── bet_sizing.py         # Kelly, fractional, confidence-weighted sizing
+│   ├── clv_calculator.py        # CLV % computation (entry vs closing odds)
+│   ├── features.py              # Feature engineering — temporal + bookmaker signals
+│   ├── movement_predictor.py    # XGBoost+RF ensemble, calibration, caps, walk-forward
+│   ├── pm_signal_generator.py   # Cross-platform signal engine (Kalshi × Poly × Meta)
+│   ├── bet_settlement.py        # Bet outcome tracking
+│   └── bet_sizing.py            # Kelly, fractional, confidence-weighted sizing
 ├── collectors/
-│   ├── odds_api_client.py    # The Odds API client
-│   ├── odds_proccessor.py    # Processing & storage pipeline
-│   ├── kalshi_client.py      # Kalshi prediction market REST API client (series + keyword fetch)
-│   ├── arb_calculator.py     # Arb spread calculation and opportunity detection
-│   └── nba_scores_client.py  # NBA.com scores fetcher
-├── models/
-│   └── database.py           # SQLAlchemy models + composite indexes
-└── utils/                    # Notifications, utilities
+│   ├── odds_api_client.py       # The Odds API client
+│   ├── odds_proccessor.py       # Odds → DB pipeline (sport-agnostic)
+│   ├── kalshi_client.py         # Kalshi REST API — RSA-PSS auth, series → events → markets
+│   ├── polymarket_client.py     # Polymarket Gamma API — public, no auth
+│   ├── metaculus_client.py      # Metaculus API — community_prediction median
+│   ├── arb_calculator.py        # Arb spread calc + fuzzy event matching
+│   ├── nba_scores_client.py     # NBA.com scores fetcher
+│   └── mlb_scores_client.py     # MLB Stats API client (statsapi.mlb.com)
+└── models/
+    └── database.py              # All SQLAlchemy models + composite indexes
 
 frontend/src/
-├── Dashboard.tsx             # Orchestrator — state, fetching, tab routing
+├── Dashboard.tsx                # Orchestrator — tab routing, state, lazy loading
 └── components/
-    ├── MLStats.tsx                # ML model performance + feature importance chart
-    ├── CLVOverview.tsx            # Market breakdown + CLV trend over time
-    ├── BookmakerPerformance.tsx   # Bookmaker comparison table
-    ├── DailyReports.tsx           # Daily reports with opportunity expansion
-    ├── BankrollSimulator.tsx      # Simulation UI with source toggle + debounce
-    ├── BestEVOpportunities.tsx    # Today's best picks with Kelly sizing
-    ├── ArbOpportunities.tsx       # Live Kalshi arb tab
-    ├── MyBets.tsx                 # Personal bet tracking dashboard
-    ├── OpportunitiesExplorer.tsx  # Filterable opportunities table
-    ├── GameDetailsModal.tsx       # Game odds snapshot detail view
-    ├── GameAnalysis.tsx           # Per-game CLV analysis
-    ├── GlassCard.tsx              # Reusable card component
-    ├── TimeRangeSelector.tsx      # Date range filter control
-    └── AnimatedCounter.tsx        # Animated metric display
+    ├── MLStats.tsx              # Model performance + feature importance
+    ├── CLVOverview.tsx          # Market breakdown + CLV trend chart
+    ├── BookmakerPerformance.tsx # Bookmaker comparison table
+    ├── DailyReports.tsx         # Daily reports with expandable opportunity rows
+    ├── BankrollSimulator.tsx    # P&L sim with source toggle + debounced inputs
+    ├── BestEVOpportunities.tsx  # Today's picks — card layout, sport filter, grouped
+    ├── ArbOpportunities.tsx     # Kalshi arb tab — 60s auto-refresh, history chart
+    ├── PredictionMarkets.tsx    # Paper trading — positions, history, signals
+    ├── MyBets.tsx               # Personal bet tracker
+    ├── OpportunitiesExplorer.tsx
+    ├── GameDetailsModal.tsx
+    ├── GameAnalysis.tsx
+    ├── GlassCard.tsx
+    ├── TimeRangeSelector.tsx
+    └── AnimatedCounter.tsx
 
 scripts/
-├── collect_odds.py                  # Opening + closing line collection
-├── schedule_game_batches.py         # Dynamic launchd batch scheduler
+├── collect_odds.py                  # Multi-sport odds collection (NBA + MLB)
+├── fetch_game_scores.py             # Score ingestion — routes by sport key
 ├── analyze_daily_clv.py             # Daily report generation
-├── fetch_game_scores.py             # Score ingestion
 ├── track_opportunity_performance.py # Bet lifecycle tracking
 ├── update_report_profit_stats.py    # ROI calculations
+├── schedule_game_batches.py         # Dynamic launchd batch scheduler
 ├── train_movement_model.py          # Walk-forward model training
-└── auto_retrain.py                  # Auto-retraining on performance degradation
+└── auto_retrain.py                  # Auto-retraining on degradation
 
-models/                     # Trained ML artifacts (git-ignored)
-migrations/                 # Alembic schema migrations
-launchd/                    # macOS scheduling plists
+migrations/                  # Alembic migration history
+models/                      # Trained ML artifacts (git-ignored)
+launchd/                     # macOS scheduling plists
 ```
 
 ---
 
-## Performance Optimizations
+## Performance Notes
 
 ### Backend
-- **N+1 elimination** — All ORM loops use pre-fetched bulk dictionaries instead of per-row queries
-- **In-memory TTL cache** — Stats, bookmaker data, and CLV history cached in-process (5–10 min TTL)
-- **Composite indexes** — Added on all major filter + sort columns in analytical queries
-- **Efficient aggregation** — `statistics.median()`, single-pass accumulators, `SELECT COUNT(*)`
+- N+1 queries eliminated — pre-fetched bulk dicts for all ORM loops, explicit JOINs when related data is always needed, `sqlalchemy.orm.aliased` when joining same table twice
+- In-memory TTL cache on `/api/stats` (5 min), `/api/bookmakers` (10 min), `/api/clv-history` (5 min)
+- `SELECT COUNT(*)` not `len(query.all())`; `statistics.median()` not manual sort
 
 ### Frontend
-- **Component splitting** — Dashboard split into 8 self-contained components
-- **Memoization** — `React.memo` on all display components; `useMemo` on sort/chart computations
-- **Debounced simulation** — Bankroll sim fires 500ms after last input change
-- **Opportunity cache** — Expanded report rows cache in `Map` ref — no duplicate requests
+- All display components wrapped in `React.memo`
+- Sort and chart data memoized with `useMemo`
+- Bankroll sim inputs debounced 500ms via `useRef + setTimeout`
+- Expanded report rows cached in a `Map` ref — no duplicate fetches
+- Games tab loads lazily on first visit via `loadedTabs` ref
 
 ---
 
-## Changelog
+## ML Pipeline Fixes (applied — do not revert)
 
-### Latest Release
-- **Prediction Market Arbitrage:** Live Kalshi scraping with series-based market fetch (NBA/NFL/MLB/NHL/etc.), 5-minute background polling, bid/ask midpoint probability estimates, Markets tab with pulsing indicator when opportunities exist
-- **ML Accuracy Improvements:** Raised minimum movement threshold to ±2.5%, confidence floor to 62%, EV score floor to 2.0; tightened prediction caps (h2h: ±8%, spreads/totals: ±4%) to eliminate low-conviction noise
-- **Best EV+ / Bankroll Alignment:** Best EV+ tab shows today-only picks; bankroll sim defaults to Best EV+ picks as data source, ensuring 1:1 alignment between what you see and what is simulated
-- **BestEVPick Tracking:** Daily picks saved to dedicated table with lifecycle settlement against game outcomes
+| Bug | Fix |
+|---|---|
+| Live prediction features were zeroed out | Call `calculate_temporal_features()` + `calculate_bookmaker_features()` before every prediction |
+| Train/test split leaked future into training | Chronological cut at 80th percentile by `snapshot_timestamp` |
+| Spread + total picks never settled | Added `point_line` column to `BestEVPick`; full settlement logic for all market types |
+| Confidence scores were uncalibrated | Wrapped both classifiers in `CalibratedClassifierCV(cv=5, method='isotonic')` |
+| STAY class chronically under-predicted | `class_weight='balanced'` on RF; `compute_sample_weight('balanced')` on XGB |
 
 ---
 
-**Stack:** Python · TypeScript · React · PostgreSQL · FastAPI · XGBoost · Docker
-**Concepts:** Time-series analytics · Market efficiency · Statistical edge detection · Quantitative position sizing · Prediction market arbitrage · Automated systems
+**Stack:** Python · TypeScript · React · PostgreSQL · FastAPI · XGBoost · Docker  
+**Concepts:** Closing line value · Line movement prediction · Prediction market arbitrage · Cross-platform signal generation · Quantitative position sizing · Walk-forward validation

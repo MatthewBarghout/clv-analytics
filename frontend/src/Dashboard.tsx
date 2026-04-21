@@ -10,6 +10,7 @@ import { BankrollSimulator } from './components/BankrollSimulator';
 import { MyBets } from './components/MyBets';
 import { BestEVOpportunities } from './components/BestEVOpportunities';
 import { ArbOpportunities } from './components/ArbOpportunities';
+import { PredictionMarkets } from './components/PredictionMarkets';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -72,7 +73,7 @@ interface FeatureImportance {
 
 const API_BASE = 'http://localhost:8000/api';
 
-type View = 'overview' | 'best-ev' | 'games' | 'reports' | 'bankroll' | 'my-bets' | 'markets';
+type View = 'overview' | 'best-ev' | 'games' | 'reports' | 'bankroll' | 'my-bets' | 'markets' | 'pred-markets';
 type SportFilter = 'all' | 'nba' | 'mlb';
 type GamesTab = 'recent' | 'history';
 
@@ -316,6 +317,11 @@ export default function Dashboard() {
                 active={view === 'markets'}
                 onClick={() => setView('markets')}
               />
+              <NavTab
+                label="Pred Markets"
+                active={view === 'pred-markets'}
+                onClick={() => setView('pred-markets')}
+              />
             </div>
           </div>
 
@@ -457,6 +463,13 @@ export default function Dashboard() {
         {view === 'markets' && (
           <div className="bg-white/4 rounded-xl border border-white/8 p-5">
             <ArbOpportunities />
+          </div>
+        )}
+
+        {/* PRED MARKETS ──────────────────────────────────────────────────── */}
+        {view === 'pred-markets' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <PredictionMarkets />
           </div>
         )}
       </main>

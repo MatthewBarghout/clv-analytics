@@ -32,7 +32,7 @@ from src.api.schemas import (
     OddsSnapshotResponse,
 )
 from src.api.ml_endpoints import router as ml_router
-from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, PredictionMarketArb, Sport, Team, UserBet
+from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, CrossPlatformSignal, DailyCLVReport, Game, KalshiMarketPrice, OddsSnapshot, OpportunityPerformance, PaperTrade, PredictionMarketArb, Sport, Team, UserBet
 
 # Load environment variables
 load_dotenv()
@@ -1805,6 +1805,314 @@ def _run_arb_poll():
         db.close()
 
 
+@app.get("/api/paper-trades")
+async def get_paper_trades(
+    is_open: bool = None,
+    strategy_tag: str = None,
+    limit: int = 50,
+):
+    """List paper trades, optionally filtered by open status or strategy."""
+    db = get_db()
+    try:
+        stmt = select(PaperTrade).order_by(PaperTrade.entry_timestamp.desc())
+        if is_open is not None:
+            stmt = stmt.where(PaperTrade.is_open == is_open)
+        if strategy_tag:
+            stmt = stmt.where(PaperTrade.strategy_tag == strategy_tag)
+        stmt = stmt.limit(limit)
+        trades = db.execute(stmt).scalars().all()
+        return [
+            {
+                "id": t.id,
+                "market_ticker": t.market_ticker,
+                "event_description": t.event_description,
+                "side": t.side,
+                "entry_price": float(t.entry_price),
+                "size_usd": float(t.size_usd),
+                "entry_timestamp": t.entry_timestamp.isoformat(),
+                "exit_price": float(t.exit_price) if t.exit_price is not None else None,
+                "exit_timestamp": t.exit_timestamp.isoformat() if t.exit_timestamp else None,
+                "resolution_result": t.resolution_result,
+                "pnl": float(t.pnl) if t.pnl is not None else None,
+                "strategy_tag": t.strategy_tag,
+                "is_open": t.is_open,
+            }
+            for t in trades
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching paper trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/paper-trades/stats")
+async def get_paper_trade_stats():
+    """Aggregate stats for all paper trades."""
+    db = get_db()
+    try:
+        all_trades = db.execute(select(PaperTrade)).scalars().all()
+        settled = [t for t in all_trades if not t.is_open and t.resolution_result]
+        wins = [t for t in settled if t.resolution_result == "WIN"]
+        total_pnl = sum(float(t.pnl) for t in settled if t.pnl is not None)
+        win_rate = len(wins) / len(settled) * 100 if settled else 0.0
+        avg_pnl = total_pnl / len(settled) if settled else 0.0
+
+        pnl_by_strategy: dict = {}
+        for t in settled:
+            tag = t.strategy_tag
+            if tag not in pnl_by_strategy:
+                pnl_by_strategy[tag] = {"pnl": 0.0, "trades": 0}
+            pnl_by_strategy[tag]["pnl"] += float(t.pnl) if t.pnl is not None else 0.0
+            pnl_by_strategy[tag]["trades"] += 1
+
+        by_month: dict = {}
+        for t in settled:
+            month_key = t.entry_timestamp.strftime("%Y-%m")
+            if month_key not in by_month:
+                by_month[month_key] = {"pnl": 0.0, "trades": 0, "wins": 0}
+            by_month[month_key]["pnl"] += float(t.pnl) if t.pnl is not None else 0.0
+            by_month[month_key]["trades"] += 1
+            if t.resolution_result == "WIN":
+                by_month[month_key]["wins"] += 1
+
+        trades_by_month = [
+            {"month": k, **v} for k, v in sorted(by_month.items())
+        ]
+
+        return {
+            "total_trades": len(all_trades),
+            "open_trades": sum(1 for t in all_trades if t.is_open),
+            "win_rate": round(win_rate, 1),
+            "total_pnl": round(total_pnl, 2),
+            "avg_pnl": round(avg_pnl, 2),
+            "pnl_by_strategy_tag": pnl_by_strategy,
+            "trades_by_month": trades_by_month,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching paper trade stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/cross-platform-signals")
+async def get_cross_platform_signals(
+    limit: int = 20,
+    min_divergence: float = 0.05,
+):
+    """Recent cross-platform signals sorted by divergence score."""
+    db = get_db()
+    try:
+        stmt = (
+            select(CrossPlatformSignal)
+            .where(CrossPlatformSignal.divergence_score >= min_divergence)
+            .order_by(CrossPlatformSignal.divergence_score.desc())
+            .limit(limit)
+        )
+        signals = db.execute(stmt).scalars().all()
+        return [
+            {
+                "id": s.id,
+                "event_description": s.event_description,
+                "kalshi_ticker": s.kalshi_ticker,
+                "kalshi_price": float(s.kalshi_price),
+                "polymarket_price": float(s.polymarket_price) if s.polymarket_price is not None else None,
+                "metaculus_forecast": float(s.metaculus_forecast) if s.metaculus_forecast is not None else None,
+                "divergence_score": round(float(s.divergence_score), 4),
+                "timestamp": s.timestamp.isoformat(),
+            }
+            for s in signals
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching cross-platform signals: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+def _run_pm_price_collection():
+    """
+    Collect Kalshi market prices, generate cross-platform signals, and open paper trades.
+
+    Runs every 10 minutes via APScheduler.
+    """
+    from src.collectors.kalshi_client import KalshiClient
+    from src.analyzers.pm_signal_generator import PMSignalGenerator
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        kalshi = KalshiClient()
+        generator = PMSignalGenerator()
+
+        raw_markets = kalshi.get_sports_markets(limit=200)
+        signal_count = 0
+        price_count = 0
+
+        # Pre-fetch open tickers to avoid duplicate positions
+        open_tickers = set(
+            row[0]
+            for row in db.execute(
+                select(PaperTrade.market_ticker).where(PaperTrade.is_open == True)  # noqa: E712
+            ).all()
+        )
+
+        for raw in raw_markets:
+            parsed = kalshi.parse_market_odds(raw)
+            if not parsed:
+                continue
+
+            ticker = parsed["ticker"]
+            yes_price = parsed["yes_implied_prob"]
+            no_price = parsed["no_implied_prob"]
+            volume = float(raw.get("volume") or 0)
+
+            # Store price snapshot
+            price_rec = KalshiMarketPrice(
+                market_ticker=ticker,
+                yes_price=yes_price,
+                no_price=no_price,
+                volume=volume if volume > 0 else None,
+                timestamp=now,
+            )
+            db.add(price_rec)
+            price_count += 1
+
+            # Generate signal
+            market_for_signal = {
+                "ticker": ticker,
+                "question": parsed.get("title") or parsed.get("market_title", ""),
+                "yes_price": yes_price,
+                "no_price": no_price,
+            }
+            try:
+                signal = generator.generate_signal(market_for_signal)
+            except Exception as e:
+                logger.debug(f"Signal generation failed for {ticker}: {e}")
+                signal = None
+
+            if signal is None:
+                continue
+
+            # Compute consensus for divergence score
+            poly_p = signal.get("polymarket_price")
+            meta_f = signal.get("metaculus_forecast")
+            consensus_vals = [p for p in [poly_p, meta_f] if p is not None]
+            consensus = sum(consensus_vals) / len(consensus_vals) if consensus_vals else yes_price
+            divergence = abs(yes_price - consensus)
+
+            # Store CrossPlatformSignal regardless of position
+            sig_rec = CrossPlatformSignal(
+                event_description=signal["question"][:500],
+                kalshi_ticker=ticker,
+                kalshi_price=yes_price,
+                polymarket_price=poly_p,
+                metaculus_forecast=meta_f,
+                divergence_score=divergence,
+                timestamp=now,
+            )
+            db.add(sig_rec)
+
+            # Open paper trade only if no existing open position for this ticker
+            if ticker not in open_tickers:
+                trade = PaperTrade(
+                    market_ticker=ticker,
+                    event_description=signal["question"][:500],
+                    side=signal["side"],
+                    entry_price=signal["entry_price"],
+                    size_usd=signal["size_usd"],
+                    entry_timestamp=now,
+                    strategy_tag=signal["strategy_tag"],
+                    is_open=True,
+                )
+                db.add(trade)
+                open_tickers.add(ticker)
+                signal_count += 1
+
+        db.commit()
+        logger.info(
+            f"PM price collection: {price_count} prices stored, {signal_count} new paper trades opened"
+        )
+
+    except Exception as e:
+        logger.error(f"PM price collection error: {e}", exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _settle_paper_trades():
+    """
+    Settle open paper trades against resolved Kalshi markets.
+
+    Runs daily at 3:15 AM via APScheduler.
+    """
+    from src.collectors.kalshi_client import KalshiClient
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        kalshi = KalshiClient()
+
+        open_trades = db.execute(
+            select(PaperTrade).where(PaperTrade.is_open == True)  # noqa: E712
+        ).scalars().all()
+
+        settled_count = 0
+        win_count = 0
+        loss_count = 0
+
+        for trade in open_trades:
+            try:
+                market = kalshi.get_market(trade.market_ticker)
+            except Exception as e:
+                logger.debug(f"Failed to fetch market {trade.market_ticker}: {e}")
+                continue
+
+            if not market:
+                continue
+            if market.get("status") != "finalized":
+                continue
+
+            result_str = (market.get("result") or "").lower()
+            resolved_yes = result_str == "yes"
+            resolved_no = result_str == "no"
+
+            if not resolved_yes and not resolved_no:
+                continue
+
+            won = (trade.side == "YES" and resolved_yes) or (trade.side == "NO" and resolved_no)
+            exit_price = 1.0 if won else 0.0
+
+            if won:
+                pnl = (exit_price - trade.entry_price) * (trade.size_usd / trade.entry_price)
+                resolution_result = "WIN"
+                win_count += 1
+            else:
+                pnl = -float(trade.size_usd)
+                resolution_result = "LOSS"
+                loss_count += 1
+
+            trade.is_open = False
+            trade.exit_price = exit_price
+            trade.exit_timestamp = now
+            trade.resolution_result = resolution_result
+            trade.pnl = pnl
+            settled_count += 1
+
+        db.commit()
+        logger.info(
+            f"Paper trade settlement: {settled_count} settled ({win_count} wins, {loss_count} losses)"
+        )
+
+    except Exception as e:
+        logger.error(f"Paper trade settlement error: {e}", exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
 # ============================================================================
 # APScheduler — Background Polling
 # ============================================================================
@@ -1817,8 +2125,20 @@ try:
     # Poll Kalshi + Polymarket every 5 minutes
     _scheduler.add_job(_run_arb_poll, "interval", minutes=5, id="arb_poll", replace_existing=True)
 
+    # Collect PM prices and generate signals every 10 minutes
+    _scheduler.add_job(
+        _run_pm_price_collection, "interval", minutes=10,
+        id="pm_price_collection", replace_existing=True,
+    )
+
+    # Settle open paper trades daily at 3:15 AM (offset from settle_picks at 3:00 AM)
+    _scheduler.add_job(
+        _settle_paper_trades, "cron", hour=3, minute=15,
+        id="settle_paper_trades", replace_existing=True,
+    )
+
     _scheduler.start()
-    logger.info("APScheduler started: arb polling every 5 minutes")
+    logger.info("APScheduler started: arb polling every 5 min, PM price collection every 10 min, paper trade settlement at 3:15 AM")
 
 except ImportError:
     logger.warning(
