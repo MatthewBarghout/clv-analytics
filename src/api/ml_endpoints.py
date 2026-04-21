@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.analyzers.features import FeatureEngineer
 from src.analyzers.movement_predictor import LineMovementPredictor
-from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Team
+from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team
 
 # Load environment variables
 load_dotenv()
@@ -148,6 +148,7 @@ class EVOpportunity(BaseModel):
     confidence: float
     ev_score: float
     was_constrained: bool = False
+    sport_key: Optional[str] = None
 
 
 class RetrainingStatus(BaseModel):
@@ -470,6 +471,13 @@ async def get_best_opportunities(
             for t in db.execute(select(Team).where(Team.id.in_(best_opp_game_team_ids))).scalars().all()
         }
 
+        # Pre-fetch sports for all games
+        best_opp_sport_ids = list({game.sport_id for _, game in results if game.sport_id})
+        best_opp_sports_map = {
+            s.id: s
+            for s in db.execute(select(Sport).where(Sport.id.in_(best_opp_sport_ids))).scalars().all()
+        }
+
         opportunities = []
 
         for snapshot, game in results:
@@ -587,6 +595,7 @@ async def get_best_opportunities(
 
                 home_t = best_opp_teams_map.get(game.home_team_id)
                 away_t = best_opp_teams_map.get(game.away_team_id)
+                sport = best_opp_sports_map.get(game.sport_id) if game.sport_id else None
                 opportunities.append(EVOpportunity(
                     game_id=game.id,
                     home_team=home_t.name if home_t else "Unknown",
@@ -601,6 +610,7 @@ async def get_best_opportunities(
                     confidence=confidence,
                     ev_score=ev_score,
                     was_constrained=was_constrained,
+                    sport_key=sport.key if sport else None,
                 ))
 
         # Sort by EV score

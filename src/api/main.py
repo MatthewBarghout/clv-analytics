@@ -207,16 +207,18 @@ async def get_games(limit: int = 50):
             select(
                 Game,
                 Team.name.label("home_team_name"),
+                Sport.key.label("sport_key"),
                 func.count(OddsSnapshot.id.distinct()).label("snapshots_count"),
                 func.count(ClosingLine.id.distinct()).label("closing_lines_count"),
             )
             .join(Team, Team.id == Game.home_team_id)
+            .join(Sport, Sport.id == Game.sport_id)
             .outerjoin(OddsSnapshot, OddsSnapshot.game_id == Game.id)
             .outerjoin(
                 ClosingLine,
                 (ClosingLine.game_id == Game.id),
             )
-            .group_by(Game.id, Team.name)
+            .group_by(Game.id, Team.name, Sport.key)
             .order_by(Game.commence_time.desc())
             .limit(limit)
         )
@@ -225,8 +227,8 @@ async def get_games(limit: int = 50):
 
         # Pre-fetch away teams and betting outcomes to avoid N+1 queries
         if results:
-            away_team_ids = list({game.away_team_id for game, _, _, _ in results})
-            game_ids = [game.id for game, _, _, _ in results]
+            away_team_ids = list({game.away_team_id for game, _, _, _, _ in results})
+            game_ids = [game.id for game, _, _, _, _ in results]
             away_teams_map = {
                 t.id: t
                 for t in db.execute(select(Team).where(Team.id.in_(away_team_ids))).scalars().all()
@@ -242,7 +244,7 @@ async def get_games(limit: int = 50):
             outcomes_map = {}
 
         games_with_clv = []
-        for game, home_team_name, snapshots_count, closing_lines_count in results:
+        for game, home_team_name, sport_key, snapshots_count, closing_lines_count in results:
             # Get away team name from pre-fetched map
             away_team = away_teams_map.get(game.away_team_id)
 
@@ -302,6 +304,7 @@ async def get_games(limit: int = 50):
                     home_score=betting_outcome.home_score if betting_outcome else None,
                     away_score=betting_outcome.away_score if betting_outcome else None,
                     winner=betting_outcome.winner if betting_outcome else None,
+                    sport_key=sport_key,
                 )
             )
 

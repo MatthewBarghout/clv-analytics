@@ -57,6 +57,7 @@ class GameWithCLV(BaseModel):
     home_score: Optional[int] = None
     away_score: Optional[int] = None
     winner: Optional[str] = None
+    sport_key: Optional[str] = None
 
 
 class CLVHistoryPoint(BaseModel):

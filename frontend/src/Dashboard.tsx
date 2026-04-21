@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { GlassCard } from './components/GlassCard';
 import { AnimatedCounter } from './components/AnimatedCounter';
 import { GameDetailsModal } from './components/GameDetailsModal';
 import { GameAnalysis } from './components/GameAnalysis';
@@ -49,6 +48,7 @@ interface GameWithCLV {
   home_score?: number | null;
   away_score?: number | null;
   winner?: string | null;
+  sport_key?: string | null;
 }
 
 interface MLModelStats {
@@ -70,25 +70,79 @@ interface FeatureImportance {
   importance: number;
 }
 
-interface EVOpportunity {
-  game_id: number;
-  home_team: string;
-  away_team: string;
-  commence_time: string;
-  bookmaker_name: string;
-  market_type: string;
-  outcome_name: string;
-  current_line: string;
-  predicted_movement: number;
-  predicted_direction: string;
-  confidence: number;
-  ev_score: number;
-  was_constrained: boolean;
-}
-
 const API_BASE = 'http://localhost:8000/api';
 
-type GamesView = 'recent' | 'history' | 'best-ev' | 'daily-reports' | 'bankroll-sim' | 'my-bets' | 'markets';
+type View = 'overview' | 'best-ev' | 'games' | 'reports' | 'bankroll' | 'my-bets' | 'markets';
+type SportFilter = 'all' | 'nba' | 'mlb';
+type GamesTab = 'recent' | 'history';
+
+// ── Sport helpers ──────────────────────────────────────────────────────────
+
+const SPORT_LABELS: Record<string, { label: string; color: string; bg: string; border: string }> = {
+  basketball_nba: { label: 'NBA', color: 'text-orange-400', bg: 'bg-orange-500/20', border: 'border-orange-500/40' },
+  baseball_mlb:   { label: 'MLB', color: 'text-blue-400',   bg: 'bg-blue-500/20',   border: 'border-blue-500/40'   },
+};
+
+function SportBadge({ sportKey }: { sportKey?: string | null }) {
+  if (!sportKey) return null;
+  const s = SPORT_LABELS[sportKey];
+  if (!s) return null;
+  return (
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold ${s.bg} ${s.color} border ${s.border}`}>
+      {s.label}
+    </span>
+  );
+}
+
+function sportKeyFromFilter(filter: SportFilter): string | null {
+  if (filter === 'nba') return 'basketball_nba';
+  if (filter === 'mlb') return 'baseball_mlb';
+  return null;
+}
+
+// ── Stat card ──────────────────────────────────────────────────────────────
+
+interface StatCardProps {
+  label: string;
+  value: number;
+  suffix?: string;
+  decimals?: number;
+  color: string;
+  sub?: React.ReactNode;
+}
+
+function StatCard({ label, value, suffix, decimals, color, sub }: StatCardProps) {
+  return (
+    <div className="bg-white/5 rounded-lg p-4 border border-white/8">
+      <div className="text-gray-500 text-xs font-medium uppercase tracking-wider mb-1.5">{label}</div>
+      <AnimatedCounter value={value} suffix={suffix} decimals={decimals} className={`text-2xl font-bold ${color}`} />
+      {sub && <div className="text-xs text-gray-600 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+// ── Nav tab ────────────────────────────────────────────────────────────────
+
+interface NavTabProps {
+  label: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}
+
+function NavTab({ label, active, onClick }: NavTabProps) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors duration-150 whitespace-nowrap ${
+        active
+          ? 'border-white text-white'
+          : 'border-transparent text-gray-500 hover:text-gray-300'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
@@ -97,56 +151,55 @@ export default function Dashboard() {
   const [bookmakers, setBookmakers] = useState<BookmakerStats[]>([]);
   const [history, setHistory] = useState<CLVHistoryPoint[]>([]);
   const [games, setGames] = useState<GameWithCLV[]>([]);
+  const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
+  const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
+  const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
+  const [arbCount, setArbCount] = useState<number>(0);
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
+  const [view, setView] = useState<View>('overview');
+  const [sport, setSport] = useState<SportFilter>('all');
+  const [gamesTab, setGamesTab] = useState<GamesTab>('recent');
   const [selectedGame, setSelectedGame] = useState<GameWithCLV | null>(null);
-  const [gamesView, setGamesView] = useState<GamesView>('recent');
-  const [historyGames, setHistoryGames] = useState<GameWithCLV[]>([]);
   const [expandedGameId, setExpandedGameId] = useState<number | null>(null);
-  const [mlStats, setMlStats] = useState<MLModelStats | null>(null);
-  const [featureImportance, setFeatureImportance] = useState<FeatureImportance[]>([]);
-  const [bestOpportunities, setBestOpportunities] = useState<EVOpportunity[]>([]);
-  const [arbCount, setArbCount] = useState<number>(0);
 
-  const fetchData = useCallback(async () => {
+  // Track which tabs have been loaded to avoid redundant fetches
+  const loadedTabs = React.useRef<Set<string>>(new Set());
+
+  const fetchOverviewData = useCallback(async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, gamesRes, mlStatsRes, featureImportanceRes, opportunitiesRes, arbRes] =
+      const [statsRes, bookmakersRes, historyRes, mlStatsRes, featureImportanceRes, arbRes] =
         await Promise.all([
           fetch(`${API_BASE}/stats`),
           fetch(`${API_BASE}/bookmakers`),
           fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
-          fetch(`${API_BASE}/games?limit=20`),
           fetch(`${API_BASE}/ml/stats`),
           fetch(`${API_BASE}/ml/feature-importance`),
-          fetch(`${API_BASE}/ml/best-opportunities?today_only=true&limit=20&min_ev_score=2.0&min_confidence=0.62`),
           fetch(`${API_BASE}/arb-opportunities?min_spread=1.0&limit=5`),
         ]);
 
-      if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok || !gamesRes.ok) {
+      if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok) {
         throw new Error('Failed to fetch data');
       }
 
-      const [statsData, bookmakersData, historyData, gamesData, mlStatsData, featureImportanceData, opportunitiesData, arbData] =
+      const [statsData, bookmakersData, historyData, mlStatsData, featureImportanceData, arbData] =
         await Promise.all([
           statsRes.json(),
           bookmakersRes.json(),
           historyRes.json(),
-          gamesRes.json(),
           mlStatsRes.ok ? mlStatsRes.json() : null,
           featureImportanceRes.ok ? featureImportanceRes.json() : [],
-          opportunitiesRes.ok ? opportunitiesRes.json() : [],
           arbRes.ok ? arbRes.json() : { total: 0 },
         ]);
 
       setStats(statsData);
       setBookmakers(bookmakersData);
       setHistory(historyData);
-      setGames(gamesData);
       setMlStats(mlStatsData);
       setFeatureImportance(featureImportanceData);
-      setBestOpportunities(Array.isArray(opportunitiesData) ? opportunitiesData : []);
       setArbCount(arbData?.total ?? 0);
       setError(null);
     } catch (err) {
@@ -156,296 +209,372 @@ export default function Dashboard() {
     }
   }, [timeRange]);
 
-  const fetchHistoryGames = useCallback(async () => {
+  const fetchGamesData = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/games?limit=100`);
-      if (res.ok) {
-        const data = await res.json();
-        setHistoryGames(data.filter((g: GameWithCLV) => g.completed && g.avg_clv !== null));
-      }
-    } catch (err) {
-      console.error('Error fetching history:', err);
+      if (!res.ok) throw new Error('Failed to fetch games');
+      setGames(await res.json());
+    } catch {
+      // Non-fatal — games tab will show empty state
     }
   }, []);
 
+  // Initial load: overview data only
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    loadedTabs.current.add('overview');
+    fetchOverviewData();
+  }, [fetchOverviewData]);
+
+  // Lazy-load when switching to games tab for the first time
+  useEffect(() => {
+    if (view === 'games' && !loadedTabs.current.has('games')) {
+      loadedTabs.current.add('games');
+      fetchGamesData();
+    }
+  }, [view, fetchGamesData]);
+
+  // Global refresh: re-fetch overview + already-loaded tab data
+  const fetchData = useCallback(async () => {
+    fetchOverviewData();
+    if (loadedTabs.current.has('games')) fetchGamesData();
+  }, [fetchOverviewData, fetchGamesData]);
 
   useEffect(() => {
-    if (gamesView === 'history') fetchHistoryGames();
-  }, [gamesView, fetchHistoryGames]);
+    if (gamesTab === 'history') {
+      setHistoryGames(games.filter((g) => g.completed && g.avg_clv !== null));
+    }
+  }, [gamesTab, games]);
+
+  // Sport-filtered game lists
+  const sportKey = sportKeyFromFilter(sport);
+  const recentGames = useMemo(
+    () => games.filter((g) => !g.completed && (sportKey ? g.sport_key === sportKey : true)),
+    [games, sportKey]
+  );
+  const completedGames = useMemo(
+    () => historyGames.filter((g) => sportKey ? g.sport_key === sportKey : true),
+    [historyGames, sportKey]
+  );
+  const displayedGames = gamesTab === 'recent' ? recentGames : completedGames;
 
   const handleGameClick = useCallback((game: GameWithCLV) => setSelectedGame(game), []);
   const handleCloseModal = useCallback(() => setSelectedGame(null), []);
 
-  // Tab data arrays memoized
-  const displayedGames = useMemo(
-    () => (gamesView === 'recent' ? games : historyGames),
-    [gamesView, games, historyGames]
-  );
-
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white flex items-center justify-center">
-        <GlassCard className="text-center">
-          <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mx-auto mb-4"></div>
-          <div className="text-xl">Loading analytics...</div>
-        </GlassCard>
+      <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-blue-500 mx-auto mb-4"></div>
+          <div className="text-gray-400">Loading analytics...</div>
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white flex items-center justify-center">
-        <GlassCard gradient="red" className="text-center max-w-md">
-          <div className="text-6xl mb-4">⚠️</div>
-          <div className="text-xl text-red-400 mb-4">Error: {error}</div>
-          <button
-            onClick={fetchData}
-            className="px-6 py-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg border border-red-500/30 transition-all duration-200"
-          >
+      <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
+        <div className="text-center max-w-sm">
+          <div className="text-red-400 text-lg mb-3">Failed to load</div>
+          <div className="text-gray-500 text-sm mb-4">{error}</div>
+          <button onClick={fetchData} className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg border border-red-500/30 text-sm transition-all">
             Retry
           </button>
-        </GlassCard>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white p-4 md:p-8">
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
-          <h1 className="text-4xl md:text-5xl font-bold mb-4 md:mb-0 bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">
-            CLV Analytics Dashboard
-          </h1>
-          <button
-            onClick={fetchData}
-            className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg backdrop-blur-sm border border-white/20 transition-all duration-200"
-          >
-            Refresh Data
-          </button>
-        </div>
-
-        {/* Summary Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-          <GlassCard gradient={(stats?.mean_clv || 0) > 0 ? 'green' : 'red'}>
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Mean CLV</h3>
-            <AnimatedCounter
-              value={stats?.mean_clv || 0}
-              decimals={2}
-              suffix="%"
-              className={`text-4xl font-bold ${(stats?.mean_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}
-            />
-          </GlassCard>
-          <GlassCard gradient="blue">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Total Analyzed</h3>
-            <AnimatedCounter value={stats?.total_analyzed || 0} className="text-4xl font-bold text-blue-400" />
-            <p className="text-sm text-gray-400 mt-2">Betting opportunities</p>
-          </GlassCard>
-          <GlassCard gradient="green">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Positive CLV Rate</h3>
-            <AnimatedCounter
-              value={stats?.positive_clv_percentage || 0}
-              decimals={1}
-              suffix="%"
-              className="text-4xl font-bold text-clv-positive-400"
-            />
-            <p className="text-sm text-gray-400 mt-2">
-              {stats?.positive_clv_count || 0} of {stats?.total_analyzed || 0} bets
-            </p>
-          </GlassCard>
-          <GlassCard gradient="purple">
-            <h3 className="text-gray-400 text-sm font-medium mb-2 uppercase tracking-wider">Median CLV</h3>
-            <AnimatedCounter
-              value={stats?.median_clv || 0}
-              decimals={2}
-              suffix="%"
-              className={`text-4xl font-bold ${(stats?.median_clv || 0) > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}
-            />
-          </GlassCard>
-        </div>
-
-        {/* ML Model Performance */}
-        <MLStats mlStats={mlStats} featureImportance={featureImportance} />
-
-        {/* CLV Overview (market breakdown + trend chart) */}
-        <CLVOverview stats={stats} history={history} timeRange={timeRange} onTimeRangeChange={setTimeRange} />
-
-        {/* Bookmaker Performance */}
-        <BookmakerPerformance bookmakers={bookmakers} />
-
-        {/* Games / Views section */}
-        <GlassCard>
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
-            <h2 className="text-2xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent mb-4 md:mb-0">
-              Games
-            </h2>
-            <div className="flex items-center gap-4">
-              <div className="flex gap-2 flex-wrap">
-                {(['recent', 'history', 'best-ev', 'daily-reports', 'bankroll-sim', 'my-bets', 'markets'] as const).map((view) => {
-                  const labels: Record<GamesView, React.ReactNode> = {
-                    recent: 'Recent',
-                    history: `History (${historyGames.length})`,
-                    'best-ev': `Best +EV (${bestOpportunities.length})`,
-                    'daily-reports': 'Daily Reports',
-                    'bankroll-sim': 'Bankroll Sim',
-                    'my-bets': 'My Bets',
-                    'markets': (
-                      <span className="flex items-center gap-1.5">
-                        Markets
-                        {arbCount > 0 && (
-                          <span className="relative flex h-2 w-2">
-                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                            <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                          </span>
-                        )}
-                      </span>
-                    ),
-                  };
-                  const activeClass: Record<GamesView, string> = {
-                    recent: 'bg-white/20 text-white border border-white/30',
-                    history: 'bg-white/20 text-white border border-white/30',
-                    'best-ev': 'bg-gradient-to-r from-green-500/30 to-emerald-500/30 text-white border border-green-500/50',
-                    'daily-reports': 'bg-gradient-to-r from-blue-500/30 to-cyan-500/30 text-white border border-blue-500/50',
-                    'bankroll-sim': 'bg-gradient-to-r from-purple-500/30 to-pink-500/30 text-white border border-purple-500/50',
-                    'my-bets': 'bg-gradient-to-r from-yellow-500/30 to-orange-500/30 text-white border border-yellow-500/50',
-                    'markets': 'bg-gradient-to-r from-cyan-500/30 to-teal-500/30 text-white border border-cyan-500/50',
-                  };
-
-                  // Hide best-ev tab when model not trained
-                  if (view === 'best-ev' && !mlStats?.is_trained) return null;
-
-                  return (
-                    <button
-                      key={view}
-                      onClick={() => setGamesView(view)}
-                      className={`px-4 py-2 rounded-lg transition-all duration-200 ${
-                        gamesView === view
-                          ? activeClass[view]
-                          : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
-                      }`}
-                    >
-                      {labels[view]}
-                    </button>
-                  );
-                })}
-              </div>
-              {gamesView !== 'best-ev' && gamesView !== 'bankroll-sim' && gamesView !== 'my-bets' && gamesView !== 'daily-reports' && gamesView !== 'markets' && (
-                <div className="text-sm text-gray-400">Click any game to view detailed betting lines</div>
+    <div className="min-h-screen bg-gray-950 text-white">
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <header className="border-b border-white/8 bg-gray-950 sticky top-0 z-50">
+        <div className="max-w-screen-2xl mx-auto px-6 flex items-center justify-between">
+          <div className="flex items-center gap-6 overflow-x-auto">
+            <h1 className="text-sm font-semibold text-white tracking-tight py-3 shrink-0">CLV Analytics</h1>
+            <div className="flex items-center">
+              <NavTab label="Overview" active={view === 'overview'} onClick={() => setView('overview')} />
+              {mlStats?.is_trained && (
+                <NavTab label="Best EV+" active={view === 'best-ev'} onClick={() => setView('best-ev')} />
               )}
+              <NavTab label="Games" active={view === 'games'} onClick={() => setView('games')} />
+              <NavTab label="Reports" active={view === 'reports'} onClick={() => setView('reports')} />
+              <NavTab label="Bankroll" active={view === 'bankroll'} onClick={() => setView('bankroll')} />
+              <NavTab label="My Bets" active={view === 'my-bets'} onClick={() => setView('my-bets')} />
+              <NavTab
+                label={
+                  <span className="flex items-center gap-1.5">
+                    Markets
+                    {arbCount > 0 && (
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+                      </span>
+                    )}
+                  </span>
+                }
+                active={view === 'markets'}
+                onClick={() => setView('markets')}
+              />
             </div>
           </div>
 
-          <div className="overflow-x-auto">
-            {gamesView === 'daily-reports' && <DailyReports />}
+          <button
+            onClick={fetchData}
+            className="text-xs text-gray-500 hover:text-gray-300 transition-colors py-3 shrink-0 ml-4"
+          >
+            Refresh
+          </button>
+        </div>
+      </header>
 
-            {gamesView === 'bankroll-sim' && <BankrollSimulator />}
+      {/* ── Main content ────────────────────────────────────────────────── */}
+      <main className="max-w-screen-2xl mx-auto px-6 py-4">
 
-            {gamesView === 'my-bets' && <MyBets />}
+        {/* OVERVIEW ──────────────────────────────────────────────────────── */}
+        {view === 'overview' && (
+          <div className="space-y-4">
+            {/* Stat cards */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <StatCard
+                label="Mean CLV"
+                value={stats?.mean_clv || 0}
+                suffix="%"
+                decimals={2}
+                color={(stats?.mean_clv || 0) > 0 ? 'text-green-400' : 'text-red-400'}
+              />
+              <StatCard
+                label="Median CLV"
+                value={stats?.median_clv || 0}
+                suffix="%"
+                decimals={2}
+                color={(stats?.median_clv || 0) > 0 ? 'text-green-400' : 'text-red-400'}
+              />
+              <StatCard
+                label="Positive CLV Rate"
+                value={stats?.positive_clv_percentage || 0}
+                suffix="%"
+                decimals={1}
+                color="text-green-400"
+                sub={`${stats?.positive_clv_count || 0} of ${stats?.total_analyzed || 0} bets`}
+              />
+              <StatCard
+                label="Total Analyzed"
+                value={stats?.total_analyzed || 0}
+                color="text-blue-400"
+                sub="Betting opportunities"
+              />
+            </div>
 
-            {gamesView === 'best-ev' && (
-              <BestEVOpportunities startingBankroll={10000} />
-            )}
-
-            {gamesView === 'markets' && <ArbOpportunities />}
-
-            {(gamesView === 'recent' || gamesView === 'history') && (
-              <>
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b border-gray-700/50">
-                      {['Game', 'Time', 'Avg CLV', 'Snapshots', 'Closing Lines', 'Status'].map((h, i) => (
-                        <th key={h} className={`py-4 px-4 text-gray-400 font-semibold uppercase text-xs tracking-wider ${i === 0 || i === 1 ? 'text-left' : 'text-center'}`}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {displayedGames.map((game, index) => (
-                      <React.Fragment key={game.game_id}>
-                        <tr
-                          onClick={() => {
-                            if (gamesView === 'history') {
-                              setExpandedGameId(expandedGameId === game.game_id ? null : game.game_id);
-                            } else {
-                              handleGameClick(game);
-                            }
-                          }}
-                          className="border-b border-gray-700/30 hover:bg-white/5 transition-all duration-200 cursor-pointer"
-                          style={{ animationDelay: `${index * 30}ms` }}
-                          title={gamesView === 'history' ? 'Click to view analysis' : 'Click to view detailed betting lines'}
-                        >
-                          <td className="py-4 px-4">
-                            <div className="font-medium text-white">
-                              <div>{game.away_team} @ {game.home_team}</div>
-                              {game.home_score !== null && game.away_score !== null && (
-                                <div className="text-sm mt-1">
-                                  <span className="text-gray-400">Final: </span>
-                                  <span className={`font-bold ${game.winner === 'away' ? 'text-green-400' : 'text-gray-300'}`}>{game.away_score}</span>
-                                  <span className="text-gray-500"> - </span>
-                                  <span className={`font-bold ${game.winner === 'home' ? 'text-green-400' : 'text-gray-300'}`}>{game.home_score}</span>
-                                </div>
-                              )}
-                            </div>
-                          </td>
-                          <td className="py-4 px-4 text-gray-300 text-sm">
-                            {new Date(game.commence_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                          </td>
-                          <td className="text-center py-4 px-4">
-                            {game.avg_clv !== null ? (
-                              <span className={`font-bold text-lg ${game.avg_clv > 0 ? 'text-clv-positive-400' : 'text-clv-negative-400'}`}>
-                                {game.avg_clv > 0 ? '+' : ''}{game.avg_clv.toFixed(2)}%
-                              </span>
-                            ) : (
-                              <span className="text-gray-500 text-sm">N/A</span>
-                            )}
-                          </td>
-                          <td className="text-center py-4 px-4">
-                            <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">{game.snapshots_count}</span>
-                          </td>
-                          <td className="text-center py-4 px-4">
-                            <span className="inline-flex items-center px-2 py-1 rounded-md text-sm font-medium bg-purple-500/20 text-purple-400 border border-purple-500/30">{game.closing_lines_count}</span>
-                          </td>
-                          <td className="text-center py-4 px-4">
-                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${game.completed ? 'bg-gray-700/50 text-gray-300 border border-gray-600/50' : 'bg-green-500/20 text-green-400 border border-green-500/30'}`}>
-                              {game.completed ? 'Completed' : 'Upcoming'}
-                            </span>
-                          </td>
-                        </tr>
-                        {gamesView === 'history' && expandedGameId === game.game_id && (
-                          <tr className="bg-gray-800/50">
-                            <td colSpan={6} className="p-6">
-                              <GameAnalysis gameId={game.game_id} />
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))}
-                  </tbody>
-                </table>
-                {gamesView === 'history' && historyGames.length === 0 && (
-                  <div className="text-center py-12 text-gray-400">
-                    <p className="text-lg mb-2">No completed games with CLV data yet</p>
-                    <p className="text-sm">Games will appear here once they're completed and have closing line data</p>
-                  </div>
-                )}
-              </>
-            )}
+            <MLStats mlStats={mlStats} featureImportance={featureImportance} />
+            <CLVOverview stats={stats} history={history} timeRange={timeRange} onTimeRangeChange={setTimeRange} />
+            <BookmakerPerformance bookmakers={bookmakers} />
           </div>
-        </GlassCard>
-
-        {/* Game Details Modal */}
-        {selectedGame && (
-          <GameDetailsModal
-            gameId={selectedGame.game_id}
-            homeTeam={selectedGame.home_team}
-            awayTeam={selectedGame.away_team}
-            onClose={handleCloseModal}
-          />
         )}
-      </div>
+
+        {/* BEST EV+ ──────────────────────────────────────────────────────── */}
+        {view === 'best-ev' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <BestEVOpportunities startingBankroll={10000} />
+          </div>
+        )}
+
+        {/* GAMES ─────────────────────────────────────────────────────────── */}
+        {view === 'games' && (
+          <div className="space-y-4">
+            {/* Controls row */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1 border-b border-white/10">
+                {(['recent', 'history'] as GamesTab[]).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setGamesTab(t)}
+                    className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                      gamesTab === t
+                        ? 'border-white text-white'
+                        : 'border-transparent text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {t === 'recent' ? `Upcoming (${recentGames.length})` : `Completed (${completedGames.length})`}
+                  </button>
+                ))}
+              </div>
+
+              {/* Sport filter */}
+              <div className="flex items-center gap-1 rounded-md bg-white/5 border border-white/10 p-0.5 text-xs font-medium">
+                {(['all', 'nba', 'mlb'] as SportFilter[]).map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSport(s)}
+                    className={`px-2.5 py-1 rounded transition-all ${
+                      sport === s
+                        ? s === 'nba'
+                          ? 'bg-orange-500/25 text-orange-300 shadow-sm'
+                          : s === 'mlb'
+                          ? 'bg-blue-500/25 text-blue-300 shadow-sm'
+                          : 'bg-white/10 text-white shadow-sm'
+                        : 'text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {s === 'all' ? 'All' : s.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <GamesTable
+              games={displayedGames}
+              mode={gamesTab}
+              expandedGameId={expandedGameId}
+              onGameClick={handleGameClick}
+              onToggleExpand={(id) => setExpandedGameId(expandedGameId === id ? null : id)}
+            />
+          </div>
+        )}
+
+        {/* REPORTS ───────────────────────────────────────────────────────── */}
+        {view === 'reports' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <DailyReports />
+          </div>
+        )}
+
+        {/* BANKROLL ──────────────────────────────────────────────────────── */}
+        {view === 'bankroll' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <BankrollSimulator />
+          </div>
+        )}
+
+        {/* MY BETS ───────────────────────────────────────────────────────── */}
+        {view === 'my-bets' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <MyBets />
+          </div>
+        )}
+
+        {/* MARKETS ───────────────────────────────────────────────────────── */}
+        {view === 'markets' && (
+          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+            <ArbOpportunities />
+          </div>
+        )}
+      </main>
+
+      {/* Game Details Modal */}
+      {selectedGame && (
+        <GameDetailsModal
+          gameId={selectedGame.game_id}
+          homeTeam={selectedGame.home_team}
+          awayTeam={selectedGame.away_team}
+          onClose={handleCloseModal}
+        />
+      )}
     </div>
   );
 }
+
+// ── GamesTable ─────────────────────────────────────────────────────────────
+
+interface GamesTableProps {
+  games: GameWithCLV[];
+  mode: GamesTab;
+  expandedGameId: number | null;
+  onGameClick: (game: GameWithCLV) => void;
+  onToggleExpand: (id: number) => void;
+}
+
+const GamesTable = React.memo(function GamesTable({
+  games,
+  mode,
+  expandedGameId,
+  onGameClick,
+  onToggleExpand,
+}: GamesTableProps) {
+  if (games.length === 0) {
+    return (
+      <div className="bg-white/4 rounded-2xl border border-white/10 p-12 text-center">
+        <p className="text-gray-400">No games to show.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white/4 rounded-xl border border-white/8 overflow-hidden">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-white/8">
+            <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Sport</th>
+            <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Game</th>
+            <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Time</th>
+            <th className="text-center py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Avg CLV</th>
+            <th className="text-center py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Snapshots</th>
+            <th className="text-center py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Closing Lines</th>
+            <th className="text-center py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {games.map((game) => (
+            <React.Fragment key={game.game_id}>
+              <tr
+                onClick={() => mode === 'history' ? onToggleExpand(game.game_id) : onGameClick(game)}
+                className="border-b border-white/5 hover:bg-white/3 transition-colors cursor-pointer"
+              >
+                <td className="py-2.5 px-4">
+                  <SportBadge sportKey={game.sport_key} />
+                </td>
+                <td className="py-2.5 px-4">
+                  <div className="font-medium text-white text-sm">{game.away_team} @ {game.home_team}</div>
+                  {game.home_score != null && game.away_score != null && (
+                    <div className="text-xs mt-0.5 text-gray-500">
+                      Final:{' '}
+                      <span className={game.winner === 'away' ? 'text-green-400 font-semibold' : 'text-gray-400'}>{game.away_score}</span>
+                      {' – '}
+                      <span className={game.winner === 'home' ? 'text-green-400 font-semibold' : 'text-gray-400'}>{game.home_score}</span>
+                    </div>
+                  )}
+                </td>
+                <td className="py-2.5 px-4 text-gray-400 text-xs whitespace-nowrap">
+                  {new Date(game.commence_time).toLocaleString('en-US', {
+                    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                  })}
+                </td>
+                <td className="text-center py-2.5 px-4">
+                  {game.avg_clv != null ? (
+                    <span className={`text-sm font-semibold ${game.avg_clv > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {game.avg_clv > 0 ? '+' : ''}{game.avg_clv.toFixed(2)}%
+                    </span>
+                  ) : (
+                    <span className="text-gray-700 text-xs">—</span>
+                  )}
+                </td>
+                <td className="text-center py-2.5 px-4 text-gray-400 text-xs">
+                  {game.snapshots_count}
+                </td>
+                <td className="text-center py-2.5 px-4 text-gray-400 text-xs">
+                  {game.closing_lines_count}
+                </td>
+                <td className="text-center py-2.5 px-4">
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                    game.completed
+                      ? 'text-gray-500'
+                      : 'text-green-400'
+                  }`}>
+                    {game.completed ? 'Final' : 'Upcoming'}
+                  </span>
+                </td>
+              </tr>
+              {mode === 'history' && expandedGameId === game.game_id && (
+                <tr className="bg-gray-900/50">
+                  <td colSpan={7} className="p-6">
+                    <GameAnalysis gameId={game.game_id} />
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+});
