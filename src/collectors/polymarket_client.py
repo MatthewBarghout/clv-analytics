@@ -90,7 +90,7 @@ class PolymarketClient:
             data = self._get("/markets", {"q": question_keyword, "limit": 5})
             markets = data if isinstance(data, list) else []
             for m in markets:
-                if float(m.get("liquidityNum") or m.get("liquidity") or 0) < 100:
+                if float(m.get("liquidityNum") or m.get("liquidity") or 0) < 5000:
                     continue
                 outcome_prices = m.get("outcomePrices")
                 if isinstance(outcome_prices, str):
@@ -169,7 +169,7 @@ class PolymarketClient:
 
             if not outcome_prices or len(outcome_prices) < 2:
                 return None
-            if liquidity < 100:  # skip dust markets
+            if liquidity < 5000:  # skip dust markets
                 return None
 
             # Find YES index

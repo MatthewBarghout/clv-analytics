@@ -87,7 +87,11 @@ class PMSignalGenerator:
         try:
             poly_data = self._poly.get_market_price(keyword)
             if poly_data:
-                poly_price = poly_data["yes_price"]
+                if _similarity(question, poly_data.get("question", "")) >= 0.3:
+                    poly_price = poly_data["yes_price"]
+                else:
+                    poly_price = None
+                    logger.debug(f"Polymarket match rejected (low similarity) for '{keyword}'")
         except Exception as e:
             logger.debug(f"Polymarket lookup failed for '{keyword}': {e}")
 
@@ -99,7 +103,11 @@ class PMSignalGenerator:
 
         # Compute fair values for YES and NO sides
         fv_yes = self.fair_value(yes_price, poly_price, meta_forecast)
-        fv_no = self.fair_value(no_price, 1.0 - poly_price if poly_price is not None else None, None)
+        fv_no = self.fair_value(
+            no_price,
+            1.0 - poly_price if poly_price is not None else None,
+            1.0 - meta_forecast if meta_forecast is not None else None,
+        )
 
         edge_yes = fv_yes - yes_price
         edge_no = fv_no - no_price
@@ -130,6 +138,14 @@ class PMSignalGenerator:
             "size_usd": self.kelly_size(edge, entry_price),
             "strategy_tag": "cross_platform_v1",
         }
+
+
+def _similarity(a: str, b: str) -> float:
+    a_words = set(a.lower().split())
+    b_words = set(b.lower().split())
+    if not a_words or not b_words:
+        return 0.0
+    return len(a_words & b_words) / min(len(a_words), len(b_words))
 
 
 def _extract_keyword(title: str) -> str:

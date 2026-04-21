@@ -1958,6 +1958,8 @@ def _run_pm_price_collection():
             ).all()
         )
 
+        MAX_SIGNALS_PER_RUN = 20
+
         for raw in raw_markets:
             parsed = kalshi.parse_market_odds(raw)
             if not parsed:
@@ -2016,6 +2018,8 @@ def _run_pm_price_collection():
 
             # Open paper trade only if no existing open position for this ticker
             if ticker not in open_tickers:
+                if signal_count >= MAX_SIGNALS_PER_RUN:
+                    break
                 trade = PaperTrade(
                     market_ticker=ticker,
                     event_description=signal["question"][:500],
