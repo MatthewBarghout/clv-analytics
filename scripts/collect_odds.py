@@ -13,6 +13,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+from requests.exceptions import HTTPError
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -172,6 +174,7 @@ def main():
 
     load_dotenv()
     api_key = os.getenv("ODDS_API_KEY")
+    api_key_2 = os.getenv("ODDS_API_KEY_2")
     db_url = os.getenv("DATABASE_URL")
 
     if not api_key:
@@ -181,12 +184,15 @@ def main():
         logger.error("DATABASE_URL not found in environment")
         sys.exit(1)
 
+    api_keys = [k for k in [api_key, api_key_2] if k]
+
     logger.info("=" * 70)
     logger.info("MULTI-SPORT ODDS COLLECTION STARTED")
     logger.info(f"Mode: {'CLOSING LINES ONLY' if args.closing_only else 'REGULAR SNAPSHOTS'}")
+    logger.info(f"API keys available: {len(api_keys)}")
     logger.info("=" * 70)
 
-    client = OddsAPIClient(api_key=api_key)
+    client = OddsAPIClient(api_key=api_keys[0])
     engine = create_engine(db_url)
     Session = sessionmaker(bind=engine)
     session = Session()
@@ -197,6 +203,7 @@ def main():
     failed_sports = []
 
     try:
+        key_index = 0
         for sport_key, sport_name in SPORTS:
             try:
                 snaps, closing = collect_sport_odds(
@@ -209,6 +216,32 @@ def main():
                 )
                 total_snapshots += snaps
                 total_closing += closing
+            except HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status in (401, 429) and key_index + 1 < len(api_keys):
+                    key_index += 1
+                    client.api_key = api_keys[key_index]
+                    logger.warning(
+                        f"{sport_name} key quota/auth error ({status}), "
+                        f"rotating to key {key_index + 1} and retrying"
+                    )
+                    try:
+                        snaps, closing = collect_sport_odds(
+                            sport_key=sport_key,
+                            sport_name=sport_name,
+                            closing_only=args.closing_only,
+                            session=session,
+                            client=client,
+                            processor=processor,
+                        )
+                        total_snapshots += snaps
+                        total_closing += closing
+                    except Exception as retry_err:
+                        logger.error(f"{sport_name} collection failed after key rotation: {retry_err}")
+                        failed_sports.append(sport_name)
+                else:
+                    logger.error(f"{sport_name} collection failed: {e}")
+                    failed_sports.append(sport_name)
             except Exception as e:
                 logger.error(f"{sport_name} collection failed: {e}")
                 failed_sports.append(sport_name)
