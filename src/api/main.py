@@ -1931,6 +1931,26 @@ async def get_cross_platform_signals(
         db.close()
 
 
+def _infer_category(ticker: str) -> str:
+    if ticker.startswith(("KXBTC", "KXETH")):
+        return "crypto"
+    if ticker.startswith(("KXPRES", "KXFED", "KXHOUSE", "KXSENATE")):
+        return "politics"
+    if ticker.startswith("KXECON"):
+        return "economics"
+    return "sports"
+
+
+def _refresh_poly_cache():
+    try:
+        from src.analyzers.pm_signal_generator import PMSignalGenerator
+        generator = PMSignalGenerator()
+        generator.refresh_poly_cache()
+        logger.info("Polymarket cache refreshed")
+    except Exception as e:
+        logger.error(f"Polymarket cache refresh failed: {e}", exc_info=True)
+
+
 def _run_pm_price_collection():
     """
     Collect Kalshi market prices, generate cross-platform signals, and open paper trades.
@@ -1946,8 +1966,10 @@ def _run_pm_price_collection():
         kalshi = KalshiClient()
         generator = PMSignalGenerator()
 
-        raw_markets = kalshi.get_sports_markets(limit=200)
-        generator.refresh_poly_cache()
+        raw_markets = kalshi.get_all_markets()
+        if not generator._poly_cache:
+            logger.warning("Polymarket cache empty — refreshing inline before PM price collection")
+            generator.refresh_poly_cache()
         signal_count = 0
         price_count = 0
 
@@ -1995,7 +2017,7 @@ def _run_pm_price_collection():
                 "no_price": no_price,
             }
             try:
-                signal = generator.generate_signal(market_for_signal)
+                signal = generator.generate_signal(market_for_signal, category=_infer_category(ticker))
             except Exception as e:
                 logger.debug(f"Signal generation failed for {ticker}: {e}")
                 signal = None
@@ -2134,6 +2156,15 @@ try:
 
     # Poll Kalshi + Polymarket every 5 minutes
     _scheduler.add_job(_run_arb_poll, "interval", minutes=5, id="arb_poll", replace_existing=True)
+
+    # Refresh Polymarket cache every 30 minutes (decoupled from PM price collection)
+    _scheduler.add_job(
+        _refresh_poly_cache,
+        "interval",
+        minutes=30,
+        id="poly_cache_refresh",
+        replace_existing=True,
+    )
 
     # Collect PM prices and generate signals every 10 minutes
     _scheduler.add_job(

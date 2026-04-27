@@ -8,6 +8,7 @@ Focuses on sports futures and game-level markets.
 """
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -42,12 +43,11 @@ class PolymarketClient:
             logger.error(f"Polymarket request failed: {e}")
             raise
 
-    def get_sports_markets(self, max_pages: int = 5, limit: int = 100) -> List[Dict]:
-        """
-        Fetch active sports markets from Polymarket.
+    def get_markets_by_tag(self, tag: str, max_pages: int = 5, limit: int = 100) -> List[Dict]:
+        """Fetch active Polymarket markets for a given tag.
 
-        Paginates up to max_pages and filters by sports keywords.
-        Returns list of raw market dicts.
+        Filters by sports keywords only when tag == "sports".
+        For other tags returns all results without keyword filtering.
         """
         all_markets: List[Dict] = []
         offset = 0
@@ -59,26 +59,46 @@ class PolymarketClient:
                     "closed": "false",
                     "limit": limit,
                     "offset": offset,
+                    "tag": tag,
                 })
                 if not isinstance(data, list):
                     break
 
-                sports = [
-                    m for m in data
-                    if any(kw in (m.get("question") or "").lower() for kw in SPORTS_KEYWORDS)
-                ]
-                all_markets.extend(sports)
+                if tag == "sports":
+                    page_markets = [
+                        m for m in data
+                        if any(kw in (m.get("question") or "").lower() for kw in SPORTS_KEYWORDS)
+                    ]
+                else:
+                    page_markets = data
+
+                all_markets.extend(page_markets)
 
                 if len(data) < limit:
                     break
                 offset += limit
 
             except Exception as e:
-                logger.error(f"Polymarket fetch error at offset {offset}: {e}")
+                logger.error(f"Polymarket fetch error at offset {offset} (tag={tag}): {e}")
                 break
 
-        logger.info(f"Polymarket: fetched {len(all_markets)} active sports markets")
+        logger.debug(f"Polymarket tag={tag}: fetched {len(all_markets)} markets")
         return all_markets
+
+    def get_all_markets_cached(self) -> List[Dict]:
+        """Fetch markets across sports, politics, and crypto tags with 1s sleep between each."""
+        tags = ["sports", "politics", "crypto"]
+        all_markets: List[Dict] = []
+        for tag in tags:
+            markets = self.get_markets_by_tag(tag)
+            logger.debug(f"Polymarket get_all_markets_cached: {len(markets)} markets for tag={tag}")
+            all_markets.extend(markets)
+            time.sleep(1)
+        logger.info(f"Polymarket get_all_markets_cached: {len(all_markets)} markets total")
+        return all_markets
+
+    def get_sports_markets(self, **kwargs) -> List[Dict]:
+        return self.get_markets_by_tag("sports", **kwargs)
 
     def get_market_price(self, question_keyword: str) -> Optional[Dict]:
         """

@@ -44,12 +44,12 @@ class PMSignalGenerator:
         self._poly_cache: List[dict] = []
 
     def refresh_poly_cache(self) -> None:
-        """Fetch and cache active Polymarket sports markets for local matching."""
+        """Fetch and cache active Polymarket markets (all categories) for local matching."""
         try:
-            raw = self._poly.get_sports_markets(max_pages=5, limit=100)
+            raw = self._poly.get_all_markets_cached()
             parsed = [self._poly.parse_market_odds(m) for m in raw]
             self._poly_cache = [p for p in parsed if p is not None]
-            logger.info(f"Polymarket cache refreshed: {len(self._poly_cache)} sports markets")
+            logger.info(f"Polymarket cache refreshed: {len(self._poly_cache)} markets")
         except Exception as e:
             logger.error(f"Polymarket cache refresh failed: {e}")
             self._poly_cache = []
@@ -108,7 +108,7 @@ class PMSignalGenerator:
         raw = (edge / (1.0 - price)) * KELLY_FRACTION * BANKROLL
         return float(max(MIN_SIZE_USD, min(MAX_SIZE_USD, raw)))
 
-    def generate_signal(self, market: dict) -> Optional[dict]:
+    def generate_signal(self, market: dict, category: str = "sports") -> Optional[dict]:
         """Evaluate a Kalshi market for a cross-platform signal.
 
         market must contain: ticker, question (or title), yes_price, no_price.
@@ -163,7 +163,7 @@ class PMSignalGenerator:
             "polymarket_price": poly_price,
             "metaculus_forecast": meta_forecast,
             "size_usd": self.kelly_size(edge, entry_price),
-            "strategy_tag": "cross_platform_v1",
+            "strategy_tag": f"cross_platform_{category}_v1",
         }
 
 

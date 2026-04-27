@@ -5,6 +5,7 @@ API: https://api.elections.kalshi.com/trade-api/v2
 
 Fetch flow: series → events → markets (per event).
 Sports series covered: NBA/MLB/NHL game winners, NBA points/rebounds props.
+Non-sports series: crypto, politics, economics.
 """
 import base64
 import logging
@@ -43,6 +44,16 @@ CHAMPIONSHIP_SERIES = [
     "KXMLB",   # MLB World Series winner
     "KXNHL",   # NHL Stanley Cup winner
     "KXNFL",   # NFL Super Bowl winner
+]
+
+NON_SPORTS_SERIES = [
+    "KXBTC",
+    "KXETH",
+    "KXPRES",
+    "KXFED",
+    "KXHOUSE",
+    "KXSENATE",
+    "KXECON",
 ]
 
 # Game-level series not suitable for cross-platform signal matching
@@ -127,6 +138,31 @@ class KalshiClient:
         except Exception as e:
             logger.debug(f"Kalshi event {event_ticker} markets unavailable: {e}")
             return []
+
+    def get_all_markets(self, series_list: List[str] = None) -> List[Dict]:
+        """Fetch active markets across all series (sports + non-sports).
+
+        Defaults to SPORTS_SERIES + CHAMPIONSHIP_SERIES + NON_SPORTS_SERIES.
+        Sleeps 0.5s between each series to avoid rate limiting.
+        """
+        if series_list is None:
+            series_list = SPORTS_SERIES + CHAMPIONSHIP_SERIES + NON_SPORTS_SERIES
+        all_markets: List[Dict] = []
+        for series in series_list:
+            events = self._get_events_for_series(series)
+            count = 0
+            for event in events:
+                event_ticker = event.get("event_ticker", "")
+                markets = self._get_markets_for_event(event_ticker)
+                for m in markets:
+                    m["_series"] = series
+                    m["_event_title"] = event.get("title", "")
+                all_markets.extend(markets)
+                count += len(markets)
+            logger.debug(f"Kalshi {series}: {count} markets")
+            time.sleep(0.5)
+        logger.info(f"Kalshi get_all_markets: {len(all_markets)} markets total")
+        return all_markets
 
     def get_sports_markets(self, limit: int = 200) -> List[Dict]:
         """

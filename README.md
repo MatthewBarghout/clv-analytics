@@ -171,13 +171,29 @@ Positive spread → Kalshi assigns higher probability than sportsbook
 Cross-platform signal engine that compares Kalshi prices against Polymarket and Metaculus, opens simulated trades on divergence, and settles them when markets resolve.
 
 **Signal generation (every 10 minutes):**
-1. Fetch all active Kalshi sports markets
-2. For each market, query Polymarket (gamma-api.polymarket.com) and Metaculus for the same event
+1. Fetch all active Kalshi markets across sports and non-sports series via `get_all_markets()`
+2. For each non-game-level market, query Polymarket and Metaculus for the same event
 3. Compute weighted fair value: Polymarket 45%, Metaculus 35%, Kalshi momentum 20%
 4. If `max(edge_YES, edge_NO) > 6%` → open a paper trade
 5. Skip if an open position already exists for that ticker
 
+**Kalshi series covered:**
+
+| Category | Series |
+|---|---|
+| Sports | KXNBAGAME, KXMLBGAME, KXNHLGAME, KXNFLGAME, KXNBAPTS, KXNBAREB, KXMMA, KXSOCCER |
+| Sports futures | KXNBA, KXMLB, KXNHL, KXNFL |
+| Crypto | KXBTC, KXETH |
+| Politics | KXPRES, KXFED, KXHOUSE, KXSENATE |
+| Economics | KXECON |
+
+Game-level series (individual match outcomes) are excluded from signal generation — they won't have Polymarket equivalents and produce false matches. Non-sports markets are matched against Polymarket's `politics` and `crypto` tag feeds.
+
 **Fair value redistribution:** if a source is unavailable (returns None), its weight is redistributed proportionally to the present sources so the estimate stays calibrated.
+
+**Strategy tags** include the market category: `cross_platform_sports_v1`, `cross_platform_crypto_v1`, `cross_platform_politics_v1`, `cross_platform_economics_v1`. Category is inferred from the Kalshi ticker prefix at signal time.
+
+**Polymarket cache** is refreshed every 30 minutes by a dedicated APScheduler job (`poly_cache_refresh`) that fetches sports, politics, and crypto tag feeds. The 10-minute price collection job reads from this cache without blocking on a network call, falling back to an inline refresh only on first run.
 
 **Position sizing (Quarter-Kelly):**
 ```
@@ -269,6 +285,7 @@ Manual bet tracking with personal P&L dashboard.
  3:15 AM  — Settle paper trades                        APScheduler
  Every 5m — Poll Kalshi for arb opportunities          APScheduler
 Every 10m — Collect PM prices + generate signals       APScheduler
+Every 30m — Refresh Polymarket market cache            APScheduler
 ```
 
 ---
