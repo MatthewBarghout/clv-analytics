@@ -1,10 +1,11 @@
 """Cross-platform prediction market signal generator.
 
-Compares Kalshi prices against Polymarket and Metaculus forecasts to find
+Compares Kalshi prices against Polymarket forecasts to find
 markets where the implied probability diverges significantly from consensus.
 """
 import logging
-from typing import Optional
+import re
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,9 @@ KELLY_FRACTION = 0.25
 MIN_SIZE_USD = 25.0
 MAX_SIZE_USD = 200.0
 
+# Minimum similarity score to accept a Polymarket match
+SIMILARITY_THRESHOLD = 0.45
+
 # Source weights for fair value calculation
 _WEIGHTS = {
     "polymarket": 0.45,
@@ -26,13 +30,55 @@ _WEIGHTS = {
 
 
 class PMSignalGenerator:
-    """Generates trading signals by comparing Kalshi prices to external forecasts."""
+    """Generates trading signals by comparing Kalshi prices to Polymarket forecasts.
+
+    Fetches Polymarket sports markets once on first use and caches them for the
+    lifetime of the instance. Call refresh_poly_cache() to force a reload.
+    """
 
     def __init__(self):
         from src.collectors.polymarket_client import PolymarketClient
         from src.collectors.metaculus_client import MetaculusClient
         self._poly = PolymarketClient()
         self._meta = MetaculusClient()
+        self._poly_cache: List[dict] = []
+
+    def refresh_poly_cache(self) -> None:
+        """Fetch and cache active Polymarket sports markets for local matching."""
+        try:
+            raw = self._poly.get_sports_markets(max_pages=5, limit=100)
+            parsed = [self._poly.parse_market_odds(m) for m in raw]
+            self._poly_cache = [p for p in parsed if p is not None]
+            logger.info(f"Polymarket cache refreshed: {len(self._poly_cache)} sports markets")
+        except Exception as e:
+            logger.error(f"Polymarket cache refresh failed: {e}")
+            self._poly_cache = []
+
+    def _match_polymarket(self, question: str) -> Optional[float]:
+        """Find the best-matching Polymarket market for a Kalshi question title.
+
+        Returns the YES price of the best match if similarity >= SIMILARITY_THRESHOLD,
+        else None.
+        """
+        if not self._poly_cache:
+            self.refresh_poly_cache()
+        if not self._poly_cache:
+            return None
+
+        best_sim = 0.0
+        best_price = None
+        for m in self._poly_cache:
+            sim = _similarity(question, m.get("title", ""))
+            if sim > best_sim:
+                best_sim = sim
+                best_price = m.get("yes_implied_prob")
+
+        if best_sim >= SIMILARITY_THRESHOLD and best_price is not None:
+            logger.debug(f"Polymarket match accepted (sim={best_sim:.2f}) for '{question[:50]}'")
+            return float(best_price)
+
+        logger.debug(f"Polymarket match rejected (best_sim={best_sim:.2f}) for '{question[:50]}'")
+        return None
 
     def fair_value(
         self,
@@ -40,10 +86,9 @@ class PMSignalGenerator:
         polymarket_price: Optional[float],
         metaculus_forecast: Optional[float],
     ) -> float:
-        """
-        Compute weighted fair value from available sources.
+        """Compute weighted fair value from available sources.
 
-        If a source is None its weight is redistributed proportionally to present sources.
+        Missing sources have their weight redistributed proportionally.
         Returns float in [0, 1].
         """
         sources: dict[str, float] = {"kalshi": kalshi_price}
@@ -64,8 +109,7 @@ class PMSignalGenerator:
         return float(max(MIN_SIZE_USD, min(MAX_SIZE_USD, raw)))
 
     def generate_signal(self, market: dict) -> Optional[dict]:
-        """
-        Evaluate a Kalshi market for a cross-platform signal.
+        """Evaluate a Kalshi market for a cross-platform signal.
 
         market must contain: ticker, question (or title), yes_price, no_price.
         Returns a signal dict if edge > EDGE_THRESHOLD, else None.
@@ -78,30 +122,13 @@ class PMSignalGenerator:
         if yes_price <= 0 or no_price <= 0 or not ticker or not question:
             return None
 
-        # Extract a short keyword from the event title for external lookups
-        keyword = _extract_keyword(question)
+        poly_price = self._match_polymarket(question)
+        meta_forecast = self._meta.get_forecast(question)
 
-        # Fetch external forecasts
-        poly_data = None
-        poly_price = None
-        try:
-            poly_data = self._poly.get_market_price(keyword)
-            if poly_data:
-                if _similarity(question, poly_data.get("question", "")) >= 0.3:
-                    poly_price = poly_data["yes_price"]
-                else:
-                    poly_price = None
-                    logger.debug(f"Polymarket match rejected (low similarity) for '{keyword}'")
-        except Exception as e:
-            logger.debug(f"Polymarket lookup failed for '{keyword}': {e}")
+        # If neither external source matched, no signal is possible
+        if poly_price is None and meta_forecast is None:
+            return None
 
-        meta_forecast = None
-        try:
-            meta_forecast = self._meta.get_forecast(keyword)
-        except Exception as e:
-            logger.debug(f"Metaculus lookup failed for '{keyword}': {e}")
-
-        # Compute fair values for YES and NO sides
         fv_yes = self.fair_value(yes_price, poly_price, meta_forecast)
         fv_no = self.fair_value(
             no_price,
@@ -141,15 +168,9 @@ class PMSignalGenerator:
 
 
 def _similarity(a: str, b: str) -> float:
+    """Word-overlap similarity, normalized to the shorter string."""
     a_words = set(a.lower().split())
     b_words = set(b.lower().split())
     if not a_words or not b_words:
         return 0.0
     return len(a_words & b_words) / min(len(a_words), len(b_words))
-
-
-def _extract_keyword(title: str) -> str:
-    """Extract a short search keyword from a market title."""
-    stopwords = {"will", "the", "a", "an", "in", "to", "of", "at", "vs", "vs.", "win", "?", "-", "win?"}
-    words = [w.strip("?.,-()") for w in title.split() if w.strip("?.,-()").lower() not in stopwords]
-    return " ".join(words[:4])

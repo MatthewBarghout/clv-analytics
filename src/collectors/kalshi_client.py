@@ -36,6 +36,21 @@ SPORTS_SERIES = [
     "KXSOCCER",   # Soccer match winner
 ]
 
+# Championship/futures series — these have Polymarket equivalents and are
+# suitable for cross-platform signal generation
+CHAMPIONSHIP_SERIES = [
+    "KXNBA",   # NBA championship winner
+    "KXMLB",   # MLB World Series winner
+    "KXNHL",   # NHL Stanley Cup winner
+    "KXNFL",   # NFL Super Bowl winner
+]
+
+# Game-level series not suitable for cross-platform signal matching
+_GAME_LEVEL_SERIES = {
+    "KXNBAGAME", "KXMLBGAME", "KXNHLGAME", "KXNFLGAME",
+    "KXNBAPTS", "KXNBAREB", "KXMMA", "KXSOCCER",
+}
+
 
 def _load_private_key(pem: str):
     pem = pem.replace("\\n", "\n").strip()
@@ -125,10 +140,14 @@ class KalshiClient:
             return markets
         return self._fetch_by_keyword(limit=limit)
 
+    def is_game_level(self, series: str) -> bool:
+        """Return True if this series contains individual game/match markets."""
+        return series in _GAME_LEVEL_SERIES
+
     def _fetch_by_series(self) -> List[Dict]:
-        """Fetch markets via series → events → markets chain."""
+        """Fetch markets via series → events → markets chain (game + championship series)."""
         all_markets: List[Dict] = []
-        for series in SPORTS_SERIES:
+        for series in SPORTS_SERIES + CHAMPIONSHIP_SERIES:
             events = self._get_events_for_series(series)
             for event in events:
                 event_ticker = event.get("event_ticker", "")
@@ -179,19 +198,20 @@ class KalshiClient:
         so fuzzy matching against sportsbook event names works better.
         """
         try:
-            yes_bid = market.get("yes_bid")
-            yes_ask = market.get("yes_ask")
-            no_bid = market.get("no_bid")
-            no_ask = market.get("no_ask")
+            yes_bid = market.get("yes_bid_dollars")
+            yes_ask = market.get("yes_ask_dollars")
+            no_bid = market.get("no_bid_dollars")
+            no_ask = market.get("no_ask_dollars")
+            last_price = market.get("last_price_dollars")
 
-            if yes_bid is None or no_bid is None:
+            if yes_bid is not None and no_bid is not None:
+                yes_prob = (float(yes_bid) + float(yes_ask)) / 2.0 if yes_ask is not None else float(yes_bid)
+                no_prob = (float(no_bid) + float(no_ask)) / 2.0 if no_ask is not None else float(no_bid)
+            elif last_price is not None:
+                yes_prob = float(last_price)
+                no_prob = 1.0 - yes_prob
+            else:
                 return None
-
-            yes_cents = (float(yes_bid) + float(yes_ask)) / 2.0 if yes_ask is not None else float(yes_bid)
-            no_cents = (float(no_bid) + float(no_ask)) / 2.0 if no_ask is not None else float(no_bid)
-
-            yes_prob = yes_cents / 100.0
-            no_prob = no_cents / 100.0
 
             if yes_prob <= 0 or no_prob <= 0:
                 return None

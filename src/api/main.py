@@ -1947,6 +1947,7 @@ def _run_pm_price_collection():
         generator = PMSignalGenerator()
 
         raw_markets = kalshi.get_sports_markets(limit=200)
+        generator.refresh_poly_cache()
         signal_count = 0
         price_count = 0
 
@@ -1981,10 +1982,15 @@ def _run_pm_price_collection():
             db.add(price_rec)
             price_count += 1
 
+            # Only generate signals for championship/futures markets — game-level
+            # markets won't have Polymarket equivalents and produce false matches
+            if kalshi.is_game_level(parsed.get("series", "")):
+                continue
+
             # Generate signal
             market_for_signal = {
                 "ticker": ticker,
-                "question": parsed.get("title") or parsed.get("market_title", ""),
+                "question": parsed.get("market_title") or parsed.get("title", ""),
                 "yes_price": yes_price,
                 "no_price": no_price,
             }
