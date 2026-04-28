@@ -100,26 +100,34 @@ class KalshiClient:
             "KALSHI-Access-Signature": base64.b64encode(sig).decode(),
         }
 
-    def _get(self, path: str, params: Dict[str, Any] = None) -> Dict:
+    def _get(self, path: str, params: Dict[str, Any] = None, _retries: int = 3) -> Dict:
         url = f"{KALSHI_BASE_URL}{path}"
-        try:
-            resp = self.session.get(
-                url,
-                params=params or {},
-                headers=self._auth_headers("GET", path),
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                logger.warning("Kalshi: unauthorized — check KALSHI_KEY_ID and KALSHI_PRIVATE_KEY.")
-                return {}
-            logger.error(f"Kalshi HTTP error on {path}: {e}")
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Kalshi request failed on {path}: {e}")
-            raise
+        for attempt in range(_retries):
+            try:
+                resp = self.session.get(
+                    url,
+                    params=params or {},
+                    headers=self._auth_headers("GET", path),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 401:
+                    logger.warning("Kalshi: unauthorized — check KALSHI_KEY_ID and KALSHI_PRIVATE_KEY.")
+                    return {}
+                if e.response is not None and e.response.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Kalshi 429 on {path}, retrying in {wait}s (attempt {attempt + 1}/{_retries})")
+                    time.sleep(wait)
+                    continue
+                logger.error(f"Kalshi HTTP error on {path}: {e}")
+                raise
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Kalshi request failed on {path}: {e}")
+                raise
+        logger.error(f"Kalshi: gave up on {path} after {_retries} retries (429)")
+        return {}
 
     def _get_events_for_series(self, series_ticker: str) -> List[Dict]:
         """Return open events for a series ticker."""
@@ -159,6 +167,7 @@ class KalshiClient:
                     m["_event_title"] = event.get("title", "")
                 all_markets.extend(markets)
                 count += len(markets)
+                time.sleep(0.25)
             logger.debug(f"Kalshi {series}: {count} markets")
             time.sleep(0.5)
         logger.info(f"Kalshi get_all_markets: {len(all_markets)} markets total")
