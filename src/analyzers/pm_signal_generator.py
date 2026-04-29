@@ -28,12 +28,15 @@ _WEIGHTS = {
     "kalshi": 0.20,
 }
 
+# Module-level shared cache — persists across PMSignalGenerator instances
+_POLY_CACHE: List[dict] = []
+
 
 class PMSignalGenerator:
     """Generates trading signals by comparing Kalshi prices to Polymarket forecasts.
 
-    Fetches Polymarket sports markets once on first use and caches them for the
-    lifetime of the instance. Call refresh_poly_cache() to force a reload.
+    Polymarket data is cached at module level so it persists across instances.
+    The dedicated _refresh_poly_cache() scheduler job populates it every 30 min.
     """
 
     def __init__(self):
@@ -41,18 +44,22 @@ class PMSignalGenerator:
         from src.collectors.metaculus_client import MetaculusClient
         self._poly = PolymarketClient()
         self._meta = MetaculusClient()
-        self._poly_cache: List[dict] = []
+
+    @property
+    def _poly_cache(self) -> List[dict]:
+        return _POLY_CACHE
 
     def refresh_poly_cache(self) -> None:
         """Fetch and cache active Polymarket markets (all categories) for local matching."""
+        global _POLY_CACHE
         try:
             raw = self._poly.get_all_markets_cached()
             parsed = [self._poly.parse_market_odds(m) for m in raw]
-            self._poly_cache = [p for p in parsed if p is not None]
-            logger.info(f"Polymarket cache refreshed: {len(self._poly_cache)} markets")
+            _POLY_CACHE = [p for p in parsed if p is not None]
+            logger.info(f"Polymarket cache refreshed: {len(_POLY_CACHE)} markets")
         except Exception as e:
             logger.error(f"Polymarket cache refresh failed: {e}")
-            self._poly_cache = []
+            _POLY_CACHE = []
 
     def _match_polymarket(self, question: str) -> Optional[float]:
         """Find the best-matching Polymarket market for a Kalshi question title.
@@ -60,14 +67,14 @@ class PMSignalGenerator:
         Returns the YES price of the best match if similarity >= SIMILARITY_THRESHOLD,
         else None.
         """
-        if not self._poly_cache:
+        if not _POLY_CACHE:
             self.refresh_poly_cache()
-        if not self._poly_cache:
+        if not _POLY_CACHE:
             return None
 
         best_sim = 0.0
         best_price = None
-        for m in self._poly_cache:
+        for m in _POLY_CACHE:
             sim = _similarity(question, m.get("title", ""))
             if sim > best_sim:
                 best_sim = sim
