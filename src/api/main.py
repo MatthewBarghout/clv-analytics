@@ -1966,7 +1966,8 @@ def _run_pm_price_collection():
         kalshi = KalshiClient()
         generator = PMSignalGenerator()
 
-        raw_markets = kalshi.get_all_markets()
+        from src.collectors.kalshi_client import CHAMPIONSHIP_SERIES, NON_SPORTS_SERIES
+        raw_markets = kalshi.get_all_markets(series_list=CHAMPIONSHIP_SERIES + NON_SPORTS_SERIES)
         if not generator._poly_cache:
             logger.warning("Polymarket cache empty — refreshing inline before PM price collection")
             generator.refresh_poly_cache()
