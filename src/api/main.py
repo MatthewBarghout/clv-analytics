@@ -1931,6 +1931,14 @@ async def get_cross_platform_signals(
         db.close()
 
 
+def _run_save_daily_picks():
+    try:
+        from src.api.ml_endpoints import _save_picks
+        _save_picks()
+    except Exception as e:
+        logger.error(f"Scheduled save_daily_picks failed: {e}", exc_info=True)
+
+
 def _infer_category(ticker: str) -> str:
     if ticker.startswith(("KXBTC", "KXETH")):
         return "crypto"
@@ -2165,6 +2173,12 @@ try:
         minutes=30,
         id="poly_cache_refresh",
         replace_existing=True,
+    )
+
+    # Snapshot Best EV picks every 2 hours — deduplicates, so safe to run repeatedly
+    _scheduler.add_job(
+        _run_save_daily_picks, "cron", hour="10-20", minute=0,
+        id="save_daily_picks", replace_existing=True,
     )
 
     # Collect PM prices and generate signals every 10 minutes

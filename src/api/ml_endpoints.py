@@ -1173,172 +1173,173 @@ async def get_best_ev_history(days: int = 30):
         db.close()
 
 
+def _save_picks():
+    """Snapshot today's top EV picks to BestEVPick. Safe to call multiple times — deduplicates on (game_id, market_type, outcome_name)."""
+    db = SessionLocal()
+    try:
+        model = get_model()
+        engineer = FeatureEngineer()
+        now = datetime.now(timezone.utc)
+        today = now.date()
+
+        # Build set of already-saved (game_id, market_type, outcome_name) for today
+        existing_keys = set(
+            (row[0], row[1], row[2])
+            for row in db.execute(
+                select(BestEVPick.game_id, BestEVPick.market_type, BestEVPick.outcome_name)
+                .where(BestEVPick.report_date == today)
+            ).all()
+        )
+
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+
+        stmt = (
+            select(OddsSnapshot, Game)
+            .join(Game, Game.id == OddsSnapshot.game_id)
+            .where(Game.commence_time >= today_start)
+            .where(Game.commence_time < today_end)
+            .where(Game.commence_time > now)
+        )
+        results = db.execute(stmt).all()
+        if not results:
+            logger.info("No upcoming games today for Best EV picks")
+            return
+
+        bk_ids = list({snap.bookmaker_id for snap, _ in results})
+        bk_map = {
+            b.id: b
+            for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(bk_ids))).scalars().all()
+        }
+
+        candidates = []
+        for snapshot, game in results:
+            hours_to_game = (game.commence_time - now).total_seconds() / 3600
+            if hours_to_game < 1.0:
+                continue
+            bookmaker = bk_map.get(snapshot.bookmaker_id)
+            day_of_week = game.commence_time.weekday()
+            is_weekend = day_of_week >= 5
+
+            for outcome in snapshot.outcomes:
+                outcome_name = outcome.get("name")
+                opening_price = outcome.get("price")
+                opening_point = outcome.get("point", 0.0)
+                if not outcome_name or opening_price is None:
+                    continue
+
+                # Skip already-tracked combos
+                if (game.id, snapshot.market_type, outcome_name) in existing_keys:
+                    continue
+
+                consensus_line = engineer.calculate_consensus_line(
+                    db, game.id, snapshot.market_type, outcome_name
+                )
+                line_spread = engineer.calculate_line_spread(
+                    db, game.id, snapshot.market_type, outcome_name
+                )
+
+                temporal = engineer.calculate_temporal_features(
+                    db, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, snapshot.timestamp,
+                )
+                bk_features = engineer.calculate_bookmaker_features(
+                    db, game.id, snapshot.bookmaker_id,
+                    snapshot.market_type, outcome_name, float(opening_price),
+                )
+
+                features = pd.DataFrame([{
+                    "bookmaker_id": snapshot.bookmaker_id,
+                    "market_type": snapshot.market_type,
+                    "hours_to_game": hours_to_game,
+                    "day_of_week": day_of_week,
+                    "is_weekend": is_weekend,
+                    "outcome_name": outcome_name,
+                    "opening_price": float(opening_price),
+                    "opening_point": float(opening_point) if opening_point is not None else 0.0,
+                    "consensus_line": consensus_line if consensus_line is not None else float(opening_price),
+                    "line_spread": line_spread if line_spread is not None else 0.0,
+                    "distance_from_consensus": float(opening_price) - consensus_line if consensus_line else 0.0,
+                    "is_outlier": abs(float(opening_price) - consensus_line) > 0.05 if consensus_line else False,
+                    "time_since_last_update": temporal["time_since_last_update"],
+                    "movement_velocity": temporal["movement_velocity"],
+                    "updates_count": temporal["updates_count"],
+                    "price_volatility_24h": temporal["price_volatility_24h"],
+                    "cumulative_movement": temporal["cumulative_movement"],
+                    "movement_direction_changes": temporal["movement_direction_changes"],
+                    "bookmaker_is_sharp": bk_features["bookmaker_is_sharp"],
+                    "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
+                    "books_moved_count": bk_features["books_moved_count"],
+                    "steam_move_signal": bk_features["steam_move_signal"],
+                }])
+
+                try:
+                    pred = model.predict_movement(features)
+                    predicted_delta = float(pred["predicted_delta"][0])
+                    confidence = float(pred["confidence"][0])
+                    direction = pred["predicted_direction"][0]
+
+                    if confidence < 0.62:
+                        continue
+
+                    MIN_MOVEMENT = 0.025
+                    if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
+                        ev_score = abs(predicted_delta) * confidence * 100
+                    elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
+                        ev_score = abs(predicted_delta) * confidence * 100
+                    else:
+                        continue
+
+                    if ev_score < 2.0:
+                        continue
+
+                    candidates.append({
+                        "game_id": game.id,
+                        "bookmaker": bookmaker.name if bookmaker else "Unknown",
+                        "market_type": snapshot.market_type,
+                        "outcome_name": outcome_name,
+                        "entry_odds": float(opening_price),
+                        "point_line": float(opening_point) if opening_point else None,
+                        "ev_score": ev_score,
+                        "confidence": confidence,
+                        "predicted_delta": predicted_delta,
+                    })
+                except Exception:
+                    continue
+
+        # Save top new picks (up to 20 per run, no daily cap)
+        candidates.sort(key=lambda x: x["ev_score"], reverse=True)
+        saved = 0
+        for c in candidates[:20]:
+            pick = BestEVPick(
+                game_id=c["game_id"],
+                report_date=today,
+                bookmaker=c["bookmaker"],
+                market_type=c["market_type"],
+                outcome_name=c["outcome_name"],
+                entry_odds=c["entry_odds"],
+                point_line=c["point_line"],
+                ev_score=c["ev_score"],
+                confidence=c["confidence"],
+                predicted_delta=c["predicted_delta"],
+                result="pending",
+            )
+            db.add(pick)
+            saved += 1
+
+        db.commit()
+        logger.info(f"Saved {saved} new Best EV picks for {today} ({len(existing_keys)} already tracked)")
+
+    except Exception as e:
+        logger.error(f"Error saving daily picks: {e}", exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
 @router.post("/save-daily-picks")
 async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
-    """
-    Save today's best EV picks to the BestEVPick tracking table.
-
-    Called daily (or manually) to snapshot today's top recommendations.
-    Skips picks already saved for today.
-    """
-
-    def _save_picks():
-        db = SessionLocal()
-        try:
-            model = get_model()
-            engineer = FeatureEngineer()
-            now = datetime.now(timezone.utc)
-            today = now.date()
-
-            # Check if picks already saved for today
-            existing = db.execute(
-                select(BestEVPick).where(BestEVPick.report_date == today)
-            ).scalars().first()
-            if existing:
-                logger.info(f"Best EV picks already saved for {today}, skipping")
-                return
-
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            today_end = today_start + timedelta(days=1)
-
-            stmt = (
-                select(OddsSnapshot, Game)
-                .join(Game, Game.id == OddsSnapshot.game_id)
-                .where(Game.commence_time >= today_start)
-                .where(Game.commence_time < today_end)
-                .where(Game.commence_time > now)
-            )
-            results = db.execute(stmt).all()
-            if not results:
-                logger.info("No upcoming games today for Best EV picks")
-                return
-
-            bk_ids = list({snap.bookmaker_id for snap, _ in results})
-            bk_map = {
-                b.id: b
-                for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(bk_ids))).scalars().all()
-            }
-
-            candidates = []
-            for snapshot, game in results:
-                hours_to_game = (game.commence_time - now).total_seconds() / 3600
-                if hours_to_game < 1.0:
-                    continue
-                bookmaker = bk_map.get(snapshot.bookmaker_id)
-                day_of_week = game.commence_time.weekday()
-                is_weekend = day_of_week >= 5
-
-                for outcome in snapshot.outcomes:
-                    outcome_name = outcome.get("name")
-                    opening_price = outcome.get("price")
-                    opening_point = outcome.get("point", 0.0)
-                    if not outcome_name or opening_price is None:
-                        continue
-
-                    consensus_line = engineer.calculate_consensus_line(
-                        db, game.id, snapshot.market_type, outcome_name
-                    )
-                    line_spread = engineer.calculate_line_spread(
-                        db, game.id, snapshot.market_type, outcome_name
-                    )
-
-                    temporal = engineer.calculate_temporal_features(
-                        db, game.id, snapshot.bookmaker_id,
-                        snapshot.market_type, outcome_name, snapshot.timestamp,
-                    )
-                    bk_features = engineer.calculate_bookmaker_features(
-                        db, game.id, snapshot.bookmaker_id,
-                        snapshot.market_type, outcome_name, float(opening_price),
-                    )
-
-                    features = pd.DataFrame([{
-                        "bookmaker_id": snapshot.bookmaker_id,
-                        "market_type": snapshot.market_type,
-                        "hours_to_game": hours_to_game,
-                        "day_of_week": day_of_week,
-                        "is_weekend": is_weekend,
-                        "outcome_name": outcome_name,
-                        "opening_price": float(opening_price),
-                        "opening_point": float(opening_point) if opening_point is not None else 0.0,
-                        "consensus_line": consensus_line if consensus_line is not None else float(opening_price),
-                        "line_spread": line_spread if line_spread is not None else 0.0,
-                        "distance_from_consensus": float(opening_price) - consensus_line if consensus_line else 0.0,
-                        "is_outlier": abs(float(opening_price) - consensus_line) > 0.05 if consensus_line else False,
-                        "time_since_last_update": temporal["time_since_last_update"],
-                        "movement_velocity": temporal["movement_velocity"],
-                        "updates_count": temporal["updates_count"],
-                        "price_volatility_24h": temporal["price_volatility_24h"],
-                        "cumulative_movement": temporal["cumulative_movement"],
-                        "movement_direction_changes": temporal["movement_direction_changes"],
-                        "bookmaker_is_sharp": bk_features["bookmaker_is_sharp"],
-                        "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
-                        "books_moved_count": bk_features["books_moved_count"],
-                        "steam_move_signal": bk_features["steam_move_signal"],
-                    }])
-
-                    try:
-                        pred = model.predict_movement(features)
-                        predicted_delta = float(pred["predicted_delta"][0])
-                        confidence = float(pred["confidence"][0])
-                        direction = pred["predicted_direction"][0]
-
-                        if confidence < 0.62:
-                            continue
-
-                        MIN_MOVEMENT = 0.025
-                        if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
-                            ev_score = abs(predicted_delta) * confidence * 100
-                        elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
-                            ev_score = abs(predicted_delta) * confidence * 100
-                        else:
-                            continue
-
-                        if ev_score < 2.0:
-                            continue
-
-                        candidates.append({
-                            "game_id": game.id,
-                            "bookmaker": bookmaker.name if bookmaker else "Unknown",
-                            "market_type": snapshot.market_type,
-                            "outcome_name": outcome_name,
-                            "entry_odds": float(opening_price),
-                            "point_line": float(opening_point) if opening_point else None,
-                            "ev_score": ev_score,
-                            "confidence": confidence,
-                            "predicted_delta": predicted_delta,
-                        })
-                    except Exception:
-                        continue
-
-            # Save top picks (up to 20)
-            candidates.sort(key=lambda x: x["ev_score"], reverse=True)
-            saved = 0
-            for c in candidates[:20]:
-                pick = BestEVPick(
-                    game_id=c["game_id"],
-                    report_date=today,
-                    bookmaker=c["bookmaker"],
-                    market_type=c["market_type"],
-                    outcome_name=c["outcome_name"],
-                    entry_odds=c["entry_odds"],
-                    point_line=c["point_line"],
-                    ev_score=c["ev_score"],
-                    confidence=c["confidence"],
-                    predicted_delta=c["predicted_delta"],
-                    result="pending",
-                )
-                db.add(pick)
-                saved += 1
-
-            db.commit()
-            logger.info(f"Saved {saved} Best EV picks for {today}")
-
-        except Exception as e:
-            logger.error(f"Error saving daily picks: {e}", exc_info=True)
-            db.rollback()
-        finally:
-            db.close()
-
+    """Snapshot today's best EV picks. Safe to call multiple times — deduplicates on (game_id, market_type, outcome_name)."""
     background_tasks.add_task(_save_picks)
     return {"status": "scheduled", "message": "Daily Best EV picks are being saved in the background"}
 
