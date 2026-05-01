@@ -64,27 +64,51 @@ class PMSignalGenerator:
     def _match_polymarket(self, question: str) -> Optional[float]:
         """Find the best-matching Polymarket market for a Kalshi question title.
 
-        Returns the YES price of the best match if similarity >= SIMILARITY_THRESHOLD,
-        else None.
+        First tries cached word-overlap similarity. On a cache miss, falls back
+        to Polymarket's search API (?q=) which handles non-sports questions
+        (crypto, politics, economics) where phrasing rarely overlaps enough.
+
+        Returns the YES price of the best match, else None.
         """
         if not _POLY_CACHE:
             self.refresh_poly_cache()
-        if not _POLY_CACHE:
-            return None
 
-        best_sim = 0.0
-        best_price = None
-        for m in _POLY_CACHE:
-            sim = _similarity(question, m.get("title", ""))
-            if sim > best_sim:
-                best_sim = sim
-                best_price = m.get("yes_implied_prob")
+        if _POLY_CACHE:
+            best_sim = 0.0
+            best_price = None
+            for m in _POLY_CACHE:
+                sim = _similarity(question, m.get("title", ""))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_price = m.get("yes_implied_prob")
 
-        if best_sim >= SIMILARITY_THRESHOLD and best_price is not None:
-            logger.debug(f"Polymarket match accepted (sim={best_sim:.2f}) for '{question[:50]}'")
-            return float(best_price)
+            if best_sim >= SIMILARITY_THRESHOLD and best_price is not None:
+                logger.debug(f"Polymarket cache match (sim={best_sim:.2f}) for '{question[:50]}'")
+                return float(best_price)
 
-        logger.debug(f"Polymarket match rejected (best_sim={best_sim:.2f}) for '{question[:50]}'")
+            logger.debug(f"Polymarket cache miss (sim={best_sim:.2f}), trying search for '{question[:50]}'")
+
+        # Search API fallback — handles non-sports/crypto/politics where phrasing diverges.
+        # Guard with similarity check to reject irrelevant high-volume markets that
+        # Polymarket's search ranks first regardless of query.
+        try:
+            result = self._poly.get_market_price(question[:200])
+            if result:
+                returned_question = result.get("question", "")
+                relevance = _similarity(question, returned_question)
+                if relevance >= SIMILARITY_THRESHOLD:
+                    logger.debug(
+                        f"Polymarket search match (sim={relevance:.2f}) for '{question[:50]}': "
+                        f"{result['yes_price']:.3f} ('{returned_question[:50]}')"
+                    )
+                    return float(result["yes_price"])
+                logger.debug(
+                    f"Polymarket search rejected (sim={relevance:.2f}): "
+                    f"'{returned_question[:50]}' for '{question[:50]}'"
+                )
+        except Exception as e:
+            logger.debug(f"Polymarket search fallback failed for '{question[:50]}': {e}")
+
         return None
 
     def fair_value(
@@ -174,10 +198,26 @@ class PMSignalGenerator:
         }
 
 
+_STOPWORDS = {
+    "will", "the", "a", "an", "of", "in", "to", "be", "is", "are", "was",
+    "it", "for", "on", "at", "by", "or", "and", "before", "after", "than",
+    "that", "this", "with", "have", "has", "any", "all", "not", "no", "do",
+    "does", "did", "its", "their", "there", "than", "then", "when", "what",
+    "which", "who", "how", "if", "as", "up", "out", "about", "into",
+}
+
+
+def _tokenize(s: str) -> set:
+    import re
+    # Normalize: lowercase, strip punctuation except $ and digits, split
+    tokens = re.sub(r"[^\w\s$]", " ", s.lower()).split()
+    return {t for t in tokens if t not in _STOPWORDS and len(t) > 1}
+
+
 def _similarity(a: str, b: str) -> float:
-    """Word-overlap similarity, normalized to the shorter string."""
-    a_words = set(a.lower().split())
-    b_words = set(b.lower().split())
+    """Word-overlap similarity with stopword removal, normalized to the shorter string."""
+    a_words = _tokenize(a)
+    b_words = _tokenize(b)
     if not a_words or not b_words:
         return 0.0
     return len(a_words & b_words) / min(len(a_words), len(b_words))
