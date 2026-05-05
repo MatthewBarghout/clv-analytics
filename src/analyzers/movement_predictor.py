@@ -581,6 +581,10 @@ class LineMovementPredictor:
         Returns:
             Dictionary with accuracy, precision, recall for XGBoost, RF, and Ensemble
         """
+        if y_test is None or len(y_test) == 0:
+            logger.warning("evaluate_classification called with empty y_test — skipping")
+            return {}
+
         X_test_processed = self.preprocessor.transform(X_test)
         y_test_encoded = self.label_encoder.transform(y_test)
 

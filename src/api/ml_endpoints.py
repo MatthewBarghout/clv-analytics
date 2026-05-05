@@ -1299,7 +1299,7 @@ def _save_picks():
                         "market_type": snapshot.market_type,
                         "outcome_name": outcome_name,
                         "entry_odds": float(opening_price),
-                        "point_line": float(opening_point) if opening_point else None,
+                        "point_line": float(opening_point) if opening_point is not None else None,
                         "ev_score": ev_score,
                         "confidence": confidence,
                         "predicted_delta": predicted_delta,

@@ -161,11 +161,11 @@ class PMSignalGenerator:
             return None
 
         fv_yes = self.fair_value(yes_price, poly_price, meta_forecast)
-        fv_no = self.fair_value(
-            no_price,
-            1.0 - poly_price if poly_price is not None else None,
-            1.0 - meta_forecast if meta_forecast is not None else None,
-        )
+        # Clamp inverted prices to (0, 1) exclusive — boundary values (0.0/1.0)
+        # from external sources can push fair_value outside valid probability range.
+        poly_no = max(0.01, min(0.99, 1.0 - poly_price)) if poly_price is not None else None
+        meta_no = max(0.01, min(0.99, 1.0 - meta_forecast)) if meta_forecast is not None else None
+        fv_no = self.fair_value(no_price, poly_no, meta_no)
 
         edge_yes = fv_yes - yes_price
         edge_no = fv_no - no_price
