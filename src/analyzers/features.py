@@ -8,7 +8,7 @@ import pandas as pd
 from sqlalchemy import select, and_
 from sqlalchemy.orm import Session
 
-from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot
+from src.models.database import Bookmaker, ClosingLine, Game, OddsSnapshot, Sport
 
 logger = logging.getLogger(__name__)
 
@@ -369,20 +369,21 @@ class FeatureEngineer:
             logger.error(f"Error calculating line spread: {e}")
             return None
 
-    def prepare_training_data(self, session: Session) -> pd.DataFrame:
+    def prepare_training_data(self, session: Session, sport_key: Optional[str] = None) -> pd.DataFrame:
         """
         Prepare training data with movement deltas as targets.
 
-        Queries all odds snapshots that have corresponding closing lines,
-        extracts features including consensus/spread, and calculates movement.
-
         Args:
             session: SQLAlchemy database session
+            sport_key: If provided, restrict training data to this sport only (e.g. 'basketball_nba')
 
         Returns:
             DataFrame with features, movement_delta, and directional_movement
         """
-        logger.info("Preparing training data for movement prediction...")
+        if sport_key:
+            logger.info(f"Preparing training data for sport: {sport_key}")
+        else:
+            logger.info("Preparing training data for movement prediction...")
 
         # Query snapshots with corresponding closing lines
         stmt = (
@@ -396,6 +397,9 @@ class FeatureEngineer:
             .join(Game, Game.id == OddsSnapshot.game_id)
             .join(Bookmaker, Bookmaker.id == OddsSnapshot.bookmaker_id)
         )
+
+        if sport_key:
+            stmt = stmt.join(Sport, Sport.id == Game.sport_id).where(Sport.key == sport_key)
 
         results = session.execute(stmt).all()
         logger.info(f"Found {len(results)} snapshot-closing line pairs")

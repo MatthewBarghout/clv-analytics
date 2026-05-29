@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -39,11 +39,18 @@ DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Model path
-MODEL_PATH = "models/line_movement_predictor.pkl"
+# Per-sport model directory
+MODEL_DIR = "models"
 
-# Global model instance
-_model: Optional[LineMovementPredictor] = None
+# Per-sport model cache: sport_key -> LineMovementPredictor
+_models: Dict[str, LineMovementPredictor] = {}
+
+# Minimum confidence for h2h picks — data shows 0.62-0.74 h2h is near-random
+MIN_H2H_CONFIDENCE = 0.75
+
+
+def _model_path(sport_key: str) -> str:
+    return f"{MODEL_DIR}/line_movement_predictor_{sport_key}.pkl"
 
 
 def get_db() -> Session:
@@ -55,22 +62,32 @@ def get_db() -> Session:
         pass
 
 
-def get_model() -> LineMovementPredictor:
-    """Get or load the trained movement prediction model."""
-    global _model
+def get_model(sport_key: str) -> Optional[LineMovementPredictor]:
+    """Load and cache the model for a specific sport. Returns None if not trained yet."""
+    global _models
 
-    if _model is None:
-        if not Path(MODEL_PATH).exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Model not trained yet. Please run scripts/train_movement_model.py first.",
-            )
+    if sport_key not in _models:
+        path = _model_path(sport_key)
+        if not Path(path).exists():
+            return None
+        model = LineMovementPredictor()
+        model.load_model(path)
+        _models[sport_key] = model
+        logger.info(f"Loaded {sport_key} model from {path}")
 
-        _model = LineMovementPredictor()
-        _model.load_model(MODEL_PATH)
-        logger.info("Movement prediction model loaded successfully")
+    return _models[sport_key]
 
-    return _model
+
+def _any_model_path() -> Optional[str]:
+    """Return path of first available sport model, for backward-compat stat endpoints."""
+    for p in Path(MODEL_DIR).glob("line_movement_predictor_*.pkl"):
+        return str(p)
+    return None
+
+
+def _sport_key_from_path(path: str) -> str:
+    """Extract sport_key from a model file path."""
+    return Path(path).stem.replace("line_movement_predictor_", "")
 
 
 # Response models
@@ -167,22 +184,20 @@ def decimal_to_american(decimal_odds: float) -> str:
 
 
 @router.get("/stats", response_model=MovementModelStats)
-async def get_model_stats():
-    """
-    Get movement prediction model performance metrics.
-
-    Returns model statistics including movement MAE, directional accuracy, and baseline comparison.
-    """
+async def get_model_stats(sport_key: Optional[str] = None):
+    """Get movement prediction model performance metrics for a sport (defaults to first available)."""
     try:
-        # Check if model exists
-        if not Path(MODEL_PATH).exists():
+        if sport_key is None:
+            first_path = _any_model_path()
+            if not first_path:
+                return MovementModelStats(is_trained=False)
+            sport_key = _sport_key_from_path(first_path)
+
+        model = get_model(sport_key)
+        if model is None:
             return MovementModelStats(is_trained=False)
 
-        # Load model
-        model = get_model()
-
-        # Get file modification time
-        model_file = Path(MODEL_PATH)
+        model_file = Path(_model_path(sport_key))
         last_trained = datetime.fromtimestamp(
             model_file.stat().st_mtime, tz=timezone.utc
         ).isoformat()
@@ -191,7 +206,7 @@ async def get_model_stats():
         db = get_db()
         try:
             engineer = FeatureEngineer()
-            df = engineer.prepare_training_data(db)
+            df = engineer.prepare_training_data(db, sport_key=sport_key)
 
             if len(df) == 0:
                 return MovementModelStats(
@@ -236,14 +251,18 @@ async def get_model_stats():
 
 
 @router.get("/feature-importance", response_model=List[FeatureImportance])
-async def get_feature_importance():
-    """
-    Get feature importance rankings for movement prediction.
-
-    Returns features sorted by their importance in the movement model.
-    """
+async def get_feature_importance(sport_key: Optional[str] = None):
+    """Get feature importance rankings. Defaults to first available sport model."""
     try:
-        model = get_model()
+        if sport_key is None:
+            first_path = _any_model_path()
+            if not first_path:
+                raise HTTPException(status_code=404, detail="No trained models found")
+            sport_key = _sport_key_from_path(first_path)
+
+        model = get_model(sport_key)
+        if model is None:
+            raise HTTPException(status_code=404, detail=f"No model trained for {sport_key}")
         importance_dict = model.get_feature_importance()
 
         importance_list = [
@@ -268,7 +287,6 @@ async def get_game_predictions(game_id: int):
     db = get_db()
 
     try:
-        model = get_model()
         engineer = FeatureEngineer()
 
         # Get all snapshots for this game, joining bookmaker so no per-row query is needed
@@ -286,6 +304,18 @@ async def get_game_predictions(game_id: int):
         )
 
         results = db.execute(stmt).all()
+
+        # Resolve sport and load appropriate model
+        game_obj = results[0][2] if results else None
+        sport_key = None
+        if game_obj and game_obj.sport_id:
+            sport = db.execute(select(Sport).where(Sport.id == game_obj.sport_id)).scalar_one_or_none()
+            sport_key = sport.key if sport else None
+        if not sport_key:
+            raise HTTPException(status_code=404, detail="Could not determine sport for game")
+        model = get_model(sport_key)
+        if model is None:
+            raise HTTPException(status_code=404, detail=f"No model trained for sport {sport_key}")
 
         if not results:
             raise HTTPException(
@@ -426,7 +456,6 @@ async def get_best_opportunities(
     db = get_db()
 
     try:
-        model = get_model()
         engineer = FeatureEngineer()
 
         # Get upcoming games
@@ -492,6 +521,15 @@ async def get_best_opportunities(
             # Apply bookmaker filter using pre-fetched map
             bookmaker = best_opp_bk_map.get(snapshot.bookmaker_id)
             if bookmaker_filter and (not bookmaker or bookmaker.name != bookmaker_filter):
+                continue
+
+            # Load sport-specific model — skip game if no model trained for this sport
+            game_sport = best_opp_sports_map.get(game.sport_id) if game.sport_id else None
+            game_sport_key = game_sport.key if game_sport else None
+            if not game_sport_key:
+                continue
+            model = get_model(game_sport_key)
+            if model is None:
                 continue
 
             day_of_week = game.commence_time.weekday()
@@ -565,7 +603,8 @@ async def get_best_opportunities(
 
                 # Strict thresholds: skip low-confidence and marginal signals
                 MIN_MOVEMENT = 0.025  # Require meaningful line movement (was 0.01)
-                if confidence < min_confidence:
+                effective_min_confidence = max(min_confidence, MIN_H2H_CONFIDENCE) if snapshot.market_type == "h2h" else min_confidence
+                if confidence < effective_min_confidence:
                     continue
 
                 # Calculate EV score (higher = better opportunity)
@@ -595,7 +634,6 @@ async def get_best_opportunities(
 
                 home_t = best_opp_teams_map.get(game.home_team_id)
                 away_t = best_opp_teams_map.get(game.away_team_id)
-                sport = best_opp_sports_map.get(game.sport_id) if game.sport_id else None
                 opportunities.append(EVOpportunity(
                     game_id=game.id,
                     home_team=home_t.name if home_t else "Unknown",
@@ -610,7 +648,7 @@ async def get_best_opportunities(
                     confidence=confidence,
                     ev_score=ev_score,
                     was_constrained=was_constrained,
-                    sport_key=sport.key if sport else None,
+                    sport_key=game_sport_key,
                 ))
 
         # Sort by EV score
@@ -635,43 +673,35 @@ async def retrain_model(background_tasks: BackgroundTasks):
     try:
 
         def retrain():
-            """Background task to retrain the model."""
+            """Background task to retrain per-sport models."""
+            from src.models.database import Sport as SportModel
             db = SessionLocal()
             try:
-                logger.info("Starting background model retraining...")
-
+                logger.info("Starting background per-sport model retraining...")
                 engineer = FeatureEngineer()
-                df = engineer.prepare_training_data(db)
+                sports = db.execute(select(SportModel)).scalars().all()
 
-                if len(df) == 0:
-                    logger.error("No training data available for retraining")
-                    return
+                for sport in sports:
+                    sk = sport.key
+                    logger.info(f"Retraining {sk}...")
+                    df = engineer.prepare_training_data(db, sport_key=sk)
+                    if len(df) < 200:
+                        logger.warning(f"Insufficient data for {sk} ({len(df)} rows) — skipping")
+                        continue
 
-                X_train, X_test, y_reg_train, y_reg_test, y_class_train, y_class_test = (
-                    engineer.train_test_split_data(df)
-                )
+                    X_train, X_test, y_reg_train, y_reg_test, y_class_train, y_class_test = (
+                        engineer.train_test_split_data(df)
+                    )
+                    predictor = LineMovementPredictor(n_estimators=100, max_depth=6, learning_rate=0.1)
+                    predictor.train(X_train, y_reg_train, y_class_train)
+                    predictor.evaluate_regression(X_test, y_reg_test)
+                    predictor.evaluate_classification(X_test, y_class_test)
+                    predictor.save_model(_model_path(sk))
+                    # Evict cached model so next request reloads fresh
+                    _models.pop(sk, None)
+                    logger.info(f"Retraining complete for {sk}")
 
-                predictor = LineMovementPredictor(
-                    n_estimators=100,
-                    max_depth=6,
-                    learning_rate=0.1,
-                )
-                predictor.train(X_train, y_reg_train, y_class_train)
-
-                # Evaluate
-                regression_metrics = predictor.evaluate_regression(X_test, y_reg_test)
-                classification_metrics = predictor.evaluate_classification(X_test, y_class_test)
-                logger.info(f"Regression metrics: {regression_metrics}")
-                logger.info(f"Classification metrics: {classification_metrics}")
-
-                # Save model
-                predictor.save_model(MODEL_PATH)
-
-                # Clear global model to force reload
-                global _model
-                _model = None
-
-                logger.info("Model retraining completed successfully")
+                logger.info("All sport models retrained successfully")
 
             except Exception as e:
                 logger.error(f"Error during retraining: {e}", exc_info=True)
@@ -693,13 +723,12 @@ async def retrain_model(background_tasks: BackgroundTasks):
 
 @router.get("/is-trained")
 async def check_model_trained():
-    """
-    Check if movement prediction model is trained.
-
-    Returns simple status indicating if model file exists.
-    """
-    is_trained = Path(MODEL_PATH).exists()
-    return {"is_trained": is_trained, "model_path": MODEL_PATH}
+    """Check which sport models are trained."""
+    sport_models = {
+        p.stem.replace("line_movement_predictor_", ""): str(p)
+        for p in Path(MODEL_DIR).glob("line_movement_predictor_*.pkl")
+    }
+    return {"is_trained": len(sport_models) > 0, "sport_models": sport_models}
 
 
 # ============================================================================
@@ -895,7 +924,6 @@ async def get_upcoming_opportunities(
     db = get_db()
 
     try:
-        model = get_model()
         engineer = FeatureEngineer()
 
         now = datetime.now(timezone.utc)
@@ -922,6 +950,13 @@ async def get_upcoming_opportunities(
             t.id: t
             for t in db.execute(select(Team).where(Team.id.in_(away_team_ids))).scalars().all()
         }
+
+        # Pre-fetch sports for all games
+        upcoming_sport_ids = list({game.sport_id for game, _ in games if game.sport_id})
+        upcoming_sports_map = {
+            s.id: s
+            for s in db.execute(select(Sport).where(Sport.id.in_(upcoming_sport_ids))).scalars().all()
+        }
         # Load all snapshots for upcoming games at once
         all_snapshots = db.execute(
             select(OddsSnapshot).where(OddsSnapshot.game_id.in_(upcoming_game_ids))
@@ -942,6 +977,15 @@ async def get_upcoming_opportunities(
         for game, home_team in games:
             away_team = upcoming_away_map.get(game.away_team_id)
             snapshots = snapshots_by_game.get(game.id, [])
+
+            # Load sport-specific model — skip game if not trained
+            game_sport = upcoming_sports_map.get(game.sport_id) if game.sport_id else None
+            game_sport_key = game_sport.key if game_sport else None
+            if not game_sport_key:
+                continue
+            model = get_model(game_sport_key)
+            if model is None:
+                continue
 
             game_opps = []
             for snapshot in snapshots:
@@ -1177,7 +1221,6 @@ def _save_picks():
     """Snapshot today's top EV picks to BestEVPick. Safe to call multiple times — deduplicates on (game_id, market_type, outcome_name)."""
     db = SessionLocal()
     try:
-        model = get_model()
         engineer = FeatureEngineer()
         now = datetime.now(timezone.utc)
         today = now.date()
@@ -1212,11 +1255,28 @@ def _save_picks():
             for b in db.execute(select(Bookmaker).where(Bookmaker.id.in_(bk_ids))).scalars().all()
         }
 
+        # Pre-fetch sports
+        save_sport_ids = list({game.sport_id for _, game in results if game.sport_id})
+        save_sports_map = {
+            s.id: s
+            for s in db.execute(select(Sport).where(Sport.id.in_(save_sport_ids))).scalars().all()
+        }
+
         candidates = []
         for snapshot, game in results:
             hours_to_game = (game.commence_time - now).total_seconds() / 3600
             if hours_to_game < 1.0:
                 continue
+
+            # Route to sport-specific model
+            game_sport = save_sports_map.get(game.sport_id) if game.sport_id else None
+            game_sport_key = game_sport.key if game_sport else None
+            if not game_sport_key:
+                continue
+            model = get_model(game_sport_key)
+            if model is None:
+                continue
+
             bookmaker = bk_map.get(snapshot.bookmaker_id)
             day_of_week = game.commence_time.weekday()
             is_weekend = day_of_week >= 5
@@ -1279,7 +1339,8 @@ def _save_picks():
                     confidence = float(pred["confidence"][0])
                     direction = pred["predicted_direction"][0]
 
-                    if confidence < 0.62:
+                    pick_min_conf = MIN_H2H_CONFIDENCE if snapshot.market_type == "h2h" else 0.62
+                    if confidence < pick_min_conf:
                         continue
 
                     MIN_MOVEMENT = 0.025
