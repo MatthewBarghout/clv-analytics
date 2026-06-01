@@ -2,9 +2,15 @@
 
 Compares Kalshi prices against Polymarket forecasts to find
 markets where the implied probability diverges significantly from consensus.
+
+For KXBTC/KXETH markets, uses a log-normal options pricing model instead of
+Polymarket text matching — hourly crypto bracket markets have no comparable
+Polymarket equivalent so text similarity produces noise.
 """
 import logging
+import math
 import re
+from datetime import datetime, timezone
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +36,112 @@ _WEIGHTS = {
 
 # Module-level shared cache — persists across PMSignalGenerator instances
 _POLY_CACHE: List[dict] = []
+
+# ── Crypto pricing constants ────────────────────────────────────────────────
+
+_MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+# Half-width of each Kalshi price bracket (observed from market structure)
+_CRYPTO_BRACKET_HALF_WIDTH = {
+    "KXETH": 10.0,    # $20 brackets (B1990, B2010, B2030...)
+    "KXBTC": 125.0,   # $250 brackets (B73125, B73375...)
+}
+
+# CoinGecko asset IDs
+_COINGECKO_ID = {
+    "KXETH": "ethereum",
+    "KXBTC": "bitcoin",
+}
+
+# Annualised historical volatility assumptions
+_CRYPTO_ANNUAL_VOL = {
+    "KXETH": 1.0,   # ~100% annualised
+    "KXBTC": 0.70,  # ~70% annualised
+}
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erfc — no scipy needed."""
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def _parse_crypto_ticker(ticker: str) -> Optional[dict]:
+    """Parse a KXETH/KXBTC ticker into pricing components.
+
+    e.g. KXETH-26MAY3114-B2010  →  {asset_key, coingecko_id, expiry_dt, strike, half_width, annual_vol}
+    """
+    parts = ticker.split("-")
+    if len(parts) != 3:
+        return None
+
+    asset_key = parts[0]
+    if asset_key not in _COINGECKO_ID:
+        return None
+
+    # Date+hour segment: 26MAY3114 → year=2026, month=MAY, day=31, hour=14
+    m = re.match(r"(\d{2})([A-Z]{3})(\d{2})(\d{2})$", parts[1])
+    if not m:
+        return None
+
+    month = _MONTH_MAP.get(m.group(2))
+    if not month:
+        return None
+
+    try:
+        expiry_dt = datetime(
+            2000 + int(m.group(1)), month, int(m.group(3)), int(m.group(4)),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+    if not parts[2].startswith("B"):
+        return None
+    try:
+        strike = float(parts[2][1:])
+    except ValueError:
+        return None
+
+    return {
+        "asset_key": asset_key,
+        "coingecko_id": _COINGECKO_ID[asset_key],
+        "expiry_dt": expiry_dt,
+        "strike": strike,
+        "half_width": _CRYPTO_BRACKET_HALF_WIDTH.get(asset_key, 10.0),
+        "annual_vol": _CRYPTO_ANNUAL_VOL.get(asset_key, 0.8),
+    }
+
+
+def _lognormal_bracket_prob(
+    current_price: float,
+    strike: float,
+    half_width: float,
+    hours_to_expiry: float,
+    annual_vol: float,
+) -> float:
+    """P(asset ends inside [strike - half_width, strike + half_width]) under log-normal.
+
+    Uses zero-drift assumption (r=0) appropriate for short-horizon crypto brackets.
+    """
+    lower = max(strike - half_width, 0.01)
+    upper = strike + half_width
+
+    if hours_to_expiry <= 0:
+        return 1.0 if lower <= current_price <= upper else 0.0
+
+    T = hours_to_expiry / 8760.0
+    sigma_sqrt_T = annual_vol * math.sqrt(T)
+    drift = -0.5 * annual_vol ** 2 * T
+
+    def prob_above(K: float) -> float:
+        d2 = (math.log(current_price / K) + drift) / sigma_sqrt_T
+        return _norm_cdf(d2)
+
+    prob = prob_above(lower) - prob_above(upper)
+    return max(0.001, min(0.999, prob))
 
 
 class PMSignalGenerator:
@@ -139,6 +251,34 @@ class PMSignalGenerator:
         raw = (edge / (1.0 - price)) * KELLY_FRACTION * BANKROLL
         return float(max(MIN_SIZE_USD, min(MAX_SIZE_USD, raw)))
 
+    def _crypto_fair_value_yes(self, ticker: str) -> Optional[float]:
+        """Compute theoretical P(YES) for a KXBTC/KXETH bracket market via log-normal pricing."""
+        from src.collectors.crypto_price_client import get_crypto_price
+
+        parsed = _parse_crypto_ticker(ticker)
+        if parsed is None:
+            return None
+
+        current_price = get_crypto_price(parsed["coingecko_id"])
+        if current_price is None:
+            return None
+
+        now = datetime.now(timezone.utc)
+        hours_to_expiry = (parsed["expiry_dt"] - now).total_seconds() / 3600.0
+
+        prob = _lognormal_bracket_prob(
+            current_price=current_price,
+            strike=parsed["strike"],
+            half_width=parsed["half_width"],
+            hours_to_expiry=hours_to_expiry,
+            annual_vol=parsed["annual_vol"],
+        )
+        logger.debug(
+            f"{ticker}: spot={current_price:.2f} strike={parsed['strike']:.2f} "
+            f"T={hours_to_expiry:.2f}h P(YES)={prob:.4f}"
+        )
+        return prob
+
     def generate_signal(self, market: dict, category: str = "sports") -> Optional[dict]:
         """Evaluate a Kalshi market for a cross-platform signal.
 
@@ -153,19 +293,28 @@ class PMSignalGenerator:
         if yes_price <= 0 or no_price <= 0 or not ticker or not question:
             return None
 
-        poly_price = self._match_polymarket(question)
-        meta_forecast = self._meta.get_forecast(question)
+        # Crypto bracket markets: use log-normal pricing instead of Polymarket text matching
+        is_crypto = ticker.startswith(("KXBTC", "KXETH"))
+        if is_crypto:
+            fv_yes_val = self._crypto_fair_value_yes(ticker)
+            if fv_yes_val is None:
+                return None
+            fv_yes = fv_yes_val
+            fv_no = 1.0 - fv_yes_val
+            poly_price = None
+            meta_forecast = None
+        else:
+            poly_price = self._match_polymarket(question)
+            meta_forecast = self._meta.get_forecast(question)
 
-        # If neither external source matched, no signal is possible
-        if poly_price is None and meta_forecast is None:
-            return None
+            if poly_price is None and meta_forecast is None:
+                return None
 
-        fv_yes = self.fair_value(yes_price, poly_price, meta_forecast)
-        # Clamp inverted prices to (0, 1) exclusive — boundary values (0.0/1.0)
-        # from external sources can push fair_value outside valid probability range.
-        poly_no = max(0.01, min(0.99, 1.0 - poly_price)) if poly_price is not None else None
-        meta_no = max(0.01, min(0.99, 1.0 - meta_forecast)) if meta_forecast is not None else None
-        fv_no = self.fair_value(no_price, poly_no, meta_no)
+            fv_yes = self.fair_value(yes_price, poly_price, meta_forecast)
+            # Clamp inverted prices to (0, 1) exclusive
+            poly_no = max(0.01, min(0.99, 1.0 - poly_price)) if poly_price is not None else None
+            meta_no = max(0.01, min(0.99, 1.0 - meta_forecast)) if meta_forecast is not None else None
+            fv_no = self.fair_value(no_price, poly_no, meta_no)
 
         edge_yes = fv_yes - yes_price
         edge_no = fv_no - no_price
