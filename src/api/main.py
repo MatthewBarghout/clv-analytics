@@ -2054,7 +2054,13 @@ def _run_pm_price_collection():
             db.add(sig_rec)
 
             # Open paper trade only if no existing open position for this ticker
+            # and the market has enough volume to give a reliable bid/ask midpoint.
             if ticker not in open_tickers:
+                if volume < 500:
+                    logger.debug(
+                        f"Skipping trade open for {ticker}: volume={volume} below 500 threshold"
+                    )
+                    continue
                 if signal_count >= MAX_SIGNALS_PER_RUN:
                     break
                 trade = PaperTrade(
@@ -2087,7 +2093,8 @@ def _settle_paper_trades():
     """
     Settle open paper trades against resolved Kalshi markets.
 
-    Runs daily at 3:15 AM via APScheduler.
+    Runs hourly via APScheduler. Sleeps 0.3s between Kalshi calls to stay under
+    rate limits — at ~360 open trades this takes ~2 minutes to complete.
     """
     from src.collectors.kalshi_client import KalshiClient
 
@@ -2100,6 +2107,8 @@ def _settle_paper_trades():
             select(PaperTrade).where(PaperTrade.is_open == True)  # noqa: E712
         ).scalars().all()
 
+        logger.info(f"Paper trade settlement starting: {len(open_trades)} open trades to check")
+
         settled_count = 0
         win_count = 0
         loss_count = 0
@@ -2109,7 +2118,10 @@ def _settle_paper_trades():
                 market = kalshi.get_market(trade.market_ticker)
             except Exception as e:
                 logger.debug(f"Failed to fetch market {trade.market_ticker}: {e}")
+                time.sleep(0.3)
                 continue
+
+            time.sleep(0.3)
 
             if not market:
                 continue
@@ -2187,14 +2199,15 @@ try:
         id="pm_price_collection", replace_existing=True,
     )
 
-    # Settle open paper trades daily at 3:15 AM (offset from settle_picks at 3:00 AM)
+    # Settle open paper trades hourly — continuous settlement avoids the rate-limit
+    # silencing that happened when 359 trades were checked in one 3 AM batch.
     _scheduler.add_job(
-        _settle_paper_trades, "cron", hour=3, minute=15,
+        _settle_paper_trades, "interval", hours=1,
         id="settle_paper_trades", replace_existing=True,
     )
 
     _scheduler.start()
-    logger.info("APScheduler started: arb polling every 5 min, PM price collection every 10 min, paper trade settlement at 3:15 AM")
+    logger.info("APScheduler started: arb polling every 5 min, PM price collection every 10 min, paper trade settlement every hour")
 
 except ImportError:
     logger.warning(

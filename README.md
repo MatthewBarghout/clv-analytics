@@ -155,7 +155,7 @@ All three market types settle correctly:
 Live monitoring of spread between traditional sportsbook implied probabilities and Kalshi.
 
 - Polls Kalshi every 5 minutes via APScheduler
-- Series-based fetch (KXNBAGAME, KXMLBGAME, KXNHLGAME, KXNFLGAME, KXNBAPTS, KXNBAREB, KXMMA, KXSOCCER) with keyword scan fallback when all series are off-season
+- Series-based fetch (KXMLBGAME, KXNHLGAME, KXNFLGAME, KXMMA, KXSOCCER) with keyword scan fallback when all series are off-season. NBA game/prop series (`KXNBAGAME`, `KXNBAPTS`, `KXNBAREB`) are held in `NBA_GAME_SERIES` and re-added when NBA resumes (~October).
 - Bid/ask midpoint used for probability estimates (more accurate than bid-only)
 - Auto-refreshes every 60 seconds; manual "Refresh Now" triggers a fresh backend poll
 - Color-coded: green ≥ 2%, yellow 1–2%, gray < 1%
@@ -176,12 +176,16 @@ Cross-platform signal engine that compares Kalshi prices against Polymarket and 
 3. Compute weighted fair value: Polymarket 45%, Metaculus 35%, Kalshi momentum 20%
 4. If `max(edge_YES, edge_NO) > 6%` → open a paper trade
 5. Skip if an open position already exists for that ticker
+6. Skip if Kalshi `volume < 500` — illiquid markets have unreliable bid/ask midpoints (signals and price snapshots are still stored)
+7. Reject the Polymarket match entirely when `|kalshi − poly| > 0.50` and the word-overlap similarity is `< 0.70` — guards against championship-futures collisions (e.g. Texas Rangers vs Texas Longhorns)
+8. Reject any signal where `entry_price > 0.80` and `edge < 0.10` — the risk/reward at high prices doesn't justify a 6% edge
 
 **Kalshi series covered:**
 
 | Category | Series |
 |---|---|
-| Sports | KXNBAGAME, KXMLBGAME, KXNHLGAME, KXNFLGAME, KXNBAPTS, KXNBAREB, KXMMA, KXSOCCER |
+| Sports (active) | KXMLBGAME, KXNHLGAME, KXNFLGAME, KXMMA, KXSOCCER |
+| Sports (off-season — `NBA_GAME_SERIES`) | KXNBAGAME, KXNBAPTS, KXNBAREB |
 | Sports futures | KXNBA, KXMLB, KXNHL, KXNFL |
 | Crypto | KXBTC, KXETH |
 | Politics | KXPRES, KXFED, KXHOUSE, KXSENATE |
@@ -199,13 +203,16 @@ Game-level series (individual match outcomes) are excluded from signal generatio
 ```
 size = (edge / (1 − entry_price)) × 0.25 × $1000
 Clamped: $25 minimum, $200 maximum
+Additional cap: $50 max when entry_price > 0.80
 ```
 
-**Settlement (daily 3:15 AM):**
-- Fetches Kalshi market status via API
+**Settlement (hourly):**
+- Fetches Kalshi market status via API with a 0.3s sleep between calls (rate-limit safe)
+- Per-trade try/except so one bad call doesn't abort the batch
 - Settles when `status == "finalized"` and `result` is `"yes"` or `"no"`
 - WIN pnl: `(1.0 − entry_price) × (size_usd / entry_price)`
 - LOSS pnl: `−size_usd`
+- Each run logs `Paper trade settlement starting: N open trades to check` then `Paper trade settlement: M settled (W wins, L losses)`
 
 **Dashboard (Pred Markets tab):**
 - Stats bar: total trades, open positions, win rate, total P&L
@@ -282,7 +289,7 @@ Manual bet tracking with personal P&L dashboard.
 11:00 AM  — Snapshot Best EV+ picks                    launchd
  2:00 AM  — Fetch game scores (NBA + MLB)              launchd
  3:00 AM  — Settle Best EV+ picks                      launchd
- 3:15 AM  — Settle paper trades                        APScheduler
+ Every 1h — Settle paper trades                        APScheduler
  Every 5m — Poll Kalshi for arb opportunities          APScheduler
 Every 10m — Collect PM prices + generate signals       APScheduler
 Every 30m — Refresh Polymarket market cache            APScheduler
@@ -467,6 +474,16 @@ launchd/                     # macOS scheduling plists
 | Spread + total picks never settled | Added `point_line` column to `BestEVPick`; full settlement logic for all market types |
 | Confidence scores were uncalibrated | Wrapped both classifiers in `CalibratedClassifierCV(cv=5, method='isotonic')` |
 | STAY class chronically under-predicted | `class_weight='balanced'` on RF; `compute_sample_weight('balanced')` on XGB |
+
+## Prediction Market Hardening Fixes (2026-06 — do not revert)
+
+| Bug | Fix |
+|---|---|
+| BUG-1: 3 AM settlement rate-limited into silence (359 sequential Kalshi calls) | Switched scheduler from `cron(hour=3,minute=15)` to `interval(hours=1)`; added 0.3s sleep between calls + per-trade try/except + open-trade count log at batch start |
+| BUG-2: Bad Polymarket match on championship futures (`KXMLB-26-TEX` ↔ Texas Longhorns baseball) | `_match_polymarket()` now returns `(price, similarity)`; `generate_signal()` rejects the match when `|kalshi − poly| > 0.50 and similarity < 0.70` |
+| BUG-3: Kelly sizing dangerous on high-priced NO positions ($200 max risk for ~$16 win at 0.91) | `kelly_size()` caps `MAX_SIZE_USD` at $50 when `price > 0.80`; `generate_signal()` rejects when `entry_price > 0.80 and edge < 0.10` |
+| BUG-4: Off-season NBA game/prop series fetched every 10 min (empty, but consumed quota) | Moved `KXNBAGAME`, `KXNBAPTS`, `KXNBAREB` from `SPORTS_SERIES` into new `NBA_GAME_SERIES` constant; `KXNBA` championship futures stay in `CHAMPIONSHIP_SERIES` |
+| BUG-5: Paper trades opened on zero-volume markets with unreliable bid/ask | `_run_pm_price_collection()` skips opening a trade when Kalshi `volume < 500`; signals and `KalshiMarketPrice` snapshots are still stored |
 
 ---
 

@@ -27,14 +27,19 @@ REQUEST_TIMEOUT = 10
 
 # Series tickers → event-level markets (game outcomes and props)
 SPORTS_SERIES = [
-    "KXNBAGAME",  # NBA game winner (playoffs/regular season)
     "KXMLBGAME",  # MLB game winner
     "KXNHLGAME",  # NHL game winner
     "KXNFLGAME",  # NFL game winner
-    "KXNBAPTS",   # NBA player points props
-    "KXNBAREB",   # NBA player rebounds props
     "KXMMA",      # MMA/UFC
     "KXSOCCER",   # Soccer match winner
+]
+
+# NBA game-level series — off-season, excluded from periodic fetches.
+# re-add to SPORTS_SERIES when NBA season resumes (~October)
+NBA_GAME_SERIES = [
+    "KXNBAGAME",  # NBA game winner (playoffs/regular season)
+    "KXNBAPTS",   # NBA player points props
+    "KXNBAREB",   # NBA player rebounds props
 ]
 
 # Championship/futures series — these have Polymarket equivalents and are

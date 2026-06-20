@@ -173,20 +173,22 @@ class PMSignalGenerator:
             logger.error(f"Polymarket cache refresh failed: {e}")
             _POLY_CACHE = []
 
-    def _match_polymarket(self, question: str) -> Optional[float]:
+    def _match_polymarket(self, question: str) -> tuple[Optional[float], float]:
         """Find the best-matching Polymarket market for a Kalshi question title.
 
         First tries cached word-overlap similarity. On a cache miss, falls back
         to Polymarket's search API (?q=) which handles non-sports questions
         (crypto, politics, economics) where phrasing rarely overlaps enough.
 
-        Returns the YES price of the best match, else None.
+        Returns (yes_price, similarity_score). Price is None when no match accepted;
+        similarity_score is always populated so callers can apply stricter checks
+        on large price divergences.
         """
         if not _POLY_CACHE:
             self.refresh_poly_cache()
 
+        best_sim = 0.0
         if _POLY_CACHE:
-            best_sim = 0.0
             best_price = None
             for m in _POLY_CACHE:
                 sim = _similarity(question, m.get("title", ""))
@@ -196,7 +198,7 @@ class PMSignalGenerator:
 
             if best_sim >= SIMILARITY_THRESHOLD and best_price is not None:
                 logger.debug(f"Polymarket cache match (sim={best_sim:.2f}) for '{question[:50]}'")
-                return float(best_price)
+                return float(best_price), best_sim
 
             logger.debug(f"Polymarket cache miss (sim={best_sim:.2f}), trying search for '{question[:50]}'")
 
@@ -213,15 +215,16 @@ class PMSignalGenerator:
                         f"Polymarket search match (sim={relevance:.2f}) for '{question[:50]}': "
                         f"{result['yes_price']:.3f} ('{returned_question[:50]}')"
                     )
-                    return float(result["yes_price"])
+                    return float(result["yes_price"]), relevance
                 logger.debug(
                     f"Polymarket search rejected (sim={relevance:.2f}): "
                     f"'{returned_question[:50]}' for '{question[:50]}'"
                 )
+                return None, relevance
         except Exception as e:
             logger.debug(f"Polymarket search fallback failed for '{question[:50]}': {e}")
 
-        return None
+        return None, best_sim
 
     def fair_value(
         self,
@@ -245,11 +248,16 @@ class PMSignalGenerator:
         return float(fv)
 
     def kelly_size(self, edge: float, price: float) -> float:
-        """Quarter-Kelly position size in USD, clamped to [25, 200]."""
+        """Quarter-Kelly position size in USD, clamped to [25, 200].
+
+        At price>0.80 the win payout is tiny relative to loss exposure, so the
+        max is tightened to $50 even when Kelly math suggests larger.
+        """
         if price >= 1.0 or price <= 0.0:
             return MIN_SIZE_USD
+        max_size = 50.0 if price > 0.80 else MAX_SIZE_USD
         raw = (edge / (1.0 - price)) * KELLY_FRACTION * BANKROLL
-        return float(max(MIN_SIZE_USD, min(MAX_SIZE_USD, raw)))
+        return float(max(MIN_SIZE_USD, min(max_size, raw)))
 
     def _crypto_fair_value_yes(self, ticker: str) -> Optional[float]:
         """Compute theoretical P(YES) for a KXBTC/KXETH bracket market via log-normal pricing."""
@@ -304,8 +312,18 @@ class PMSignalGenerator:
             poly_price = None
             meta_forecast = None
         else:
-            poly_price = self._match_polymarket(question)
+            poly_price, poly_sim = self._match_polymarket(question)
             meta_forecast = self._meta.get_forecast(question)
+
+            # High-divergence guard: large price gaps demand a stricter similarity
+            # bar. Without this, championship futures collide with unrelated markets
+            # that share team names (e.g. KXMLB-26-TEX vs. Texas Longhorns baseball).
+            if poly_price is not None and abs(yes_price - poly_price) > 0.50 and poly_sim < 0.70:
+                logger.debug(
+                    f"Rejecting high-divergence Polymarket match for '{question[:50]}': "
+                    f"|{yes_price:.3f}-{poly_price:.3f}|>0.50 with sim={poly_sim:.2f}<0.70"
+                )
+                poly_price = None
 
             if poly_price is None and meta_forecast is None:
                 return None
@@ -332,6 +350,10 @@ class PMSignalGenerator:
             edge = edge_no
             entry_price = no_price
             fv = fv_no
+
+        # High-price edge bar: a 6% edge at 90¢ has unjustifiable risk/reward.
+        if entry_price > 0.80 and edge < 0.10:
+            return None
 
         return {
             "ticker": ticker,

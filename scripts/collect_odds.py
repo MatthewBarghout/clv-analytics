@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 BOOKMAKERS = ["pinnacle", "fanduel", "draftkings", "espnbet"]
 
 SPORTS = [
-    ("basketball_nba", "NBA"),
+    # ("basketball_nba", "NBA"),  # off-season — re-enable October
     ("baseball_mlb", "MLB"),
 ]
 
@@ -175,6 +175,7 @@ def main():
     load_dotenv()
     api_key = os.getenv("ODDS_API_KEY")
     api_key_2 = os.getenv("ODDS_API_KEY_2")
+    api_key_3 = os.getenv("ODDS_API_KEY_3")
     db_url = os.getenv("DATABASE_URL")
 
     if not api_key:
@@ -184,7 +185,7 @@ def main():
         logger.error("DATABASE_URL not found in environment")
         sys.exit(1)
 
-    api_keys = [k for k in [api_key, api_key_2] if k]
+    api_keys = [k for k in [api_key, api_key_2, api_key_3] if k]
 
     logger.info("=" * 70)
     logger.info("MULTI-SPORT ODDS COLLECTION STARTED")
