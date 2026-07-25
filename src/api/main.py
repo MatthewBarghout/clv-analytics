@@ -1901,13 +1901,13 @@ async def get_cross_platform_signals(
     limit: int = 20,
     min_divergence: float = 0.05,
 ):
-    """Recent cross-platform signals sorted by divergence score."""
+    """Recent cross-platform signals sorted by recency."""
     db = get_db()
     try:
         stmt = (
             select(CrossPlatformSignal)
             .where(CrossPlatformSignal.divergence_score >= min_divergence)
-            .order_by(CrossPlatformSignal.divergence_score.desc())
+            .order_by(CrossPlatformSignal.timestamp.desc())
             .limit(limit)
         )
         signals = db.execute(stmt).scalars().all()
@@ -2000,7 +2000,7 @@ def _run_pm_price_collection():
             ticker = parsed["ticker"]
             yes_price = parsed["yes_implied_prob"]
             no_price = parsed["no_implied_prob"]
-            volume = float(raw.get("volume") or 0)
+            volume = float(raw.get("volume_fp") or raw.get("volume") or 0)
 
             # Store price snapshot
             price_rec = KalshiMarketPrice(

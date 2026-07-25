@@ -280,8 +280,8 @@ class KalshiClient:
                 "no_implied_odds": round(1.0 / no_prob, 4),
                 "market_url": f"https://kalshi.com/markets/{market.get('ticker', '')}",
                 "close_time": market.get("close_time"),
-                "volume": market.get("volume", 0),
-                "open_interest": market.get("open_interest", 0),
+                "volume": market.get("volume_fp") or market.get("volume") or 0,
+                "open_interest": market.get("open_interest_fp") or market.get("open_interest") or 0,
             }
         except Exception as e:
             logger.debug(f"Kalshi parse error for {market.get('ticker')}: {e}")
