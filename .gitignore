@@ -111,3 +111,6 @@ frontend/dist-ssr/
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Claude Code local (personal) settings
+.claude/settings.local.json

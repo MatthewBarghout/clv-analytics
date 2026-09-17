@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchJSON } from '../api/client';
 
-const API_BASE = 'http://localhost:8000/api';
 
 interface DailyCLVReport {
   id: number;
@@ -62,11 +62,7 @@ export const DailyReports: React.FC = () => {
   useEffect(() => {
     const fetchReports = async () => {
       try {
-        const res = await fetch(`${API_BASE}/daily-reports?limit=14`);
-        if (res.ok) {
-          const data = await res.json();
-          setDailyReports(data);
-        }
+        setDailyReports(await fetchJSON<DailyCLVReport[]>('/daily-reports?limit=14'));
       } catch (err) {
         console.error('Error fetching daily reports:', err);
       }
@@ -82,13 +78,12 @@ export const DailyReports: React.FC = () => {
     }
     try {
       setLoadingOpportunities(true);
-      const res = await fetch(`${API_BASE}/daily-reports/${reportId}/opportunities`);
-      if (res.ok) {
-        const data = await res.json();
-        const opps = data.opportunities || [];
-        opportunitiesCache.current.set(reportId, opps);
-        setTrackedOpportunities(opps);
-      }
+      const data = await fetchJSON<{ opportunities?: TrackedOpportunity[] }>(
+        `/daily-reports/${reportId}/opportunities`
+      );
+      const opps = data.opportunities || [];
+      opportunitiesCache.current.set(reportId, opps);
+      setTrackedOpportunities(opps);
     } catch (err) {
       console.error('Error fetching tracked opportunities:', err);
       setTrackedOpportunities([]);
@@ -115,7 +110,7 @@ export const DailyReports: React.FC = () => {
       {dailyReports.map((report, index) => (
         <div
           key={report.id}
-          className="bg-white/5 rounded-lg p-6 border border-white/10 hover:bg-white/8 transition-all duration-200"
+          className="bg-panel-raised rounded-lg p-6 border border-line hover:bg-white/8 transition-all duration-200"
           style={{ animationDelay: `${index * 50}ms` }}
         >
           <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-4">
@@ -199,7 +194,7 @@ export const DailyReports: React.FC = () => {
             <h4 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wider">Top 3 Best Opportunities</h4>
             <div className="space-y-2">
               {report.best_opportunities.slice(0, 3).map((opp, oppIndex) => (
-                <div key={oppIndex} className="flex items-center justify-between bg-white/5 rounded-lg p-3 border border-white/5">
+                <div key={oppIndex} className="flex items-center justify-between bg-panel-raised rounded-lg p-3 border border-line">
                   <div className="flex items-center gap-3">
                     <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-yellow-500/30 to-orange-500/30 border border-yellow-500/50 flex items-center justify-center">
                       <span className="text-yellow-400 font-bold text-sm">#{oppIndex + 1}</span>
@@ -220,7 +215,7 @@ export const DailyReports: React.FC = () => {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-white/10">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-line">
             <div className="text-center">
               <div className="text-xs text-gray-400 mb-1">Best Book</div>
               <div className="text-sm font-medium text-blue-400">
@@ -248,13 +243,13 @@ export const DailyReports: React.FC = () => {
           </div>
 
           {report.settled_count !== undefined && report.settled_count > 0 && (
-            <div className="mt-4 pt-4 border-t border-white/10">
+            <div className="mt-4 pt-4 border-t border-line">
               <button
                 onClick={() => toggleReportExpanded(report.id)}
                 className={`w-full px-4 py-3 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 ${
                   expandedReportId === report.id
                     ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50'
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10 border border-white/10'
+                    : 'bg-panel-raised text-gray-300 hover:bg-white/10 border border-line'
                 }`}
               >
                 <svg
@@ -288,7 +283,7 @@ export const DailyReports: React.FC = () => {
                               ? 'bg-red-500/10 border-red-500/30'
                               : opp.result === 'push'
                               ? 'bg-gray-500/10 border-gray-500/30'
-                              : 'bg-white/5 border-white/10'
+                              : 'bg-panel-raised border-line'
                           }`}
                         >
                           <div className="flex items-center gap-3">

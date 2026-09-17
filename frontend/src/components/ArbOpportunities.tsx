@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   LineChart,
   Line,
@@ -9,8 +9,11 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
+import { fetchJSON, postJSON } from '../api/client';
+import { usePolling } from '../hooks/usePolling';
+import { LoadingState } from './States';
+import { axisProps, gridProps, legendProps, tooltipStyle } from '../charts/theme';
 
-const API_BASE = 'http://localhost:8000/api';
 const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
 
 interface ArbOpportunity {
@@ -46,11 +49,6 @@ interface ArbHistoryResponse {
   total_records: number;
 }
 
-const tooltipStyle = {
-  backgroundColor: '#1F2937',
-  border: '1px solid #374151',
-  borderRadius: '8px',
-};
 
 function spreadColor(spread: number): string {
   if (spread >= 2) return 'text-green-400 bg-green-500/20 border-green-500/30';
@@ -71,7 +69,6 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
   const [error, setError] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState<string>('');
   const [minSpread, setMinSpread] = useState<number>(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchData = useCallback(async (isManual = false) => {
     if (isManual) setRefreshing(true);
@@ -80,16 +77,13 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
       const params = new URLSearchParams({ limit: '100', min_spread: minSpread.toString() });
       if (sourceFilter) params.append('source', sourceFilter);
 
-      const [oppRes, histRes] = await Promise.all([
-        fetch(`${API_BASE}/arb-opportunities?${params}`),
-        fetch(`${API_BASE}/arb-history?days=7&min_spread=0.5`),
+      const [opps, hist] = await Promise.all([
+        fetchJSON<ArbResponse>(`/arb-opportunities?${params}`),
+        fetchJSON<ArbHistoryResponse>('/arb-history?days=7&min_spread=0.5').catch(() => null),
       ]);
 
-      if (oppRes.ok) setData(await oppRes.json());
-      if (histRes.ok) {
-        const h: ArbHistoryResponse = await histRes.json();
-        setHistory(h.history);
-      }
+      setData(opps);
+      if (hist) setHistory(hist.history);
       setLastRefresh(new Date());
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch arb data');
@@ -103,52 +97,41 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
     setRefreshing(true);
     try {
       // Trigger backend re-poll first
-      await fetch(`${API_BASE}/arb/refresh`, { method: 'POST' });
+      await postJSON('/arb/refresh');
     } catch {
       // ignore — still fetch cached data below
     }
     fetchData(true);
   };
 
-  // Initial load + auto-refresh every 60s
-  useEffect(() => {
-    fetchData();
-    intervalRef.current = setInterval(() => fetchData(), REFRESH_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [fetchData]);
+  // Initial load + auto-refresh every 60s, paused while the tab is hidden
+  usePolling(fetchData, REFRESH_INTERVAL_MS);
 
   const opportunities = data?.opportunities ?? [];
   const highSpread = opportunities.filter((o) => o.arb_spread >= 2).length;
   const medSpread = opportunities.filter((o) => o.arb_spread >= 1 && o.arb_spread < 2).length;
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center py-16">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mr-3"></div>
-        <span className="text-gray-400">Scanning prediction markets...</span>
-      </div>
-    );
+    return <LoadingState message="Scanning prediction markets..." />;
   }
 
   return (
     <div className="space-y-6">
       {/* Summary bar */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <div className="text-xs text-gray-400 uppercase mb-1">Total Opportunities</div>
           <div className="text-2xl font-bold text-white">{opportunities.length}</div>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-green-500/20">
+        <div className="bg-panel-raised rounded-lg p-4 border border-green-500/20">
           <div className="text-xs text-gray-400 uppercase mb-1">Strong Arb ≥2%</div>
           <div className="text-2xl font-bold text-green-400">{highSpread}</div>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-yellow-500/20">
+        <div className="bg-panel-raised rounded-lg p-4 border border-yellow-500/20">
           <div className="text-xs text-gray-400 uppercase mb-1">Marginal 1–2%</div>
           <div className="text-2xl font-bold text-yellow-400">{medSpread}</div>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <div className="text-xs text-gray-400 uppercase mb-1">Best Spread</div>
           <div className="text-2xl font-bold text-cyan-400">
             {opportunities.length > 0 ? `+${opportunities[0].arb_spread.toFixed(2)}%` : '—'}
@@ -209,7 +192,6 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
       {/* Arb opportunities table */}
       {opportunities.length === 0 ? (
         <div className="text-center py-16">
-          <div className="text-5xl mb-4">🔄</div>
           <p className="text-lg text-gray-400 mb-2">No active arbitrage opportunities</p>
           <p className="text-sm text-gray-500">
             The system polls Kalshi every 5 minutes. Opportunities appear
@@ -235,7 +217,7 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
             </thead>
             <tbody>
               {opportunities.map((opp) => (
-                <tr key={opp.id} className="border-b border-gray-700/30 hover:bg-white/5 transition-all">
+                <tr key={opp.id} className="border-b border-gray-700/30 hover:bg-panel-raised transition-all">
                   <td className="py-3 px-3 max-w-[200px]">
                     <span className="text-white font-medium text-xs leading-tight line-clamp-2">
                       {opp.event_title}
@@ -270,7 +252,7 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
                         href={opp.market_url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="px-2 py-1 bg-white/10 hover:bg-white/20 rounded border border-white/20 text-xs text-gray-300 transition-all whitespace-nowrap"
+                        className="px-2 py-1 bg-white/10 hover:bg-white/20 rounded border border-line-strong text-xs text-gray-300 transition-all whitespace-nowrap"
                       >
                         View Market
                       </a>
@@ -289,13 +271,13 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
 
       {/* Historical chart */}
       {history.length > 0 && (
-        <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-6 border border-line">
           <h3 className="text-lg font-semibold text-white mb-4">7-Day Arb Spread Trend</h3>
           <ResponsiveContainer width="100%" height={220}>
             <LineChart data={history}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-              <XAxis dataKey="date" stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 11 }} />
-              <YAxis stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 11 }} tickFormatter={(v) => `${v}%`} />
+              <CartesianGrid {...gridProps} />
+              <XAxis dataKey="date" {...axisProps} />
+              <YAxis {...axisProps} tickFormatter={(v) => `${v}%`} />
               <Tooltip
                 contentStyle={tooltipStyle}
                 formatter={(value: string | number | undefined, name: string | undefined) => [
@@ -303,7 +285,7 @@ export const ArbOpportunities = React.memo(function ArbOpportunities() {
                   name === 'avg_spread' ? 'Avg Spread' : 'Max Spread',
                 ]}
               />
-              <Legend />
+              <Legend {...legendProps} />
               <Line type="monotone" dataKey="avg_spread" stroke="#60A5FA" strokeWidth={2} dot={false} name="avg_spread" />
               <Line type="monotone" dataKey="max_spread" stroke="#34D399" strokeWidth={2} dot={false} strokeDasharray="4 4" name="max_spread" />
             </LineChart>

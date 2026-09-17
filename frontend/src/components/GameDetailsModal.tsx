@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { GlassCard } from './GlassCard';
 import {
@@ -9,6 +9,7 @@ import {
   getMarketTypeName,
   getImpliedProbability
 } from '../utils/oddsTranslator';
+import { fetchJSON } from '../api/client';
 
 interface OddsSnapshot {
   id: number;
@@ -62,7 +63,6 @@ interface GameDetailsModalProps {
   onClose: () => void;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDetailsModalProps) {
   const [snapshots, setSnapshots] = useState<OddsSnapshot[]>([]);
@@ -78,25 +78,18 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
   const fetchGameDetails = async () => {
     try {
       setLoading(true);
-      const [snapshotsRes, closingRes, predictionsRes] = await Promise.all([
-        fetch(`${API_BASE}/games/${gameId}/snapshots`),
-        fetch(`${API_BASE}/games/${gameId}/closing-lines`),
-        fetch(`${API_BASE}/ml/predictions/${gameId}`)
+      const [snapshotsData, closingData] = await Promise.all([
+        fetchJSON<OddsSnapshot[]>(`/games/${gameId}/snapshots`),
+        fetchJSON<ClosingLine[]>(`/games/${gameId}/closing-lines`),
       ]);
+      setSnapshots(snapshotsData);
+      setClosingLines(closingData);
 
-      if (snapshotsRes.ok && closingRes.ok) {
-        const [snapshotsData, closingData] = await Promise.all([
-          snapshotsRes.json(),
-          closingRes.json()
-        ]);
-        setSnapshots(snapshotsData);
-        setClosingLines(closingData);
-      }
-
-      if (predictionsRes.ok) {
-        const predictionsData = await predictionsRes.json();
-        setPredictions(predictionsData.predictions || []);
-      }
+      // Predictions are optional — the panel hides itself when empty
+      const predictionsData = await fetchJSON<{ predictions?: MLPrediction[] }>(
+        `/ml/predictions/${gameId}`
+      ).catch(() => null);
+      setPredictions(predictionsData?.predictions || []);
     } catch (err) {
       console.error('Error fetching game details:', err);
     } finally {
@@ -119,14 +112,9 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
 
   const modalContent = (
     <div
-      className="fixed inset-0 flex items-center justify-center p-4"
-      style={{
-        zIndex: 999999,
-        backgroundColor: 'rgba(255, 0, 0, 0.5)',
-        border: '10px solid yellow'
-      }}
+      className="fixed inset-0 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+      style={{ zIndex: 999999 }}
       onClick={(e) => {
-        console.log('🔴 Modal backdrop clicked');
         if (e.target === e.currentTarget) {
           onClose();
         }
@@ -134,12 +122,9 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
     >
       <div
         className="max-w-6xl w-full max-h-[90vh] overflow-y-auto"
-        style={{
-          zIndex: 1000000,
-          border: '5px solid lime'
-        }}
+        style={{ zIndex: 1000000 }}
       >
-        <GlassCard className="relative bg-gray-900" style={{ border: '3px solid cyan' }}>
+        <GlassCard className="relative bg-panel">
           {/* Close button */}
           <button
             onClick={onClose}
@@ -166,8 +151,8 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
                 onClick={() => setSelectedMarket(market)}
                 className={`px-4 py-2 rounded-lg transition-all duration-200 ${
                   selectedMarket === market
-                    ? 'bg-white/20 text-white border border-white/30'
-                    : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
+                    ? 'bg-white/20 text-white border border-line-strong'
+                    : 'bg-panel-raised text-gray-400 hover:text-white hover:bg-white/10 border border-line'
                 }`}
               >
                 {getMarketTypeName(market)}
@@ -208,7 +193,7 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
                   </div>
                   <div className="space-y-4">
                     {filteredPredictions.map((prediction, idx) => (
-                      <GlassCard key={idx} gradient="purple" className="p-4">
+                      <GlassCard key={idx} gradient="info" className="p-4">
                         <div className="flex justify-between items-start mb-4">
                           <h4 className="font-bold text-white text-lg">{prediction.bookmaker_name}</h4>
                           <span className="text-xs text-purple-400 bg-purple-500/20 px-2 py-1 rounded">AI PREDICTION</span>
@@ -254,7 +239,7 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
 
                                 {/* Movement indicator */}
                                 {hasPoint && Math.abs(pointMovement) > 0.1 && (
-                                  <div className="mt-3 pt-3 border-t border-white/10">
+                                  <div className="mt-3 pt-3 border-t border-line">
                                     <div className="text-xs">
                                       <span className="text-yellow-400 font-semibold">Line Movement:</span>{' '}
                                       <span className={pointMovement > 0 ? 'text-red-400' : 'text-green-400'}>
@@ -269,7 +254,7 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
                                 )}
 
                                 {!hasPoint && outcome.predicted_closing_price !== outcome.opening_price && (
-                                  <div className="mt-3 pt-3 border-t border-white/10">
+                                  <div className="mt-3 pt-3 border-t border-line">
                                     <div className="text-xs">
                                       <span className="text-yellow-400 font-semibold">Odds Movement:</span>{' '}
                                       <span className={priceMovement ? 'text-green-400' : 'text-red-400'}>
@@ -281,7 +266,7 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
 
                                 {/* Actual closing (if available) */}
                                 {outcome.actual_closing_price !== null && (
-                                  <div className="mt-3 pt-3 border-t border-white/10">
+                                  <div className="mt-3 pt-3 border-t border-line">
                                     <div className="text-xs text-gray-400">
                                       <strong>Actual Closing:</strong>{' '}
                                       {outcome.actual_closing_point !== null && outcome.actual_closing_point !== 0 &&
@@ -303,10 +288,10 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
               {/* Closing Lines (if available) */}
               {filteredClosing.length > 0 && (
                 <div>
-                  <h3 className="text-xl font-bold mb-4 text-green-400">🎯 Closing Lines (Final Odds)</h3>
+                  <h3 className="text-xl font-bold mb-4 text-green-400">Closing Lines (Final Odds)</h3>
                   <div className="space-y-3">
                     {filteredClosing.map((closing) => (
-                      <GlassCard key={closing.id} gradient="green" className="p-4">
+                      <GlassCard key={closing.id} gradient="pos" className="p-4">
                         <div className="flex justify-between items-start mb-3">
                           <h4 className="font-bold text-white">{closing.bookmaker_name}</h4>
                           <span className="text-xs text-green-400 bg-green-500/20 px-2 py-1 rounded">CLOSING LINE</span>
@@ -343,12 +328,12 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
 
                 return (
                   <div key={bookmaker}>
-                    <h3 className="text-xl font-bold mb-4 text-blue-400">📈 {bookmaker} - Line Movement</h3>
+                    <h3 className="text-xl font-bold mb-4 text-blue-400">{bookmaker} - Line Movement</h3>
 
                     {/* Show movement summary */}
                     {firstSnapshot && lastSnapshot && firstSnapshot.id !== lastSnapshot.id && (
                       <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-4 mb-4">
-                        <h4 className="text-purple-400 font-semibold mb-2">📊 Movement Summary</h4>
+                        <h4 className="text-info font-semibold mb-2">Movement Summary</h4>
                         {firstSnapshot.outcomes.map((firstOutcome, idx) => {
                           const lastOutcome = lastSnapshot.outcomes[idx];
                           if (firstOutcome && lastOutcome) {
@@ -369,7 +354,7 @@ export function GameDetailsModal({ gameId, homeTeam, awayTeam, onClose }: GameDe
                         <GlassCard
                           key={snapshot.id}
                           className="p-4"
-                          gradient={snapshotIdx === 0 ? 'blue' : undefined}
+                          gradient={snapshotIdx === 0 ? 'info' : undefined}
                         >
                           <div className="flex justify-between items-start mb-3">
                             <div className="text-sm text-gray-400">

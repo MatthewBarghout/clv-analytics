@@ -33,6 +33,7 @@ from src.models.database import (
     DailyCLVReport,
     Game,
     OddsSnapshot,
+    Sport,
     Team,
 )
 
@@ -47,6 +48,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Per-sport model directory — models are line_movement_predictor_{sport_key}.pkl
+MODEL_DIR = "models"
+
 
 class DailyCLVAnalyzer:
     """Analyzes CLV for completed games on a given date."""
@@ -54,23 +58,31 @@ class DailyCLVAnalyzer:
     def __init__(self, session):
         self.session = session
         self.calc = CLVCalculator()
-        self.model = None
-        self.engineer = None
+        self.engineer = FeatureEngineer()
+        self._models: Dict[str, LineMovementPredictor] = {}
 
-        # Try to load ML model if available
-        model_path = "models/line_movement_predictor.pkl"
-        if Path(model_path).exists():
-            try:
-                self.model = LineMovementPredictor()
-                self.model.load_model(model_path)
-                self.engineer = FeatureEngineer()
-                logger.info("ML model loaded successfully for EV opportunities")
-            except Exception as e:
-                logger.warning(f"Could not load ML model: {e}")
-                self.model = None
-                self.engineer = None
+        available = sorted(Path(MODEL_DIR).glob("line_movement_predictor_*.pkl"))
+        if available:
+            logger.info(f"Per-sport models available: {[p.stem for p in available]}")
         else:
-            logger.info("ML model not found - EV opportunities will not be included")
+            logger.info("No per-sport models found - EV opportunities will not be included")
+
+    def _get_model(self, sport_key: str):
+        """Lazily load and cache the model for one sport. None if not trained yet."""
+        if sport_key not in self._models:
+            path = Path(MODEL_DIR) / f"line_movement_predictor_{sport_key}.pkl"
+            if not path.exists():
+                self._models[sport_key] = None
+            else:
+                try:
+                    model = LineMovementPredictor()
+                    model.load_model(str(path))
+                    self._models[sport_key] = model
+                    logger.info(f"Loaded {sport_key} model from {path}")
+                except Exception as e:
+                    logger.warning(f"Could not load {sport_key} model: {e}")
+                    self._models[sport_key] = None
+        return self._models[sport_key]
 
     def get_completed_games(self, start_date: datetime, end_date: datetime) -> List[Game]:
         """Get all games that started between start_date and end_date."""
@@ -156,8 +168,8 @@ class DailyCLVAnalyzer:
         Returns:
             List of EV opportunity dictionaries
         """
-        if not self.model or not self.engineer:
-            logger.info("ML model not available - skipping EV opportunities")
+        if not list(Path(MODEL_DIR).glob("line_movement_predictor_*.pkl")):
+            logger.info("No per-sport models available - skipping EV opportunities")
             return []
 
         try:
@@ -188,6 +200,12 @@ class DailyCLVAnalyzer:
                 hours_to_game = (game.commence_time - snapshot.timestamp).total_seconds() / 3600
                 day_of_week = game.commence_time.weekday()
                 is_weekend = day_of_week >= 5
+
+                # Per-sport model — skip the game if that sport has no trained model
+                sport = self.session.get(Sport, game.sport_id) if game.sport_id else None
+                model = self._get_model(sport.key) if sport else None
+                if model is None:
+                    continue
 
                 # Get team names
                 home_team = self.session.get(Team, game.home_team_id)
@@ -234,7 +252,7 @@ class DailyCLVAnalyzer:
                     }])
 
                     # Predict movement
-                    movement_pred = self.model.predict_movement(features)
+                    movement_pred = model.predict_movement(features)
 
                     predicted_delta = float(movement_pred["predicted_delta"][0])
                     confidence = float(movement_pred["confidence"][0])

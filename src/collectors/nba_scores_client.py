@@ -1,8 +1,12 @@
 """
-NBA.com Score Fetcher
+NBA Score Fetcher
 
-Fetches final scores from the official NBA.com API.
-This API is free, doesn't require authentication, and keeps historical scores.
+Fetches final scores from ESPN's public scoreboard API.
+Free, no authentication required, accepts a real date parameter.
+
+Replaced cdn.nba.com (2026-09-15): that endpoint only ever served *today's*
+scoreboard — the previous client passed a date it then ignored, so historical
+scores were never actually retrievable — and it now returns 403 outright.
 """
 import logging
 from datetime import datetime, timedelta
@@ -14,140 +18,103 @@ logger = logging.getLogger(__name__)
 
 
 class NBAScoresClient:
-    """Client for fetching NBA game scores from NBA.com."""
+    """Client for fetching NBA game scores from ESPN's public scoreboard API."""
 
-    BASE_URL = "https://cdn.nba.com/static/json/liveData/scoreboard"
+    BASE_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 
     def __init__(self):
-        """Initialize the NBA scores client."""
+        # Deliberately no User-Agent override. ESPN 403s browser-spoofing and custom
+        # agents on this endpoint and allows honest tool agents, so requests' own
+        # default (python-requests/x.y.z) is what gets through. Do not "fix" this by
+        # adding a Mozilla string.
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-        })
 
-    def get_scoreboard(self, date: datetime) -> Dict:
-        """
-        Get scoreboard data for a specific date.
-
-        Args:
-            date: The date to fetch scores for
-
-        Returns:
-            Dictionary containing scoreboard data with games and scores
-        """
-        # Format date as YYYY-MM-DD
-        date_str = date.strftime("%Y-%m-%d")
-
-        # NBA.com uses the format: todaysScoreboard_00.json for today
-        # For specific dates, we need to try the scoreboard endpoint
-        url = f"{self.BASE_URL}/todaysScoreboard_00.json"
-
+    def _fetch_slate(self, date: datetime) -> List[Dict]:
+        """Fetch one ESPN game-day slate. Returns raw event dicts."""
         try:
-            logger.info(f"Fetching NBA scores for {date_str}")
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(
+                self.BASE_URL, params={"dates": date.strftime("%Y%m%d")}, timeout=15
+            )
             response.raise_for_status()
-            data = response.json()
-
-            # Filter games by the requested date
-            scoreboard_date = data.get("scoreboard", {}).get("gameDate", "")
-            if scoreboard_date.startswith(date_str):
-                return data
-
-            # If today's scoreboard doesn't match, try historical endpoint
-            # NBA.com historical format varies, so we'll use today's endpoint
-            # and the caller should handle date filtering
-            return data
-
+            return response.json().get("events", []) or []
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch scoreboard from NBA.com: {e}")
-            return {}
+            logger.error(f"Failed to fetch NBA scores for {date.strftime('%Y-%m-%d')}: {e}")
+            return []
+        except ValueError as e:
+            logger.error(f"Malformed NBA response for {date.strftime('%Y-%m-%d')}: {e}")
+            return []
 
-    def get_completed_games(self, date: datetime) -> List[Dict]:
+    def parse_game_score(self, event: Dict) -> Optional[Dict]:
+        """Normalize one ESPN event to {home_team, away_team, home_score, away_score, completed}."""
+        try:
+            competition = (event.get("competitions") or [{}])[0]
+            status = competition.get("status", {}).get("type", {})
+            competitors = competition.get("competitors") or []
+
+            sides = {c.get("homeAway"): c for c in competitors}
+            home, away = sides.get("home"), sides.get("away")
+            if not home or not away:
+                return None
+
+            home_score, away_score = home.get("score"), away.get("score")
+            if home_score is None or away_score is None:
+                return None
+
+            # Emit the nickname ("Clippers"), not displayName. The caller matches by
+            # substring against full DB names, and ESPN abbreviates some locations
+            # ("LA Clippers" vs. our "Los Angeles Clippers"), which defeats that.
+            # Nicknames are unique across all 30 teams and are always a substring.
+            return {
+                "home_team": home.get("team", {}).get("name")
+                or home.get("team", {}).get("displayName", ""),
+                "away_team": away.get("team", {}).get("name")
+                or away.get("team", {}).get("displayName", ""),
+                "home_score": int(home_score),
+                "away_score": int(away_score),
+                "completed": bool(status.get("completed")),
+                # Tip-off date (UTC) — required to pick the right game when the same
+                # two teams meet on nearby dates.
+                "game_date": (event.get("date") or "")[:10],
+            }
+        except (KeyError, TypeError, ValueError) as e:
+            logger.debug(f"Could not parse NBA event: {e}")
+            return None
+
+    def get_scores_for_date(self, date: datetime) -> List[Dict]:
         """
         Get all completed games for a specific date.
 
-        Args:
-            date: The date to fetch completed games for
+        ESPN slates are keyed by US game day, so an evening tip-off lands on the
+        *following* UTC date. Callers bucket games by the UTC date of commence_time,
+        which can fall either side of the slate, so the neighbouring days are fetched
+        and merged too.
 
-        Returns:
-            List of completed games with scores
+        Returns list of dicts: {home_team, away_team, home_score, away_score, completed}
         """
-        data = self.get_scoreboard(date)
-        scoreboard = data.get("scoreboard", {})
-        games = scoreboard.get("games", [])
+        events = (
+            self._fetch_slate(date - timedelta(days=1))
+            + self._fetch_slate(date)
+            + self._fetch_slate(date + timedelta(days=1))
+        )
 
-        completed_games = []
-        for game in games:
-            game_status = game.get("gameStatus", 0)
-            # gameStatus: 1=scheduled, 2=live, 3=completed
-            if game_status == 3:
-                completed_games.append(game)
+        seen = set()
+        games = []
+        for event in events:
+            event_id = event.get("id")
+            if event_id in seen:
+                continue
+            seen.add(event_id)
 
-        logger.info(f"Found {len(completed_games)} completed games on {date.strftime('%Y-%m-%d')}")
-        return completed_games
+            parsed = self.parse_game_score(event)
+            if parsed and parsed["completed"]:
+                games.append(parsed)
 
-    def parse_game_score(self, game_data: Dict) -> Optional[Dict]:
-        """
-        Parse game data into a simple score dictionary.
-
-        Args:
-            game_data: Raw game data from NBA.com API
-
-        Returns:
-            Dictionary with home_team, away_team, home_score, away_score, completed
-        """
-        try:
-            home_team = game_data.get("homeTeam", {})
-            away_team = game_data.get("awayTeam", {})
-
-            home_name = home_team.get("teamName", "")
-            home_city = home_team.get("teamCity", "")
-            away_name = away_team.get("teamName", "")
-            away_city = away_team.get("teamCity", "")
-
-            # Full team names like "Los Angeles Lakers"
-            home_full = f"{home_city} {home_name}".strip()
-            away_full = f"{away_city} {away_name}".strip()
-
-            home_score = home_team.get("score", 0)
-            away_score = away_team.get("score", 0)
-
-            game_status = game_data.get("gameStatus", 0)
-            completed = game_status == 3
-
-            return {
-                "home_team": home_full,
-                "away_team": away_full,
-                "home_score": home_score,
-                "away_score": away_score,
-                "completed": completed,
-                "game_id": game_data.get("gameId", ""),
-            }
-        except Exception as e:
-            logger.error(f"Failed to parse game data: {e}")
-            return None
+        logger.info(f"Found {len(games)} completed games on {date.strftime('%Y-%m-%d')}")
+        return games
 
     def get_scores_for_date_range(self, start_date: datetime, days: int = 1) -> List[Dict]:
-        """
-        Get all completed game scores for a date range.
-
-        Args:
-            start_date: Starting date
-            days: Number of days to fetch (default 1)
-
-        Returns:
-            List of all completed games with scores
-        """
+        """Get all completed game scores for a date range."""
         all_games = []
-
         for i in range(days):
-            date = start_date + timedelta(days=i)
-            completed = self.get_completed_games(date)
-
-            for game in completed:
-                parsed = self.parse_game_score(game)
-                if parsed:
-                    all_games.append(parsed)
-
+            all_games.extend(self.get_scores_for_date(start_date + timedelta(days=i)))
         return all_games

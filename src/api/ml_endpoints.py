@@ -9,10 +9,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from src.analyzers.features import FeatureEngineer
+from src.analyzers.features import FeatureEngineer, SnapshotIndex
 from src.analyzers.movement_predictor import LineMovementPredictor
 from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLine, DailyCLVReport, Game, OddsSnapshot, OpportunityPerformance, Sport, Team
 
@@ -184,7 +184,7 @@ def decimal_to_american(decimal_odds: float) -> str:
 
 
 @router.get("/stats", response_model=MovementModelStats)
-async def get_model_stats(sport_key: Optional[str] = None):
+def get_model_stats(sport_key: Optional[str] = None):
     """Get movement prediction model performance metrics for a sport (defaults to first available)."""
     try:
         if sport_key is None:
@@ -251,7 +251,7 @@ async def get_model_stats(sport_key: Optional[str] = None):
 
 
 @router.get("/feature-importance", response_model=List[FeatureImportance])
-async def get_feature_importance(sport_key: Optional[str] = None):
+def get_feature_importance(sport_key: Optional[str] = None):
     """Get feature importance rankings. Defaults to first available sport model."""
     try:
         if sport_key is None:
@@ -278,7 +278,7 @@ async def get_feature_importance(sport_key: Optional[str] = None):
 
 
 @router.get("/predictions/{game_id}", response_model=GameMovementPredictions)
-async def get_game_predictions(game_id: int):
+def get_game_predictions(game_id: int):
     """
     Get predicted line movement for a game.
 
@@ -427,7 +427,7 @@ async def get_game_predictions(game_id: int):
 
 
 @router.get("/best-opportunities", response_model=List[EVOpportunity])
-async def get_best_opportunities(
+def get_best_opportunities(
     limit: int = 50,
     min_confidence: float = 0.62,
     min_ev_score: float = 2.0,
@@ -483,6 +483,11 @@ async def get_best_opportunities(
         if not results:
             return []
 
+        # Pre-fetch every snapshot for these games once. The per-outcome feature
+        # helpers below would otherwise issue ~5 queries each, which is what made
+        # this endpoint take ~25s.
+        snapshot_index = SnapshotIndex.for_games(db, {game.id for _, game in results})
+
         # Pre-fetch all bookmakers used in results to avoid N+1 queries
         best_opp_bk_ids = list({snapshot.bookmaker_id for snapshot, _ in results})
         best_opp_bk_map = {
@@ -508,6 +513,7 @@ async def get_best_opportunities(
         }
 
         opportunities = []
+        pending: List[dict] = []
 
         for snapshot, game in results:
             hours_to_game = (game.commence_time - snapshot.timestamp).total_seconds() / 3600
@@ -545,22 +551,24 @@ async def get_best_opportunities(
 
                 # Calculate consensus
                 consensus_line = engineer.calculate_consensus_line(
-                    db, game.id, snapshot.market_type, outcome_name
+                    db, game.id, snapshot.market_type, outcome_name, index=snapshot_index
                 )
                 line_spread = engineer.calculate_line_spread(
-                    db, game.id, snapshot.market_type, outcome_name
+                    db, game.id, snapshot.market_type, outcome_name, index=snapshot_index
                 )
 
                 temporal = engineer.calculate_temporal_features(
                     db, game.id, snapshot.bookmaker_id,
                     snapshot.market_type, outcome_name, snapshot.timestamp,
+                    index=snapshot_index,
                 )
                 bk_features = engineer.calculate_bookmaker_features(
                     db, game.id, snapshot.bookmaker_id,
                     snapshot.market_type, outcome_name, float(opening_price),
+                    index=snapshot_index,
                 )
 
-                features = pd.DataFrame([{
+                features = {
                     "bookmaker_id": snapshot.bookmaker_id,
                     "market_type": snapshot.market_type,
                     "hours_to_game": hours_to_game,
@@ -591,65 +599,105 @@ async def get_best_opportunities(
                     "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
                     "books_moved_count": bk_features["books_moved_count"],
                     "steam_move_signal": bk_features["steam_move_signal"],
-                }])
+                }
 
-                # Predict movement
-                movement_pred = model.predict_movement(features)
+                # Collect rather than predict. Single-row inference through the
+                # calibrated ensemble costs ~87ms; the same 450 rows batched cost
+                # ~110ms in total. Prediction happens once per sport after the loop.
+                pending.append({
+                    "sport_key": game_sport_key,
+                    "features": features,
+                    "game": game,
+                    "snapshot": snapshot,
+                    "bookmaker": bookmaker,
+                    "outcome_name": outcome_name,
+                    "opening_price": opening_price,
+                    "opening_point": opening_point,
+                })
 
-                predicted_delta = float(movement_pred["predicted_delta"][0])
-                confidence = float(movement_pred["confidence"][0])
-                direction = movement_pred["predicted_direction"][0]
-                was_constrained = bool(movement_pred["was_constrained"][0])
+        # Batch inference, one call per sport
+        predictions = {}
+        by_sport: Dict[str, List[int]] = {}
+        for i, item in enumerate(pending):
+            by_sport.setdefault(item["sport_key"], []).append(i)
 
-                # Strict thresholds: skip low-confidence and marginal signals
-                MIN_MOVEMENT = 0.025  # Require meaningful line movement (was 0.01)
-                effective_min_confidence = max(min_confidence, MIN_H2H_CONFIDENCE) if snapshot.market_type == "h2h" else min_confidence
-                if confidence < effective_min_confidence:
-                    continue
+        for sk, idxs in by_sport.items():
+            sport_model = get_model(sk)
+            if sport_model is None:
+                continue
+            batch = sport_model.predict_movement(
+                pd.DataFrame([pending[i]["features"] for i in idxs])
+            )
+            for pos, i in enumerate(idxs):
+                predictions[i] = (
+                    float(batch["predicted_delta"][pos]),
+                    float(batch["confidence"][pos]),
+                    batch["predicted_direction"][pos],
+                    bool(batch["was_constrained"][pos]),
+                )
 
-                # Calculate EV score (higher = better opportunity)
-                # Unfavorable movement (odds getting worse) = good betting opportunity NOW
-                if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
-                    # Price dropping (getting worse for bettor) - bet now!
-                    ev_score = abs(predicted_delta) * confidence * 100
-                elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
-                    # Price rising (getting worse for bettor on the other side)
-                    ev_score = abs(predicted_delta) * confidence * 100
-                else:
-                    continue
+        # Score in the original iteration order so ties sort as they did before
+        for i, item in enumerate(pending):
+            if i not in predictions:
+                continue
+            predicted_delta, confidence, direction, was_constrained = predictions[i]
+            game = item["game"]
+            snapshot = item["snapshot"]
+            bookmaker = item["bookmaker"]
+            outcome_name = item["outcome_name"]
+            opening_price = item["opening_price"]
+            opening_point = item["opening_point"]
+            game_sport_key = item["sport_key"]
 
-                # Apply minimum EV score filter
-                if ev_score < min_ev_score:
-                    continue
+            # Strict thresholds: skip low-confidence and marginal signals
+            MIN_MOVEMENT = 0.025  # Require meaningful line movement (was 0.01)
+            effective_min_confidence = max(min_confidence, MIN_H2H_CONFIDENCE) if snapshot.market_type == "h2h" else min_confidence
+            if confidence < effective_min_confidence:
+                continue
 
-                # Calculate edge estimate
-                fair_prob = 1 / float(opening_price)
-                edge_estimate = abs(predicted_delta) * fair_prob
+            # Calculate EV score (higher = better opportunity)
+            # Unfavorable movement (odds getting worse) = good betting opportunity NOW
+            if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
+                # Price dropping (getting worse for bettor) - bet now!
+                ev_score = abs(predicted_delta) * confidence * 100
+            elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
+                # Price rising (getting worse for bettor on the other side)
+                ev_score = abs(predicted_delta) * confidence * 100
+            else:
+                continue
 
-                # Format current line
-                if opening_point != 0:
-                    current_line = f"{opening_point:+.1f} at {decimal_to_american(opening_price)}"
-                else:
-                    current_line = decimal_to_american(opening_price)
+            # Apply minimum EV score filter
+            if ev_score < min_ev_score:
+                continue
 
-                home_t = best_opp_teams_map.get(game.home_team_id)
-                away_t = best_opp_teams_map.get(game.away_team_id)
-                opportunities.append(EVOpportunity(
-                    game_id=game.id,
-                    home_team=home_t.name if home_t else "Unknown",
-                    away_team=away_t.name if away_t else "Unknown",
-                    commence_time=game.commence_time,
-                    bookmaker_name=bookmaker.name if bookmaker else "Unknown",
-                    market_type=snapshot.market_type,
-                    outcome_name=outcome_name,
-                    current_line=current_line,
-                    predicted_movement=predicted_delta,
-                    predicted_direction=direction,
-                    confidence=confidence,
-                    ev_score=ev_score,
-                    was_constrained=was_constrained,
-                    sport_key=game_sport_key,
-                ))
+            # Calculate edge estimate
+            fair_prob = 1 / float(opening_price)
+            edge_estimate = abs(predicted_delta) * fair_prob
+
+            # Format current line
+            if opening_point != 0:
+                current_line = f"{opening_point:+.1f} at {decimal_to_american(opening_price)}"
+            else:
+                current_line = decimal_to_american(opening_price)
+
+            home_t = best_opp_teams_map.get(game.home_team_id)
+            away_t = best_opp_teams_map.get(game.away_team_id)
+            opportunities.append(EVOpportunity(
+                game_id=game.id,
+                home_team=home_t.name if home_t else "Unknown",
+                away_team=away_t.name if away_t else "Unknown",
+                commence_time=game.commence_time,
+                bookmaker_name=bookmaker.name if bookmaker else "Unknown",
+                market_type=snapshot.market_type,
+                outcome_name=outcome_name,
+                current_line=current_line,
+                predicted_movement=predicted_delta,
+                predicted_direction=direction,
+                confidence=confidence,
+                ev_score=ev_score,
+                was_constrained=was_constrained,
+                sport_key=game_sport_key,
+            ))
 
         # Sort by EV score
         opportunities.sort(key=lambda x: x.ev_score, reverse=True)
@@ -664,7 +712,7 @@ async def get_best_opportunities(
 
 
 @router.post("/retrain", response_model=RetrainingStatus)
-async def retrain_model(background_tasks: BackgroundTasks):
+def retrain_model(background_tasks: BackgroundTasks):
     """
     Trigger model retraining with latest data.
 
@@ -722,7 +770,7 @@ async def retrain_model(background_tasks: BackgroundTasks):
 
 
 @router.get("/is-trained")
-async def check_model_trained():
+def check_model_trained():
     """Check which sport models are trained."""
     sport_models = {
         p.stem.replace("line_movement_predictor_", ""): str(p)
@@ -757,7 +805,7 @@ class OpportunityDetail(BaseModel):
 
 
 @router.get("/opportunities")
-async def get_opportunities(
+def get_opportunities(
     status: str = "all",
     min_confidence: float = None,
     min_clv: float = None,
@@ -910,7 +958,7 @@ async def get_opportunities(
 
 
 @router.get("/upcoming-opportunities")
-async def get_upcoming_opportunities(
+def get_upcoming_opportunities(
     hours_ahead: int = 24,
     min_ev_score: float = 0.0,
 ):
@@ -965,6 +1013,9 @@ async def get_upcoming_opportunities(
         for snap in all_snapshots:
             snapshots_by_game.setdefault(snap.game_id, []).append(snap)
 
+        # Reuse the snapshots already in memory for the per-outcome feature helpers
+        snapshot_index = SnapshotIndex(all_snapshots)
+
         # Pre-fetch all bookmakers used in those snapshots
         bk_ids = list({snap.bookmaker_id for snap in all_snapshots})
         bookmakers_map = {
@@ -973,6 +1024,8 @@ async def get_upcoming_opportunities(
         }
 
         game_opportunities = []
+        game_meta: List[dict] = []
+        pending: List[dict] = []
 
         for game, home_team in games:
             away_team = upcoming_away_map.get(game.away_team_id)
@@ -987,13 +1040,13 @@ async def get_upcoming_opportunities(
             if model is None:
                 continue
 
-            game_opps = []
+            # Game-level, not snapshot-level — game_meta below reads it after the loop
+            hours_to_game = (game.commence_time - now).total_seconds() / 3600
+            day_of_week = game.commence_time.weekday()
+            is_weekend = day_of_week >= 5
+
             for snapshot in snapshots:
                 bookmaker = bookmakers_map.get(snapshot.bookmaker_id)
-
-                hours_to_game = (game.commence_time - now).total_seconds() / 3600
-                day_of_week = game.commence_time.weekday()
-                is_weekend = day_of_week >= 5
 
                 for outcome in snapshot.outcomes:
                     outcome_name = outcome.get("name")
@@ -1005,22 +1058,26 @@ async def get_upcoming_opportunities(
 
                     # Calculate consensus
                     consensus_line = engineer.calculate_consensus_line(
-                        db, game.id, snapshot.market_type, outcome_name
+                        db, game.id, snapshot.market_type, outcome_name,
+                        index=snapshot_index,
                     )
                     line_spread = engineer.calculate_line_spread(
-                        db, game.id, snapshot.market_type, outcome_name
+                        db, game.id, snapshot.market_type, outcome_name,
+                        index=snapshot_index,
                     )
 
                     temporal = engineer.calculate_temporal_features(
                         db, game.id, snapshot.bookmaker_id,
                         snapshot.market_type, outcome_name, snapshot.timestamp,
+                        index=snapshot_index,
                     )
                     bk_features = engineer.calculate_bookmaker_features(
                         db, game.id, snapshot.bookmaker_id,
                         snapshot.market_type, outcome_name, float(opening_price),
+                        index=snapshot_index,
                     )
 
-                    features = pd.DataFrame([{
+                    features = {
                         "bookmaker_id": snapshot.bookmaker_id,
                         "market_type": snapshot.market_type,
                         "hours_to_game": hours_to_game,
@@ -1051,57 +1108,94 @@ async def get_upcoming_opportunities(
                         "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
                         "books_moved_count": bk_features["books_moved_count"],
                         "steam_move_signal": bk_features["steam_move_signal"],
-                    }])
+                    }
 
-                    try:
-                        movement_pred = model.predict_movement(features)
-                        predicted_delta = float(movement_pred["predicted_delta"][0])
-                        confidence = float(movement_pred["confidence"][0])
-                        direction = movement_pred["predicted_direction"][0]
+                    # Collected and predicted in one batch per sport after the loop
+                    pending.append({
+                        "sport_key": game_sport_key,
+                        "features": features,
+                        "game_id": game.id,
+                        "market_type": snapshot.market_type,
+                        "bookmaker": bookmaker.name if bookmaker else "Unknown",
+                        "outcome_name": outcome_name,
+                        "opening_price": opening_price,
+                        "opening_point": opening_point,
+                    })
 
-                        # Calculate EV score
-                        if direction == "DOWN" and predicted_delta < -0.01:
-                            ev_score = abs(predicted_delta) * confidence * 100
-                        elif direction == "UP" and predicted_delta > 0.01:
-                            ev_score = abs(predicted_delta) * confidence * 100
-                        else:
-                            ev_score = 0.0
+            game_meta.append({
+                "game_id": game.id,
+                "home_team": home_team.name,
+                "away_team": away_team.name if away_team else "Unknown",
+                "commence_time": game.commence_time.isoformat(),
+                "hours_to_game": round(hours_to_game, 1),
+            })
 
-                        if ev_score < min_ev_score:
-                            continue
+        # Batch inference, one call per sport
+        opps_by_game: Dict[int, list] = {}
+        by_sport: Dict[str, List[int]] = {}
+        for i, item in enumerate(pending):
+            by_sport.setdefault(item["sport_key"], []).append(i)
 
-                        # Format line
-                        if opening_point != 0:
-                            current_line = f"{opening_point:+.1f} at {decimal_to_american(opening_price)}"
-                        else:
-                            current_line = decimal_to_american(opening_price)
+        for sk, idxs in by_sport.items():
+            sport_model = get_model(sk)
+            if sport_model is None:
+                continue
+            try:
+                batch = sport_model.predict_movement(
+                    pd.DataFrame([pending[i]["features"] for i in idxs])
+                )
+            except Exception:
+                logger.exception(f"Batch prediction failed for {sk}")
+                continue
 
-                        game_opps.append({
-                            "bookmaker": bookmaker.name if bookmaker else "Unknown",
-                            "market_type": snapshot.market_type,
-                            "outcome_name": outcome_name,
-                            "current_line": current_line,
-                            "predicted_movement": round(predicted_delta, 4),
-                            "predicted_direction": direction,
-                            "confidence": round(confidence, 3),
-                            "ev_score": round(ev_score, 2),
-                        })
-                    except Exception:
-                        continue
+            for pos, i in enumerate(idxs):
+                item = pending[i]
+                predicted_delta = float(batch["predicted_delta"][pos])
+                confidence = float(batch["confidence"][pos])
+                direction = batch["predicted_direction"][pos]
 
+                # Calculate EV score
+                if direction == "DOWN" and predicted_delta < -0.01:
+                    ev_score = abs(predicted_delta) * confidence * 100
+                elif direction == "UP" and predicted_delta > 0.01:
+                    ev_score = abs(predicted_delta) * confidence * 100
+                else:
+                    ev_score = 0.0
+
+                if ev_score < min_ev_score:
+                    continue
+
+                opening_price = item["opening_price"]
+                opening_point = item["opening_point"]
+
+                # Format line
+                if opening_point != 0:
+                    current_line = f"{opening_point:+.1f} at {decimal_to_american(opening_price)}"
+                else:
+                    current_line = decimal_to_american(opening_price)
+
+                opps_by_game.setdefault(item["game_id"], []).append({
+                    "bookmaker": item["bookmaker"],
+                    "market_type": item["market_type"],
+                    "outcome_name": item["outcome_name"],
+                    "current_line": current_line,
+                    "predicted_movement": round(predicted_delta, 4),
+                    "predicted_direction": direction,
+                    "confidence": round(confidence, 3),
+                    "ev_score": round(ev_score, 2),
+                })
+
+        for meta in game_meta:
+            game_opps = opps_by_game.get(meta["game_id"], [])
+            if not game_opps:
+                continue
             # Sort opportunities by EV score
             game_opps.sort(key=lambda x: x["ev_score"], reverse=True)
-
-            if game_opps:
-                game_opportunities.append({
-                    "game_id": game.id,
-                    "home_team": home_team.name,
-                    "away_team": away_team.name if away_team else "Unknown",
-                    "commence_time": game.commence_time.isoformat(),
-                    "hours_to_game": round(hours_to_game, 1),
-                    "opportunities": game_opps[:10],  # Top 10 per game
-                    "total_opportunities": len(game_opps),
-                })
+            game_opportunities.append({
+                **meta,
+                "opportunities": game_opps[:10],  # Top 10 per game
+                "total_opportunities": len(game_opps),
+            })
 
         # Sort games by best opportunity
         game_opportunities.sort(
@@ -1130,7 +1224,7 @@ async def get_upcoming_opportunities(
 
 
 @router.get("/best-ev-history")
-async def get_best_ev_history(days: int = 30):
+def get_best_ev_history(days: int = 30):
     """
     Get historical Best EV picks with settled results.
 
@@ -1262,7 +1356,11 @@ def _save_picks():
             for s in db.execute(select(Sport).where(Sport.id.in_(save_sport_ids))).scalars().all()
         }
 
+        # One snapshot fetch for every game, instead of ~5 queries per outcome
+        snapshot_index = SnapshotIndex.for_games(db, {game.id for _, game in results})
+
         candidates = []
+        pending: List[dict] = []
         for snapshot, game in results:
             hours_to_game = (game.commence_time - now).total_seconds() / 3600
             if hours_to_game < 1.0:
@@ -1293,22 +1391,24 @@ def _save_picks():
                     continue
 
                 consensus_line = engineer.calculate_consensus_line(
-                    db, game.id, snapshot.market_type, outcome_name
+                    db, game.id, snapshot.market_type, outcome_name, index=snapshot_index
                 )
                 line_spread = engineer.calculate_line_spread(
-                    db, game.id, snapshot.market_type, outcome_name
+                    db, game.id, snapshot.market_type, outcome_name, index=snapshot_index
                 )
 
                 temporal = engineer.calculate_temporal_features(
                     db, game.id, snapshot.bookmaker_id,
                     snapshot.market_type, outcome_name, snapshot.timestamp,
+                    index=snapshot_index,
                 )
                 bk_features = engineer.calculate_bookmaker_features(
                     db, game.id, snapshot.bookmaker_id,
                     snapshot.market_type, outcome_name, float(opening_price),
+                    index=snapshot_index,
                 )
 
-                features = pd.DataFrame([{
+                features = {
                     "bookmaker_id": snapshot.bookmaker_id,
                     "market_type": snapshot.market_type,
                     "hours_to_game": hours_to_game,
@@ -1331,42 +1431,69 @@ def _save_picks():
                     "relative_to_pinnacle": bk_features["relative_to_pinnacle"],
                     "books_moved_count": bk_features["books_moved_count"],
                     "steam_move_signal": bk_features["steam_move_signal"],
-                }])
+                }
 
-                try:
-                    pred = model.predict_movement(features)
-                    predicted_delta = float(pred["predicted_delta"][0])
-                    confidence = float(pred["confidence"][0])
-                    direction = pred["predicted_direction"][0]
+                # Collected here and predicted in one batch per sport below —
+                # single-row inference is ~87ms each, batched it is ~0.25ms.
+                pending.append({
+                    "sport_key": game_sport_key,
+                    "features": features,
+                    "game_id": game.id,
+                    "market_type": snapshot.market_type,
+                    "bookmaker": bookmaker.name if bookmaker else "Unknown",
+                    "outcome_name": outcome_name,
+                    "opening_price": opening_price,
+                    "opening_point": opening_point,
+                })
 
-                    pick_min_conf = MIN_H2H_CONFIDENCE if snapshot.market_type == "h2h" else 0.62
-                    if confidence < pick_min_conf:
-                        continue
+        by_sport: Dict[str, List[int]] = {}
+        for i, item in enumerate(pending):
+            by_sport.setdefault(item["sport_key"], []).append(i)
 
-                    MIN_MOVEMENT = 0.025
-                    if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
-                        ev_score = abs(predicted_delta) * confidence * 100
-                    elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
-                        ev_score = abs(predicted_delta) * confidence * 100
-                    else:
-                        continue
+        for sk, idxs in by_sport.items():
+            sport_model = get_model(sk)
+            if sport_model is None:
+                continue
+            try:
+                batch = sport_model.predict_movement(
+                    pd.DataFrame([pending[i]["features"] for i in idxs])
+                )
+            except Exception:
+                logger.exception(f"Batch prediction failed for {sk}")
+                continue
 
-                    if ev_score < 2.0:
-                        continue
+            for pos, i in enumerate(idxs):
+                item = pending[i]
+                predicted_delta = float(batch["predicted_delta"][pos])
+                confidence = float(batch["confidence"][pos])
+                direction = batch["predicted_direction"][pos]
 
-                    candidates.append({
-                        "game_id": game.id,
-                        "bookmaker": bookmaker.name if bookmaker else "Unknown",
-                        "market_type": snapshot.market_type,
-                        "outcome_name": outcome_name,
-                        "entry_odds": float(opening_price),
-                        "point_line": float(opening_point) if opening_point is not None else None,
-                        "ev_score": ev_score,
-                        "confidence": confidence,
-                        "predicted_delta": predicted_delta,
-                    })
-                except Exception:
+                pick_min_conf = MIN_H2H_CONFIDENCE if item["market_type"] == "h2h" else 0.62
+                if confidence < pick_min_conf:
                     continue
+
+                MIN_MOVEMENT = 0.025
+                if direction == "DOWN" and predicted_delta < -MIN_MOVEMENT:
+                    ev_score = abs(predicted_delta) * confidence * 100
+                elif direction == "UP" and predicted_delta > MIN_MOVEMENT:
+                    ev_score = abs(predicted_delta) * confidence * 100
+                else:
+                    continue
+
+                if ev_score < 2.0:
+                    continue
+
+                candidates.append({
+                    "game_id": item["game_id"],
+                    "bookmaker": item["bookmaker"],
+                    "market_type": item["market_type"],
+                    "outcome_name": item["outcome_name"],
+                    "entry_odds": float(item["opening_price"]),
+                    "point_line": float(item["opening_point"]) if item["opening_point"] is not None else None,
+                    "ev_score": ev_score,
+                    "confidence": confidence,
+                    "predicted_delta": predicted_delta,
+                })
 
         # Save top new picks (up to 20 per run, no daily cap)
         candidates.sort(key=lambda x: x["ev_score"], reverse=True)
@@ -1399,14 +1526,14 @@ def _save_picks():
 
 
 @router.post("/save-daily-picks")
-async def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
+def save_daily_best_ev_picks(background_tasks: BackgroundTasks):
     """Snapshot today's best EV picks. Safe to call multiple times — deduplicates on (game_id, market_type, outcome_name)."""
     background_tasks.add_task(_save_picks)
     return {"status": "scheduled", "message": "Daily Best EV picks are being saved in the background"}
 
 
 @router.post("/settle-picks")
-async def settle_best_ev_picks(background_tasks: BackgroundTasks):
+def settle_best_ev_picks(background_tasks: BackgroundTasks):
     """
     Settle pending BestEVPick records against known BettingOutcome results.
 
@@ -1424,6 +1551,16 @@ async def settle_best_ev_picks(background_tasks: BackgroundTasks):
                 .where(BettingOutcome.completed == True)  # noqa: E712
             )
             results = db.execute(stmt).all()
+
+            # Surface the gap between pending picks and settleable ones — picks on games
+            # that never got scores stay pending forever and silently skew the bankroll sim.
+            total_pending = db.execute(
+                select(func.count()).select_from(BestEVPick).where(BestEVPick.result == "pending")
+            ).scalar_one()
+            logger.info(
+                f"Pick settlement starting: {total_pending} pending, "
+                f"{len(results)} with completed outcomes"
+            )
 
             # Pre-fetch all teams to avoid N+1 queries
             team_ids = list({tid for _, game, _ in results for tid in (game.home_team_id, game.away_team_id)})

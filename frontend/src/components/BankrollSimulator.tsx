@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { fetchJSON } from '../api/client';
+import { CHART_COLORS, axisProps, gridProps, tooltipStyle } from '../charts/theme';
 
-const API_BASE = 'http://localhost:8000/api';
 
 interface BankrollDataPoint {
   date: string;
@@ -52,11 +53,6 @@ interface BankrollSimulation {
   by_market?: Record<string, { bets: number; wins: number; losses: number; pushes: number; profit: number; wagered: number; roi: number; avg_clv: number; win_rate: number }>;
 }
 
-const tooltipStyle = {
-  backgroundColor: '#1F2937',
-  border: '1px solid #374151',
-  borderRadius: '8px',
-};
 
 export const BankrollSimulator: React.FC = () => {
   const [bankrollSimulation, setBankrollSimulation] = useState<BankrollSimulation | null>(null);
@@ -99,11 +95,7 @@ export const BankrollSimulator: React.FC = () => {
       if (params.marketFilter) urlParams.append('market_filter', params.marketFilter);
       if (params.clvThreshold !== null) urlParams.append('clv_threshold', params.clvThreshold.toString());
 
-      const res = await fetch(`${API_BASE}/bankroll-simulation?${urlParams}`);
-      if (res.ok) {
-        const data = await res.json();
-        setBankrollSimulation(data);
-      }
+      setBankrollSimulation(await fetchJSON<BankrollSimulation>(`/bankroll-simulation?${urlParams}`));
     } catch (err) {
       console.error('Error fetching bankroll simulation:', err);
     } finally {
@@ -137,7 +129,7 @@ export const BankrollSimulator: React.FC = () => {
       {/* Data Source Toggle */}
       <div className="flex items-center gap-3">
         <span className="text-sm text-gray-400 font-medium">Data Source:</span>
-        <div className="flex bg-white/5 rounded-lg p-1 border border-white/10">
+        <div className="flex bg-panel-raised rounded-lg p-1 border border-line">
           <button
             onClick={() => setSimSource('best_ev')}
             className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
@@ -152,7 +144,7 @@ export const BankrollSimulator: React.FC = () => {
             onClick={() => setSimSource('all')}
             className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
               simSource === 'all'
-                ? 'bg-white/20 text-white border border-white/30'
+                ? 'bg-white/20 text-white border border-line-strong'
                 : 'text-gray-400 hover:text-white'
             }`}
           >
@@ -167,7 +159,7 @@ export const BankrollSimulator: React.FC = () => {
       </div>
 
       {/* Controls */}
-      <div className="bg-white/5 rounded-lg p-4 border border-white/10 space-y-4">
+      <div className="bg-panel-raised rounded-lg p-4 border border-line space-y-4">
         <div className="flex flex-wrap gap-4 items-center">
           <div className="flex items-center gap-2">
             <label className="text-sm text-gray-400">Strategy:</label>
@@ -307,7 +299,7 @@ export const BankrollSimulator: React.FC = () => {
               { label: 'Sharpe Ratio', value: bankrollSimulation.summary.sharpe_ratio?.toFixed(2) ?? 'N/A', sub: 'Risk-adjusted', color: bankrollSimulation.summary.sharpe_ratio >= 0 ? 'text-cyan-400' : 'text-orange-400' },
               { label: 'Avg Bet Size', value: `$${bankrollSimulation.summary.avg_bet_size?.toFixed(0) ?? 'N/A'}`, sub: bankrollSimulation.summary.strategy?.replace('_', ' '), color: 'text-yellow-400' },
             ].map((card) => (
-              <div key={card.label} className="bg-white/5 rounded-lg p-4 border border-white/10">
+              <div key={card.label} className="bg-panel-raised rounded-lg p-4 border border-line">
                 <div className="text-xs text-gray-400 mb-1 uppercase">{card.label}</div>
                 <div className={`text-2xl font-bold ${card.color}`}>{card.value}</div>
                 {card.sub && <div className="text-xs text-gray-500 mt-1">{card.sub}</div>}
@@ -319,7 +311,7 @@ export const BankrollSimulator: React.FC = () => {
           {(bankrollSimulation.by_bookmaker || bankrollSimulation.by_market) && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {bankrollSimulation.by_bookmaker && Object.keys(bankrollSimulation.by_bookmaker).length > 0 && (
-                <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                <div className="bg-panel-raised rounded-lg p-6 border border-line">
                   <h3 className="text-lg font-semibold text-white mb-4">By Bookmaker</h3>
                   <div className="space-y-3">
                     {Object.entries(bankrollSimulation.by_bookmaker)
@@ -344,7 +336,7 @@ export const BankrollSimulator: React.FC = () => {
                 </div>
               )}
               {bankrollSimulation.by_market && Object.keys(bankrollSimulation.by_market).length > 0 && (
-                <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+                <div className="bg-panel-raised rounded-lg p-6 border border-line">
                   <h3 className="text-lg font-semibold text-white mb-4">By Market Type</h3>
                   <div className="space-y-3">
                     {Object.entries(bankrollSimulation.by_market)
@@ -372,7 +364,7 @@ export const BankrollSimulator: React.FC = () => {
           )}
 
           {/* P&L Curve Chart */}
-          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+          <div className="bg-panel-raised rounded-lg p-6 border border-line">
             <h3 className="text-lg font-semibold text-white mb-4">Cumulative P&L</h3>
             <ResponsiveContainer width="100%" height={300}>
               <LineChart data={bankrollSimulation.data_points}>
@@ -382,9 +374,9 @@ export const BankrollSimulator: React.FC = () => {
                     <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                <XAxis dataKey="bet_number" stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} label={{ value: 'Bet #', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }} />
-                <YAxis stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} tickFormatter={(v) => `$${v}`} />
+                <CartesianGrid {...gridProps} />
+                <XAxis dataKey="bet_number" {...axisProps} label={{ value: 'Bet #', position: 'insideBottom', offset: -5, fill: CHART_COLORS.tick }} />
+                <YAxis {...axisProps} tickFormatter={(v) => `$${v}`} />
                 <Tooltip
                   contentStyle={tooltipStyle}
                   formatter={(value: number | undefined, name: string | undefined) => {
@@ -401,13 +393,13 @@ export const BankrollSimulator: React.FC = () => {
           </div>
 
           {/* Drawdown Chart */}
-          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+          <div className="bg-panel-raised rounded-lg p-6 border border-line">
             <h3 className="text-lg font-semibold text-white mb-4">Drawdown Analysis</h3>
             <ResponsiveContainer width="100%" height={200}>
               <BarChart data={bankrollSimulation.data_points}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-                <XAxis dataKey="bet_number" stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} />
-                <YAxis stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} tickFormatter={(v) => `${v}%`} />
+                <CartesianGrid {...gridProps} />
+                <XAxis dataKey="bet_number" {...axisProps} />
+                <YAxis {...axisProps} tickFormatter={(v) => `${v}%`} />
                 <Tooltip
                   contentStyle={tooltipStyle}
                   formatter={(value: number | undefined) => [`${value?.toFixed(2) ?? '0'}%`, 'Drawdown']}
@@ -419,7 +411,7 @@ export const BankrollSimulator: React.FC = () => {
           </div>
 
           {/* Bet History Table */}
-          <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+          <div className="bg-panel-raised rounded-lg p-6 border border-line">
             <h3 className="text-lg font-semibold text-white mb-1">Bet History</h3>
             <p className="text-xs text-gray-500 mb-4">
               {bankrollSimulation.source === 'best_ev'
@@ -437,7 +429,7 @@ export const BankrollSimulator: React.FC = () => {
                 </thead>
                 <tbody>
                   {bankrollSimulation.data_points.map((bet, idx) => (
-                    <tr key={idx} className="border-b border-gray-800 hover:bg-white/5">
+                    <tr key={idx} className="border-b border-gray-800 hover:bg-panel-raised">
                       <td className="py-2 px-2 text-gray-400 text-xs whitespace-nowrap">{bet.game_date}</td>
                       <td className="py-2 px-2 text-white text-xs max-w-[150px] truncate" title={bet.game}>{bet.game}</td>
                       <td className="py-2 px-2 text-gray-300 text-xs max-w-[80px] truncate" title={bet.bookmaker}>{bet.bookmaker}</td>
@@ -470,7 +462,6 @@ export const BankrollSimulator: React.FC = () => {
         </>
       ) : (
         <div className="text-center py-12 text-gray-400">
-          <div className="text-6xl mb-4">📊</div>
           <p className="text-lg mb-2">No simulation data available</p>
           {bankrollSimulation?.message ? (
             <p className="text-sm max-w-md mx-auto">{bankrollSimulation.message}</p>

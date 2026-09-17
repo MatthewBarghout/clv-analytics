@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { fetchJSON, postJSON } from '../api/client';
+import { LoadingState } from './States';
 
 interface EVOpportunity {
   game_id: number;
@@ -24,7 +26,6 @@ interface BestEVOpportunitiesProps {
 
 type SportFilter = 'all' | 'nba' | 'mlb';
 
-const API_BASE = 'http://localhost:8000/api';
 
 const SPORT_META: Record<string, { label: string; color: string; bg: string; border: string; accent: string }> = {
   basketball_nba: { label: 'NBA', color: 'text-orange-400', bg: 'bg-orange-500/15', border: 'border-orange-500/30', accent: 'bg-orange-500/25' },
@@ -82,7 +83,7 @@ const PickCard = React.memo(function PickCard({ opp, bankroll, onAddToBets }: Pi
                                     'text-sky-400 bg-sky-500/15 border-sky-500/30';
 
   return (
-    <div className="bg-white/5 rounded-xl border border-white/10 p-4 hover:bg-white/8 transition-colors">
+    <div className="bg-panel-raised rounded-xl border border-line p-4 hover:bg-white/8 transition-colors">
       {/* Top row: game + EV badge */}
       <div className="flex items-start justify-between gap-3 mb-3">
         <div>
@@ -104,7 +105,7 @@ const PickCard = React.memo(function PickCard({ opp, bankroll, onAddToBets }: Pi
         <span className="text-white font-medium text-sm">{opp.outcome_name}</span>
         <span className="text-gray-400 font-mono text-xs">{opp.current_line}</span>
         {opp.was_constrained && (
-          <span className="text-yellow-400 text-xs" title="Prediction capped">⚠ capped</span>
+          <span className="text-yellow-400 text-xs" title="Prediction capped">capped</span>
         )}
       </div>
 
@@ -161,7 +162,7 @@ interface SportSectionProps {
 const SportSection = React.memo(function SportSection({ sportKey, picks, bankroll, onAddToBets }: SportSectionProps) {
   const meta = SPORT_META[sportKey];
   const label = meta?.label ?? sportKey.toUpperCase();
-  const headerCls = meta ? `${meta.color} ${meta.bg} ${meta.border}` : 'text-gray-400 bg-white/5 border-white/10';
+  const headerCls = meta ? `${meta.color} ${meta.bg} ${meta.border}` : 'text-gray-400 bg-panel-raised border-line';
 
   return (
     <div>
@@ -200,11 +201,9 @@ export const BestEVOpportunities = React.memo(function BestEVOpportunities({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(
-        `${API_BASE}/ml/best-opportunities?today_only=true&limit=50&min_ev_score=2.0&min_confidence=0.62&min_hours_to_game=1.0`
+      const data = await fetchJSON<EVOpportunity[]>(
+        '/ml/best-opportunities?today_only=true&limit=50&min_ev_score=2.0&min_confidence=0.62&min_hours_to_game=1.0'
       );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
       setRaw(Array.isArray(data) ? data : []);
       setLastRefresh(new Date());
     } catch (err) {
@@ -220,8 +219,7 @@ export const BestEVOpportunities = React.memo(function BestEVOpportunities({
     setSavingPicks(true);
     setSavedMsg(null);
     try {
-      const res = await fetch(`${API_BASE}/ml/save-daily-picks`, { method: 'POST' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await postJSON('/ml/save-daily-picks');
       setSavedMsg("Today's picks saved for tracking. They'll settle after games complete.");
     } catch {
       setSavedMsg('Error saving picks. Please try again.');
@@ -264,12 +262,7 @@ export const BestEVOpportunities = React.memo(function BestEVOpportunities({
   const mlbCnt = useMemo(() => deduped.filter((o) => o.sport_key === 'baseball_mlb').length, [deduped]);
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center py-16">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-green-500 mr-3" />
-        <span className="text-gray-400">Scanning for today's best opportunities...</span>
-      </div>
-    );
+    return <LoadingState message="Scanning for today's best opportunities..." />;
   }
 
   if (error) {
@@ -297,7 +290,7 @@ export const BestEVOpportunities = React.memo(function BestEVOpportunities({
 
         <div className="flex flex-wrap items-center gap-2">
           {/* Sport filter */}
-          <div className="flex items-center gap-0.5 rounded-lg bg-white/5 border border-white/10 p-0.5 text-xs font-medium">
+          <div className="flex items-center gap-0.5 rounded-lg bg-panel-raised border border-line p-0.5 text-xs font-medium">
             <button
               onClick={() => setSportFilter('all')}
               className={`px-2.5 py-1 rounded transition-all ${sportFilter === 'all' ? 'bg-white/10 text-white' : 'text-gray-500 hover:text-gray-300'}`}
@@ -320,7 +313,7 @@ export const BestEVOpportunities = React.memo(function BestEVOpportunities({
 
           <button
             onClick={fetchOpportunities}
-            className="px-3 py-1.5 bg-white/10 hover:bg-white/15 rounded-lg border border-white/15 text-xs transition-all"
+            className="px-3 py-1.5 bg-white/10 hover:bg-white/15 rounded-lg border border-line-strong text-xs transition-all"
           >
             Refresh
           </button>

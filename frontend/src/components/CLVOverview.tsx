@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { GlassCard } from './GlassCard';
 import { TimeRangeSelector } from './TimeRangeSelector';
+import { CHART_COLORS, axisProps, gridProps, legendProps, tooltipStyle } from '../charts/theme';
 
 interface CLVStats {
   mean_clv: number | null;
@@ -38,12 +39,6 @@ interface Props {
   onTimeRangeChange: (range: '7d' | '30d' | '90d' | 'all') => void;
 }
 
-const tooltipStyle = {
-  backgroundColor: '#1F2937',
-  border: '1px solid #374151',
-  borderRadius: '8px',
-  backdropFilter: 'blur(10px)',
-};
 
 export const CLVOverview: React.FC<Props> = React.memo(({ stats, history, timeRange, onTimeRangeChange }) => {
   const marketChartData = useMemo(
@@ -83,17 +78,16 @@ export const CLVOverview: React.FC<Props> = React.memo(({ stats, history, timeRa
                 <stop offset="100%" stopColor="#ef4444" stopOpacity={0.3} />
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-            <XAxis dataKey="market" stroke="#9CA3AF" tick={{ fill: '#9CA3AF' }} />
+            <CartesianGrid {...gridProps} />
+            <XAxis dataKey="market" {...axisProps} />
             <YAxis
-              stroke="#9CA3AF"
-              tick={{ fill: '#9CA3AF' }}
-              label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: '#9CA3AF' }}
+              {...axisProps}
+              label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: CHART_COLORS.tick }}
             />
             <Tooltip
               contentStyle={tooltipStyle}
               labelStyle={{ color: '#F3F4F6' }}
-              itemStyle={{ color: '#9CA3AF' }}
+              itemStyle={{ color: CHART_COLORS.tick }}
               formatter={(value: number | undefined, _name: string | undefined, props: any) => [
                 `${value ? value.toFixed(2) : '0'}% (${props.payload.count} bets)`,
                 'Avg CLV',
@@ -123,19 +117,18 @@ export const CLVOverview: React.FC<Props> = React.memo(({ stats, history, timeRa
                 <stop offset="95%" stopColor="#10B981" stopOpacity={0} />
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-            <XAxis dataKey="date" stroke="#9CA3AF" tick={{ fill: '#9CA3AF', fontSize: 12 }} />
+            <CartesianGrid {...gridProps} />
+            <XAxis dataKey="date" {...axisProps} />
             <YAxis
-              stroke="#9CA3AF"
-              tick={{ fill: '#9CA3AF', fontSize: 12 }}
-              label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: '#9CA3AF' }}
+              {...axisProps}
+              label={{ value: 'Avg CLV %', angle: -90, position: 'insideLeft', fill: CHART_COLORS.tick }}
             />
             <Tooltip
               contentStyle={tooltipStyle}
               labelStyle={{ color: '#F3F4F6', fontWeight: 'bold' }}
               itemStyle={{ color: '#10B981' }}
             />
-            <Legend wrapperStyle={{ color: '#9CA3AF' }} />
+            <Legend {...legendProps} />
             <Line
               type="monotone"
               dataKey="avg_clv"
