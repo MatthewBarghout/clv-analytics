@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { fetchJSON, postJSON } from '../api/client';
 
-const API_BASE = 'http://localhost:8000/api';
 
 interface UserBet {
   id: number;
@@ -53,12 +53,12 @@ export const MyBets: React.FC = () => {
   const fetchUserBets = useCallback(async () => {
     try {
       setLoadingUserBets(true);
-      const [betsRes, summaryRes] = await Promise.all([
-        fetch(`${API_BASE}/user-bets`),
-        fetch(`${API_BASE}/user-bets/summary`),
+      const [bets, summary] = await Promise.all([
+        fetchJSON<UserBet[]>('/user-bets'),
+        fetchJSON<UserBetsSummary>('/user-bets/summary'),
       ]);
-      if (betsRes.ok) setUserBets(await betsRes.json());
-      if (summaryRes.ok) setUserBetsSummary(await summaryRes.json());
+      setUserBets(bets);
+      setUserBetsSummary(summary);
     } catch (err) {
       console.error('Error fetching user bets:', err);
     } finally {
@@ -81,12 +81,10 @@ export const MyBets: React.FC = () => {
         odds: newBet.odds,
         stake: newBet.stake,
       });
-      const res = await fetch(`${API_BASE}/user-bets?${params}`, { method: 'POST' });
-      if (res.ok) {
-        setShowAddBetForm(false);
-        setNewBet(emptyBet);
-        fetchUserBets();
-      }
+      await postJSON(`/user-bets?${params}`);
+      setShowAddBetForm(false);
+      setNewBet(emptyBet);
+      fetchUserBets();
     } catch (err) {
       console.error('Error adding bet:', err);
     }
@@ -94,8 +92,8 @@ export const MyBets: React.FC = () => {
 
   const handleSettleBet = useCallback(async (betId: number, result: 'win' | 'loss' | 'push') => {
     try {
-      const res = await fetch(`${API_BASE}/user-bets/${betId}?result=${result}`, { method: 'PUT' });
-      if (res.ok) fetchUserBets();
+      await fetchJSON(`/user-bets/${betId}?result=${result}`, { method: 'PUT' });
+      fetchUserBets();
     } catch (err) {
       console.error('Error settling bet:', err);
     }
@@ -103,8 +101,8 @@ export const MyBets: React.FC = () => {
 
   const handleDeleteBet = useCallback(async (betId: number) => {
     try {
-      const res = await fetch(`${API_BASE}/user-bets/${betId}`, { method: 'DELETE' });
-      if (res.ok) fetchUserBets();
+      await fetchJSON(`/user-bets/${betId}`, { method: 'DELETE' });
+      fetchUserBets();
     } catch (err) {
       console.error('Error deleting bet:', err);
     }
@@ -121,7 +119,7 @@ export const MyBets: React.FC = () => {
             { label: 'Profit', value: `${userBetsSummary.total_profit >= 0 ? '+' : ''}$${userBetsSummary.total_profit}`, color: userBetsSummary.total_profit >= 0 ? 'text-green-400' : 'text-red-400' },
             { label: 'ROI', value: `${userBetsSummary.roi >= 0 ? '+' : ''}${userBetsSummary.roi}%`, color: userBetsSummary.roi >= 0 ? 'text-green-400' : 'text-red-400' },
           ].map((card) => (
-            <div key={card.label} className="bg-white/5 rounded-lg p-4 border border-white/10">
+            <div key={card.label} className="bg-panel-raised rounded-lg p-4 border border-line">
               <div className="text-xs text-gray-400 mb-1 uppercase">{card.label}</div>
               <div className={`text-2xl font-bold ${card.color}`}>{card.value}</div>
             </div>
@@ -139,7 +137,7 @@ export const MyBets: React.FC = () => {
       </div>
 
       {showAddBetForm && (
-        <div className="bg-white/5 rounded-lg p-6 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-6 border border-line">
           <h3 className="text-lg font-semibold text-white mb-4">Add New Bet</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <input
@@ -211,7 +209,7 @@ export const MyBets: React.FC = () => {
           <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-yellow-500 mx-auto"></div>
         </div>
       ) : userBets.length > 0 ? (
-        <div className="bg-white/5 rounded-lg border border-white/10 overflow-hidden">
+        <div className="bg-panel-raised rounded-lg border border-line overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-gray-900">
               <tr className="border-b border-gray-700">
@@ -222,7 +220,7 @@ export const MyBets: React.FC = () => {
             </thead>
             <tbody>
               {userBets.map((bet) => (
-                <tr key={bet.id} className="border-b border-gray-800 hover:bg-white/5">
+                <tr key={bet.id} className="border-b border-gray-800 hover:bg-panel-raised">
                   <td className="py-3 px-4 text-gray-400">{new Date(bet.game_date).toLocaleDateString()}</td>
                   <td className="py-3 px-4 text-white">{bet.game_description}</td>
                   <td className="py-3 px-4">
@@ -284,7 +282,6 @@ export const MyBets: React.FC = () => {
         </div>
       ) : (
         <div className="text-center py-12 text-gray-400">
-          <div className="text-6xl mb-4">🎰</div>
           <p className="text-lg mb-2">No bets tracked yet</p>
           <p className="text-sm">Click "+ Add Bet" to start tracking your bets</p>
         </div>

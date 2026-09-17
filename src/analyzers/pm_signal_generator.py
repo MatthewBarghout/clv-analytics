@@ -250,12 +250,13 @@ class PMSignalGenerator:
     def kelly_size(self, edge: float, price: float) -> float:
         """Quarter-Kelly position size in USD, clamped to [25, 200].
 
-        At price>0.80 the win payout is tiny relative to loss exposure, so the
-        max is tightened to $50 even when Kelly math suggests larger.
+        Both tails are tightened to $50. At price>0.80 the win payout is tiny
+        relative to loss exposure. At price<0.20 the (1-price) denominator is
+        large, so Kelly runs straight to the clamp on a lottery-ticket contract.
         """
         if price >= 1.0 or price <= 0.0:
             return MIN_SIZE_USD
-        max_size = 50.0 if price > 0.80 else MAX_SIZE_USD
+        max_size = 50.0 if (price > 0.80 or price < 0.20) else MAX_SIZE_USD
         raw = (edge / (1.0 - price)) * KELLY_FRACTION * BANKROLL
         return float(max(MIN_SIZE_USD, min(max_size, raw)))
 

@@ -1,15 +1,73 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/*
+ * Tailwind v4 is CSS-first. The old v3 `@tailwind` directives plus a
+ * `tailwind.config.js` were silently doing nothing for the custom theme: the
+ * `clv-positive-*` / `clv-negative-*` classes used in BookmakerPerformance never
+ * made it into the built CSS, so those numbers rendered with no colour at all.
+ * Everything the app actually uses now lives here.
+ */
+
+@theme {
+  /* ── Surfaces ──────────────────────────────────────────────────────────
+     The app is dark-only. There is no light palette and `color-scheme` no
+     longer claims one. */
+  --color-surface: #0a0b0e;
+  --color-panel: #101217;
+  --color-panel-raised: #171a21;
+
+  /* ── Lines ─────────────────────────────────────────────────────────────
+     Two weights only. Previously the codebase mixed border-white/8,
+     border-white/10 and border-white/20 more or less at random. */
+  --color-line: #1d212a;
+  --color-line-strong: #2b313d;
+
+  /* ── Text ──────────────────────────────────────────────────────────────
+     Three weights: primary, secondary, and de-emphasised. */
+  --color-ink: #e9ebef;
+  --color-ink-muted: #98a0ac;
+  --color-ink-faint: #6a7280;
+
+  /* ── Semantic: money ───────────────────────────────────────────────────
+     Use these for P&L and CLV, not raw green-400/red-400, so profit and loss
+     read the same everywhere. */
+  --color-pos: #4ade80;
+  --color-pos-strong: #22c55e;
+  --color-neg: #f87171;
+  --color-neg-strong: #ef4444;
+  --color-warn: #fbbf24;
+  --color-info: #60a5fa;
+
+  /* ── CLV scales ────────────────────────────────────────────────────────
+     Carried over from the old JS config. Only the shades the app references
+     are defined; the unused 50-300/700-900 steps are gone. */
+  --color-clv-positive-400: #4ade80;
+  --color-clv-positive-500: #22c55e;
+  --color-clv-positive-600: #16a34a;
+  --color-clv-negative-400: #f87171;
+  --color-clv-negative-500: #ef4444;
+  --color-clv-negative-600: #dc2626;
+
+  /* ── Motion ────────────────────────────────────────────────────────────
+     animate-count-up is the only animation the app used; fade-in, slide-up,
+     the gradient backgrounds and backdrop-blur-xs were all dead config. */
+  --animate-count-up: countUp 1s ease-out;
+}
+
+@keyframes countUp {
+  0% { opacity: 0; transform: scale(0.8); }
+  50% { opacity: 0.5; transform: scale(1.1); }
+  100% { opacity: 1; transform: scale(1); }
+}
 
 :root {
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  color-scheme: dark;
+  color: var(--color-ink);
+  background-color: var(--color-surface);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -25,4 +83,14 @@ body {
 #portal-root {
   position: relative;
   z-index: 999999;
+}
+
+/*
+ * Figures that update in place — P&L, CLV %, odds, bankroll — must not reflow
+ * as digits change. Applied to any cell holding a number.
+ */
+.tabular,
+table {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
 }

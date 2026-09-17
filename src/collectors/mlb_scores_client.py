@@ -29,13 +29,19 @@ class MLBScoresClient:
         """
         Get all completed games for a specific date.
 
+        Spans the neighbouring days as well. Callers bucket games by the UTC date of
+        commence_time, which does not always equal MLB's official game date — a game
+        listed at 23:46 UTC on May 5 can sit in MLB's May 6 slate, and late West Coast
+        starts roll the other way. Fetching +/- 1 day covers both.
+
         Returns list of dicts: {home_team, away_team, home_score, away_score, completed}
         """
         date_str = date.strftime("%Y-%m-%d")
         url = f"{self.BASE_URL}/schedule"
         params = {
             "sportId": 1,       # MLB
-            "date": date_str,
+            "startDate": (date - timedelta(days=1)).strftime("%Y-%m-%d"),
+            "endDate": (date + timedelta(days=1)).strftime("%Y-%m-%d"),
             "gameType": "R,F,D,L,W",  # Regular, Wild Card, Division, League, World Series
         }
 
@@ -83,6 +89,9 @@ class MLBScoresClient:
                 "home_score": int(home_score),
                 "away_score": int(away_score),
                 "completed": True,
+                # Official game date — required to pick the right game of a series,
+                # since the same two teams play on consecutive days.
+                "game_date": game.get("officialDate") or game.get("gameDate", "")[:10],
             }
         except Exception as e:
             logger.error(f"Failed to parse MLB game data: {e}")

@@ -86,7 +86,7 @@ cp .env.example .env
 # 4. Install dependencies
 poetry install
 
-# 5. (Optional) Train ML model — required to enable predictions
+# 5. (Optional) Train ML models (one per sport) — required to enable predictions
 poetry run python -m scripts.train_movement_model --walk-forward
 
 # 6. Launch backend + frontend
@@ -114,9 +114,17 @@ Ensemble of XGBoost and Random Forest predicting line movement direction and mag
 | Prediction cap (h2h) | ±8% | Prevents over-sized signals |
 | Prediction cap (spreads/totals) | ±4% | Tighter due to noisier markets |
 
-**Current validated accuracy (walk-forward, 5 chronological folds):**
-- 56.6% ± 0.7% vs 40.1% baseline
-- Consistent across all folds — model generalizes across time
+**Current validated accuracy (walk-forward, 5 chronological folds).** Models are per-sport since
+2026-07-25 — compare a retrain only against the same sport's own history:
+
+| Scope | Date | Accuracy | Naive baseline |
+|---|---|---|---|
+| **baseball_mlb** (current) | 2026-09-15 | **48.3% ± 2.0%** (18,802 rows) | 35.6% |
+| Mixed-sport, pre-split (historical) | 2026-04-21 | 56.6% ± 0.7% | 40.1% |
+
+The 2026-04-21 row is largely NBA and predates the per-sport split; it is not a valid comparator
+for a single-sport retrain. MLB accuracy has been flat since July — what improved with 2.2x the
+data is stability (±5.2% → ±2.0%).
 
 **Feature groups:**
 - *Temporal:* movement velocity, price volatility, cumulative drift, direction change count
@@ -124,8 +132,13 @@ Ensemble of XGBoost and Random Forest predicting line movement direction and mag
 
 **Training:**
 ```bash
-poetry run python -m scripts.train_movement_model --walk-forward
+poetry run python -m scripts.train_movement_model --sport baseball_mlb --walk-forward
+# omit --sport to train every sport found in the database
 ```
+
+> `train_sport()` saves unconditionally — it overwrites the live model before you see the
+> validation number. Back up the existing `.pkl` first. There is deliberately no scheduled
+> retrain job until a promotion gate exists (see `ROADMAP_2026_09.md` Phase 5).
 
 ### Best EV+ Opportunities
 
@@ -226,7 +239,7 @@ No API keys required — Polymarket and Metaculus are public APIs.
 
 | Sport | Key | Score Source |
 |---|---|---|
-| NBA | `basketball_nba` | NBA.com API (free) |
+| NBA | `basketball_nba` | ESPN public API (free) |
 | MLB | `baseball_mlb` | MLB Stats API — statsapi.mlb.com (free) |
 
 NFL to be added when preseason begins (August). Adding a new sport requires one line in `collect_odds.py` and routing in `fetch_game_scores.py` — no DB migrations, no model changes.
@@ -408,7 +421,7 @@ src/
 │   ├── polymarket_client.py     # Polymarket Gamma API — public, no auth
 │   ├── metaculus_client.py      # Metaculus API — community_prediction median
 │   ├── arb_calculator.py        # Arb spread calc + fuzzy event matching
-│   ├── nba_scores_client.py     # NBA.com scores fetcher
+│   ├── nba_scores_client.py     # NBA scores fetcher (ESPN)
 │   └── mlb_scores_client.py     # MLB Stats API client (statsapi.mlb.com)
 └── models/
     └── database.py              # All SQLAlchemy models + composite indexes
@@ -439,8 +452,7 @@ scripts/
 ├── track_opportunity_performance.py # Bet lifecycle tracking
 ├── update_report_profit_stats.py    # ROI calculations
 ├── schedule_game_batches.py         # Dynamic launchd batch scheduler
-├── train_movement_model.py          # Walk-forward model training
-└── auto_retrain.py                  # Auto-retraining on degradation
+└── train_movement_model.py          # Per-sport walk-forward model training
 
 migrations/                  # Alembic migration history
 models/                      # Trained ML artifacts (git-ignored)

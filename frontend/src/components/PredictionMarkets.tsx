@@ -1,6 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
+import { fetchJSON } from '../api/client';
+import { usePolling } from '../hooks/usePolling';
+import { LoadingState } from './States';
 
-const API_BASE = 'http://localhost:8000/api';
 const REFRESH_INTERVAL_MS = 60_000;
 
 interface PaperTrade {
@@ -74,21 +76,20 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchData = useCallback(async (isManual = false) => {
     if (isManual) setRefreshing(true);
     setError(null);
     try {
-      const [tradesRes, statsRes, signalsRes] = await Promise.all([
-        fetch(`${API_BASE}/paper-trades?limit=100`),
-        fetch(`${API_BASE}/paper-trades/stats`),
-        fetch(`${API_BASE}/cross-platform-signals?limit=20&min_divergence=0.05`),
+      const [tradesData, statsData, signalsData] = await Promise.all([
+        fetchJSON<PaperTrade[]>('/paper-trades?limit=100'),
+        fetchJSON<PaperTradeStats>('/paper-trades/stats'),
+        fetchJSON<CrossPlatformSignal[]>('/cross-platform-signals?limit=20&min_divergence=0.05'),
       ]);
 
-      if (tradesRes.ok) setTrades(await tradesRes.json());
-      if (statsRes.ok) setStats(await statsRes.json());
-      if (signalsRes.ok) setSignals(await signalsRes.json());
+      setTrades(tradesData);
+      setStats(statsData);
+      setSignals(signalsData);
       setLastRefresh(new Date());
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch prediction market data');
@@ -98,13 +99,8 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchData();
-    intervalRef.current = setInterval(() => fetchData(), REFRESH_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [fetchData]);
+  // Auto-refresh every 60s, paused while the tab is hidden
+  usePolling(fetchData, REFRESH_INTERVAL_MS);
 
   const openTrades = useMemo(() => trades.filter((t) => t.is_open), [trades]);
   const closedTrades = useMemo(
@@ -117,34 +113,29 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
   );
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center py-16">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mr-3"></div>
-        <span className="text-gray-400">Loading prediction market data...</span>
-      </div>
-    );
+    return <LoadingState message="Loading prediction market data..." />;
   }
 
   return (
     <div className="space-y-6">
       {/* Stats bar */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <div className="text-xs text-gray-400 uppercase mb-1">Total Trades</div>
           <div className="text-2xl font-bold text-white">{stats?.total_trades ?? 0}</div>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-blue-500/20">
+        <div className="bg-panel-raised rounded-lg p-4 border border-blue-500/20">
           <div className="text-xs text-gray-400 uppercase mb-1">Open Positions</div>
           <div className="text-2xl font-bold text-blue-400">{stats?.open_trades ?? 0}</div>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <div className="text-xs text-gray-400 uppercase mb-1">Win Rate</div>
           <div className="text-2xl font-bold text-white">
             {stats ? `${stats.win_rate.toFixed(1)}%` : '—'}
           </div>
         </div>
         <div
-          className={`bg-white/5 rounded-lg p-4 border ${
+          className={`bg-panel-raised rounded-lg p-4 border ${
             (stats?.total_pnl ?? 0) >= 0 ? 'border-green-500/20' : 'border-red-500/20'
           }`}
         >
@@ -202,7 +193,7 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
               </thead>
               <tbody>
                 {openTrades.map((t) => (
-                  <tr key={t.id} className="border-b border-gray-700/30 hover:bg-white/5 transition-all">
+                  <tr key={t.id} className="border-b border-gray-700/30 hover:bg-panel-raised transition-all">
                     <td className="py-3 px-3 font-mono text-xs text-gray-300">{t.market_ticker}</td>
                     <td className="py-3 px-3 max-w-[220px] text-xs text-white leading-tight">
                       <span className="line-clamp-2">{t.event_description}</span>
@@ -254,7 +245,7 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
               </thead>
               <tbody>
                 {closedTrades.map((t) => (
-                  <tr key={t.id} className="border-b border-gray-700/30 hover:bg-white/5 transition-all">
+                  <tr key={t.id} className="border-b border-gray-700/30 hover:bg-panel-raised transition-all">
                     <td className="py-3 px-3 font-mono text-xs text-gray-300">{t.market_ticker}</td>
                     <td className="py-3 px-3 max-w-[180px] text-xs text-white">
                       <span className="line-clamp-2">{t.event_description}</span>
@@ -316,7 +307,7 @@ export const PredictionMarkets = React.memo(function PredictionMarkets() {
               </thead>
               <tbody>
                 {signals.map((s) => (
-                  <tr key={s.id} className="border-b border-gray-700/30 hover:bg-white/5 transition-all">
+                  <tr key={s.id} className="border-b border-gray-700/30 hover:bg-panel-raised transition-all">
                     <td className="py-3 px-3 font-mono text-xs text-gray-300">{s.kalshi_ticker}</td>
                     <td className="py-3 px-3 max-w-[200px] text-xs text-white">
                       <span className="line-clamp-2">{s.event_description}</span>

@@ -1,4 +1,3 @@
-import React from 'react';
 
 interface TimeRangeSelectorProps {
   selected: '7d' | '30d' | '90d' | 'all';
@@ -14,7 +13,7 @@ export function TimeRangeSelector({ selected, onChange }: TimeRangeSelectorProps
   ];
 
   return (
-    <div className="inline-flex rounded-lg bg-white/5 p-1 backdrop-blur-sm border border-white/10">
+    <div className="inline-flex rounded-lg bg-panel-raised p-1 backdrop-blur-sm border border-line">
       {options.map((option) => (
         <button
           key={option.value}

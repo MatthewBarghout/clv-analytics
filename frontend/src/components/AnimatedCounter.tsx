@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface AnimatedCounterProps {
   value: number;
@@ -20,7 +20,7 @@ export function AnimatedCounter({
   const [displayValue, setDisplayValue] = useState(0);
   const [isAnimating, setIsAnimating] = useState(false);
   const startTimeRef = useRef<number | null>(null);
-  const animationFrameRef = useRef<number>();
+  const animationFrameRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     setIsAnimating(true);
@@ -55,7 +55,7 @@ export function AnimatedCounter({
   }, [value, duration]);
 
   return (
-    <span className={`${className} ${isAnimating ? 'animate-count-up' : ''}`}>
+    <span className={`tabular ${className} ${isAnimating ? 'animate-count-up' : ''}`}>
       {prefix}
       {displayValue.toFixed(decimals)}
       {suffix}
