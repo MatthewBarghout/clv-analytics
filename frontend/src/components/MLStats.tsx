@@ -40,21 +40,32 @@ interface Props {
 export const MLStats: React.FC<Props> = React.memo(({ mlStats, featureImportance }) => {
   const topFeatures = useMemo(() => featureImportance.slice(0, 7), [featureImportance]);
 
-  if (!mlStats?.is_trained) {
+  // null means the stats request failed or timed out — which is not the same thing
+  // as the model being untrained, and saying so sent people chasing a training bug
+  // that did not exist.
+  if (mlStats === null) {
     return (
-      <GlassCard className="mb-8 border-yellow-500/30 bg-yellow-500/5">
-        <div className="flex items-center gap-4">
-          <div>
-            <h3 className="text-lg font-semibold text-yellow-400 mb-1">ML Model Not Trained</h3>
-            <p className="text-sm text-gray-400">
-              Run{' '}
-              <code className="px-2 py-1 bg-gray-800 rounded text-yellow-400">
-                poetry run python scripts/train_model.py
-              </code>{' '}
-              to train the closing line prediction model.
-            </p>
-          </div>
-        </div>
+      <GlassCard className="mb-8 border-line-strong">
+        <h3 className="text-lg font-semibold text-ink mb-1">Model stats unavailable</h3>
+        <p className="text-sm text-ink-muted">
+          Could not load model metrics. The model itself is unaffected — evaluating it is
+          expensive on a cold cache, so the first request after a retrain can take a while.
+        </p>
+      </GlassCard>
+    );
+  }
+
+  if (!mlStats.is_trained) {
+    return (
+      <GlassCard className="mb-8 border-warn/30 bg-warn/5">
+        <h3 className="text-lg font-semibold text-warn mb-1">ML Model Not Trained</h3>
+        <p className="text-sm text-ink-muted">
+          Run{' '}
+          <code className="px-2 py-1 bg-panel-raised rounded text-warn">
+            poetry run python -m scripts.train_movement_model --walk-forward
+          </code>{' '}
+          to train the per-sport line movement models.
+        </p>
       </GlassCard>
     );
   }

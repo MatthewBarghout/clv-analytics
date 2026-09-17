@@ -45,6 +45,10 @@ MODEL_DIR = "models"
 # Per-sport model cache: sport_key -> LineMovementPredictor
 _models: Dict[str, LineMovementPredictor] = {}
 
+# Computed model metrics, keyed by (sport_key, model file mtime). Evaluating a model
+# costs ~113s, and the result is constant until the model is retrained.
+_stats_cache: Dict[tuple, "MovementModelStats"] = {}
+
 # Minimum confidence for h2h picks — data shows 0.62-0.74 h2h is near-random
 MIN_H2H_CONFIDENCE = 0.75
 
@@ -198,9 +202,17 @@ def get_model_stats(sport_key: Optional[str] = None):
             return MovementModelStats(is_trained=False)
 
         model_file = Path(_model_path(sport_key))
-        last_trained = datetime.fromtimestamp(
-            model_file.stat().st_mtime, tz=timezone.utc
-        ).isoformat()
+        model_mtime = model_file.stat().st_mtime
+        last_trained = datetime.fromtimestamp(model_mtime, tz=timezone.utc).isoformat()
+
+        # These metrics only change when the model is retrained, but computing them
+        # re-runs prepare_training_data over the full dataset plus a train/test split
+        # and two evaluations — ~113s per request. Cache on the model file's mtime so
+        # it is paid once per retrain and invalidates itself automatically.
+        cache_key = (sport_key, model_mtime)
+        cached = _stats_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         # Load training data to compute metrics
         db = get_db()
@@ -209,9 +221,11 @@ def get_model_stats(sport_key: Optional[str] = None):
             df = engineer.prepare_training_data(db, sport_key=sport_key)
 
             if len(df) == 0:
-                return MovementModelStats(
+                empty = MovementModelStats(
                     is_trained=True, last_trained=last_trained, training_records=0
                 )
+                _stats_cache[cache_key] = empty
+                return empty
 
             # Split data
             X_train, X_test, y_reg_train, y_reg_test, y_class_train, y_class_test = (
@@ -228,7 +242,7 @@ def get_model_stats(sport_key: Optional[str] = None):
             baseline_mae = y_reg_test["price_movement"].abs().mean()
             improvement = ((baseline_mae - regression_metrics["ensemble_mae"]) / baseline_mae) * 100
 
-            return MovementModelStats(
+            stats = MovementModelStats(
                 is_trained=True,
                 movement_mae=regression_metrics["ensemble_mae"],
                 movement_rmse=regression_metrics["ensemble_rmse"],
@@ -241,6 +255,8 @@ def get_model_stats(sport_key: Optional[str] = None):
                 baseline_mae=baseline_mae,
                 improvement_vs_baseline=improvement,
             )
+            _stats_cache[cache_key] = stats
+            return stats
 
         finally:
             db.close()

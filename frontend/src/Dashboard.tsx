@@ -182,7 +182,9 @@ export default function Dashboard() {
       ]);
 
       const [mlStatsData, featureImportanceData, arbData] = await Promise.all([
-        fetchJSON<MLModelStats>('/ml/stats').catch(() => null),
+        // Evaluating the model is slow on a cold cache (it is memoised per retrain
+        // server-side), so this one call gets a longer leash than the 30s default.
+        fetchJSON<MLModelStats>('/ml/stats', { timeoutMs: 180_000 }).catch(() => null),
         fetchJSON<FeatureImportance[]>('/ml/feature-importance').catch(() => []),
         fetchJSON<{ total: number }>('/arb-opportunities?min_spread=1.0&limit=5').catch(() => ({
           total: 0,
