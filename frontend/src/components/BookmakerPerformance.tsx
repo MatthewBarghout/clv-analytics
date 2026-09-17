@@ -38,7 +38,7 @@ export const BookmakerPerformance: React.FC<Props> = React.memo(({ bookmakers })
             {sorted.map((bookmaker, index) => (
               <tr
                 key={bookmaker.bookmaker_name}
-                className="border-b border-gray-700/30 hover:bg-white/5 transition-colors duration-200"
+                className="border-b border-gray-700/30 hover:bg-panel-raised transition-colors duration-200"
                 style={{ animationDelay: `${index * 50}ms` }}
               >
                 <td className="py-4 px-4">

@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { fetchJSON } from './api/client';
+import { ErrorState, LoadingState } from './components/States';
 import { AnimatedCounter } from './components/AnimatedCounter';
 import { GameDetailsModal } from './components/GameDetailsModal';
 import { GameAnalysis } from './components/GameAnalysis';
@@ -71,7 +73,6 @@ interface FeatureImportance {
   importance: number;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 type View = 'overview' | 'best-ev' | 'games' | 'reports' | 'bankroll' | 'my-bets' | 'markets' | 'pred-markets';
 type SportFilter = 'all' | 'nba' | 'mlb';
@@ -114,7 +115,7 @@ interface StatCardProps {
 
 function StatCard({ label, value, suffix, decimals, color, sub }: StatCardProps) {
   return (
-    <div className="bg-white/5 rounded-lg p-4 border border-white/8">
+    <div className="bg-panel-raised rounded-lg p-4 border border-line">
       <div className="text-gray-500 text-xs font-medium uppercase tracking-wider mb-1.5">{label}</div>
       <AnimatedCounter value={value} suffix={suffix} decimals={decimals} className={`text-2xl font-bold ${color}`} />
       {sub && <div className="text-xs text-gray-600 mt-1">{sub}</div>}
@@ -172,29 +173,21 @@ export default function Dashboard() {
   const fetchOverviewData = useCallback(async () => {
     try {
       setLoading(true);
-      const [statsRes, bookmakersRes, historyRes, mlStatsRes, featureImportanceRes, arbRes] =
-        await Promise.all([
-          fetch(`${API_BASE}/stats`),
-          fetch(`${API_BASE}/bookmakers`),
-          fetch(`${API_BASE}/clv-history?time_range=${timeRange}`),
-          fetch(`${API_BASE}/ml/stats`),
-          fetch(`${API_BASE}/ml/feature-importance`),
-          fetch(`${API_BASE}/arb-opportunities?min_spread=1.0&limit=5`),
-        ]);
+      // The first three are required; the ML and arb panels degrade to empty rather
+      // than failing the whole overview.
+      const [statsData, bookmakersData, historyData] = await Promise.all([
+        fetchJSON<CLVStats>('/stats'),
+        fetchJSON<BookmakerStats[]>('/bookmakers'),
+        fetchJSON<CLVHistoryPoint[]>(`/clv-history?time_range=${timeRange}`),
+      ]);
 
-      if (!statsRes.ok || !bookmakersRes.ok || !historyRes.ok) {
-        throw new Error('Failed to fetch data');
-      }
-
-      const [statsData, bookmakersData, historyData, mlStatsData, featureImportanceData, arbData] =
-        await Promise.all([
-          statsRes.json(),
-          bookmakersRes.json(),
-          historyRes.json(),
-          mlStatsRes.ok ? mlStatsRes.json() : null,
-          featureImportanceRes.ok ? featureImportanceRes.json() : [],
-          arbRes.ok ? arbRes.json() : { total: 0 },
-        ]);
+      const [mlStatsData, featureImportanceData, arbData] = await Promise.all([
+        fetchJSON<MLModelStats>('/ml/stats').catch(() => null),
+        fetchJSON<FeatureImportance[]>('/ml/feature-importance').catch(() => []),
+        fetchJSON<{ total: number }>('/arb-opportunities?min_spread=1.0&limit=5').catch(() => ({
+          total: 0,
+        })),
+      ]);
 
       setStats(statsData);
       setBookmakers(bookmakersData);
@@ -212,9 +205,7 @@ export default function Dashboard() {
 
   const fetchGamesData = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/games?limit=100`);
-      if (!res.ok) throw new Error('Failed to fetch games');
-      setGames(await res.json());
+      setGames(await fetchJSON<GameWithCLV[]>('/games?limit=100'));
     } catch {
       // Non-fatal — games tab will show empty state
     }
@@ -262,34 +253,17 @@ export default function Dashboard() {
   const handleCloseModal = useCallback(() => setSelectedGame(null), []);
 
   if (loading) {
-    return (
-      <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-blue-500 mx-auto mb-4"></div>
-          <div className="text-gray-400">Loading analytics...</div>
-        </div>
-      </div>
-    );
+    return <LoadingState message="Loading analytics..." fullScreen />;
   }
 
   if (error) {
-    return (
-      <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
-        <div className="text-center max-w-sm">
-          <div className="text-red-400 text-lg mb-3">Failed to load</div>
-          <div className="text-gray-500 text-sm mb-4">{error}</div>
-          <button onClick={fetchData} className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg border border-red-500/30 text-sm transition-all">
-            Retry
-          </button>
-        </div>
-      </div>
-    );
+    return <ErrorState message={error} onRetry={fetchData} fullScreen />;
   }
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
       {/* ── Header ─────────────────────────────────────────────────────── */}
-      <header className="border-b border-white/8 bg-gray-950 sticky top-0 z-50">
+      <header className="border-b border-line bg-gray-950 sticky top-0 z-50">
         <div className="max-w-screen-2xl mx-auto px-6 flex items-center justify-between">
           <div className="flex items-center gap-6 overflow-x-auto">
             <h1 className="text-sm font-semibold text-white tracking-tight py-3 shrink-0">CLV Analytics</h1>
@@ -380,7 +354,7 @@ export default function Dashboard() {
 
         {/* BEST EV+ ──────────────────────────────────────────────────────── */}
         {view === 'best-ev' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <BestEVOpportunities startingBankroll={10000} />
           </div>
         )}
@@ -390,7 +364,7 @@ export default function Dashboard() {
           <div className="space-y-4">
             {/* Controls row */}
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1 border-b border-white/10">
+              <div className="flex items-center gap-1 border-b border-line">
                 {(['recent', 'history'] as GamesTab[]).map((t) => (
                   <button
                     key={t}
@@ -407,7 +381,7 @@ export default function Dashboard() {
               </div>
 
               {/* Sport filter */}
-              <div className="flex items-center gap-1 rounded-md bg-white/5 border border-white/10 p-0.5 text-xs font-medium">
+              <div className="flex items-center gap-1 rounded-md bg-panel-raised border border-line p-0.5 text-xs font-medium">
                 {(['all', 'nba', 'mlb'] as SportFilter[]).map((s) => (
                   <button
                     key={s}
@@ -440,35 +414,35 @@ export default function Dashboard() {
 
         {/* REPORTS ───────────────────────────────────────────────────────── */}
         {view === 'reports' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <DailyReports />
           </div>
         )}
 
         {/* BANKROLL ──────────────────────────────────────────────────────── */}
         {view === 'bankroll' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <BankrollSimulator />
           </div>
         )}
 
         {/* MY BETS ───────────────────────────────────────────────────────── */}
         {view === 'my-bets' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <MyBets />
           </div>
         )}
 
         {/* MARKETS ───────────────────────────────────────────────────────── */}
         {view === 'markets' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <ArbOpportunities />
           </div>
         )}
 
         {/* PRED MARKETS ──────────────────────────────────────────────────── */}
         {view === 'pred-markets' && (
-          <div className="bg-white/4 rounded-xl border border-white/8 p-5">
+          <div className="bg-panel-raised rounded-xl border border-line p-5">
             <PredictionMarkets />
           </div>
         )}
@@ -506,17 +480,17 @@ const GamesTable = React.memo(function GamesTable({
 }: GamesTableProps) {
   if (games.length === 0) {
     return (
-      <div className="bg-white/4 rounded-2xl border border-white/10 p-12 text-center">
+      <div className="bg-panel-raised rounded-2xl border border-line p-12 text-center">
         <p className="text-gray-400">No games to show.</p>
       </div>
     );
   }
 
   return (
-    <div className="bg-white/4 rounded-xl border border-white/8 overflow-hidden">
+    <div className="bg-panel-raised rounded-xl border border-line overflow-hidden">
       <table className="w-full text-sm">
         <thead>
-          <tr className="border-b border-white/8">
+          <tr className="border-b border-line">
             <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Sport</th>
             <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Game</th>
             <th className="text-left py-2.5 px-4 text-gray-500 font-medium uppercase text-xs tracking-wider">Time</th>
@@ -531,7 +505,7 @@ const GamesTable = React.memo(function GamesTable({
             <React.Fragment key={game.game_id}>
               <tr
                 onClick={() => mode === 'history' ? onToggleExpand(game.game_id) : onGameClick(game)}
-                className="border-b border-white/5 hover:bg-white/3 transition-colors cursor-pointer"
+                className="border-b border-line hover:bg-panel-raised transition-colors cursor-pointer"
               >
                 <td className="py-2.5 px-4">
                   <SportBadge sportKey={game.sport_key} />

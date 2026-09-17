@@ -28,6 +28,65 @@ def get_direction_threshold(market_type: str) -> float:
     return DIRECTION_THRESHOLDS.get(market_type, 0.01)
 
 
+class SnapshotIndex:
+    """Pre-fetched OddsSnapshot rows for a set of games, indexed for feature lookup.
+
+    Each per-outcome feature helper below issues its own query. At ~450 outcomes per
+    prediction request that is thousands of round trips, which is what made
+    /api/ml/best-opportunities take ~25s. Fetching every snapshot for the games once
+    and serving the same filtered, identically-ordered views from memory removes the
+    round trips without changing a single computed value.
+    """
+
+    def __init__(self, snapshots: List[OddsSnapshot]):
+        self._by_game_market: Dict[tuple, List[OddsSnapshot]] = {}
+        self._by_game_book_market: Dict[tuple, List[OddsSnapshot]] = {}
+        for s in snapshots:
+            self._by_game_market.setdefault((s.game_id, s.market_type), []).append(s)
+            self._by_game_book_market.setdefault(
+                (s.game_id, s.bookmaker_id, s.market_type), []
+            ).append(s)
+
+    @classmethod
+    def for_games(cls, session: Session, game_ids) -> "SnapshotIndex":
+        ids = list(game_ids)
+        if not ids:
+            return cls([])
+        rows = session.execute(
+            select(OddsSnapshot).where(OddsSnapshot.game_id.in_(ids))
+        ).scalars().all()
+        return cls(rows)
+
+    def game_market(self, game_id: int, market_type: str) -> List[OddsSnapshot]:
+        """All snapshots for a game/market. Unordered, matching the unordered query."""
+        return self._by_game_market.get((game_id, market_type), [])
+
+    def prior(
+        self, game_id: int, bookmaker_id: int, market_type: str, before: datetime
+    ) -> List[OddsSnapshot]:
+        """Snapshots strictly before `before`, ascending — matches the temporal query."""
+        rows = [
+            s
+            for s in self._by_game_book_market.get((game_id, bookmaker_id, market_type), [])
+            if s.timestamp < before
+        ]
+        rows.sort(key=lambda s: s.timestamp)
+        return rows
+
+    def by_book_latest_first(self, game_id: int, market_type: str) -> List[OddsSnapshot]:
+        """Ordered by bookmaker_id asc, timestamp desc — matches the books-moved query."""
+        rows = list(self.game_market(game_id, market_type))
+        rows.sort(key=lambda s: (s.bookmaker_id, -s.timestamp.timestamp()))
+        return rows
+
+    def latest_for_book(
+        self, game_id: int, bookmaker_id: int, market_type: str
+    ) -> Optional[OddsSnapshot]:
+        """Most recent snapshot for one book — matches the Pinnacle lookup."""
+        rows = self._by_game_book_market.get((game_id, bookmaker_id, market_type), [])
+        return max(rows, key=lambda s: s.timestamp) if rows else None
+
+
 class FeatureEngineer:
     """Handles feature extraction and data preparation for line movement prediction."""
 
@@ -66,6 +125,7 @@ class FeatureEngineer:
         market_type: str,
         outcome_name: str,
         current_timestamp: datetime,
+        index: Optional["SnapshotIndex"] = None,
     ) -> Dict[str, float]:
         """
         Calculate temporal features based on historical snapshots.
@@ -80,16 +140,21 @@ class FeatureEngineer:
             - movement_direction_changes: Number of direction reversals
         """
         try:
-            # Get all prior snapshots for this outcome
-            stmt = (
-                select(OddsSnapshot)
-                .where(OddsSnapshot.game_id == game_id)
-                .where(OddsSnapshot.bookmaker_id == bookmaker_id)
-                .where(OddsSnapshot.market_type == market_type)
-                .where(OddsSnapshot.timestamp < current_timestamp)
-                .order_by(OddsSnapshot.timestamp.asc())
-            )
-            prior_snapshots = session.execute(stmt).scalars().all()
+            if index is not None:
+                prior_snapshots = index.prior(
+                    game_id, bookmaker_id, market_type, current_timestamp
+                )
+            else:
+                # Get all prior snapshots for this outcome
+                stmt = (
+                    select(OddsSnapshot)
+                    .where(OddsSnapshot.game_id == game_id)
+                    .where(OddsSnapshot.bookmaker_id == bookmaker_id)
+                    .where(OddsSnapshot.market_type == market_type)
+                    .where(OddsSnapshot.timestamp < current_timestamp)
+                    .order_by(OddsSnapshot.timestamp.asc())
+                )
+                prior_snapshots = session.execute(stmt).scalars().all()
 
             if not prior_snapshots:
                 return {
@@ -181,6 +246,7 @@ class FeatureEngineer:
         market_type: str,
         outcome_name: str,
         current_price: float,
+        index: Optional["SnapshotIndex"] = None,
     ) -> Dict[str, float]:
         """
         Calculate bookmaker-specific features.
@@ -200,15 +266,20 @@ class FeatureEngineer:
             relative_to_pinnacle = 0.0
 
             if pinnacle_id and pinnacle_id != bookmaker_id:
-                stmt = (
-                    select(OddsSnapshot)
-                    .where(OddsSnapshot.game_id == game_id)
-                    .where(OddsSnapshot.bookmaker_id == pinnacle_id)
-                    .where(OddsSnapshot.market_type == market_type)
-                    .order_by(OddsSnapshot.timestamp.desc())
-                    .limit(1)
-                )
-                pinnacle_snapshot = session.execute(stmt).scalar_one_or_none()
+                if index is not None:
+                    pinnacle_snapshot = index.latest_for_book(
+                        game_id, pinnacle_id, market_type
+                    )
+                else:
+                    stmt = (
+                        select(OddsSnapshot)
+                        .where(OddsSnapshot.game_id == game_id)
+                        .where(OddsSnapshot.bookmaker_id == pinnacle_id)
+                        .where(OddsSnapshot.market_type == market_type)
+                        .order_by(OddsSnapshot.timestamp.desc())
+                        .limit(1)
+                    )
+                    pinnacle_snapshot = session.execute(stmt).scalar_one_or_none()
 
                 if pinnacle_snapshot:
                     for outcome in pinnacle_snapshot.outcomes:
@@ -219,13 +290,16 @@ class FeatureEngineer:
                             break
 
             # Count books that have moved - get latest snapshot from each bookmaker
-            stmt = (
-                select(OddsSnapshot)
-                .where(OddsSnapshot.game_id == game_id)
-                .where(OddsSnapshot.market_type == market_type)
-                .order_by(OddsSnapshot.bookmaker_id, OddsSnapshot.timestamp.desc())
-            )
-            all_snapshots = session.execute(stmt).scalars().all()
+            if index is not None:
+                all_snapshots = index.by_book_latest_first(game_id, market_type)
+            else:
+                stmt = (
+                    select(OddsSnapshot)
+                    .where(OddsSnapshot.game_id == game_id)
+                    .where(OddsSnapshot.market_type == market_type)
+                    .order_by(OddsSnapshot.bookmaker_id, OddsSnapshot.timestamp.desc())
+                )
+                all_snapshots = session.execute(stmt).scalars().all()
 
             # Group by bookmaker and track latest prices
             latest_by_book = {}
@@ -276,7 +350,12 @@ class FeatureEngineer:
             }
 
     def calculate_consensus_line(
-        self, session: Session, game_id: int, market_type: str, outcome_name: str
+        self,
+        session: Session,
+        game_id: int,
+        market_type: str,
+        outcome_name: str,
+        index: Optional["SnapshotIndex"] = None,
     ) -> Optional[float]:
         """
         Calculate consensus (average) opening line across all bookmakers.
@@ -291,13 +370,16 @@ class FeatureEngineer:
             Average opening price across bookmakers, or None if insufficient data
         """
         try:
-            # Query all opening snapshots for this game/market
-            stmt = (
-                select(OddsSnapshot)
-                .where(OddsSnapshot.game_id == game_id)
-                .where(OddsSnapshot.market_type == market_type)
-            )
-            snapshots = session.execute(stmt).scalars().all()
+            if index is not None:
+                snapshots = index.game_market(game_id, market_type)
+            else:
+                # Query all opening snapshots for this game/market
+                stmt = (
+                    select(OddsSnapshot)
+                    .where(OddsSnapshot.game_id == game_id)
+                    .where(OddsSnapshot.market_type == market_type)
+                )
+                snapshots = session.execute(stmt).scalars().all()
 
             if len(snapshots) < 2:
                 return None  # Need at least 2 bookmakers for consensus
@@ -322,7 +404,12 @@ class FeatureEngineer:
             return None
 
     def calculate_line_spread(
-        self, session: Session, game_id: int, market_type: str, outcome_name: str
+        self,
+        session: Session,
+        game_id: int,
+        market_type: str,
+        outcome_name: str,
+        index: Optional["SnapshotIndex"] = None,
     ) -> Optional[float]:
         """
         Calculate line spread (max - min) across all bookmakers.
@@ -339,13 +426,16 @@ class FeatureEngineer:
             Price spread (max - min), or None if insufficient data
         """
         try:
-            # Query all opening snapshots
-            stmt = (
-                select(OddsSnapshot)
-                .where(OddsSnapshot.game_id == game_id)
-                .where(OddsSnapshot.market_type == market_type)
-            )
-            snapshots = session.execute(stmt).scalars().all()
+            if index is not None:
+                snapshots = index.game_market(game_id, market_type)
+            else:
+                # Query all opening snapshots
+                stmt = (
+                    select(OddsSnapshot)
+                    .where(OddsSnapshot.game_id == game_id)
+                    .where(OddsSnapshot.market_type == market_type)
+                )
+                snapshots = session.execute(stmt).scalars().all()
 
             if len(snapshots) < 2:
                 return None

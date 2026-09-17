@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NBA Odds Collection Runner
+# Odds Collection Runner (multi-sport)
 # Wraps the Python collection script with logging
 
 set -e
@@ -21,7 +21,7 @@ LOG_FILE="$LOGS_DIR/collection_$TIMESTAMP.log"
 cd "$PROJECT_DIR"
 
 # Run collection with all arguments passed to this script
-echo "Starting NBA odds collection at $(date)" | tee -a "$LOG_FILE"
+echo "Starting odds collection at $(date)" | tee -a "$LOG_FILE"
 echo "Log file: $LOG_FILE" | tee -a "$LOG_FILE"
 echo "Arguments: $@" | tee -a "$LOG_FILE"
 echo "----------------------------------------" | tee -a "$LOG_FILE"
@@ -39,5 +39,9 @@ EXIT_CODE=${PIPESTATUS[0]}
 
 echo "----------------------------------------" | tee -a "$LOG_FILE"
 echo "Collection finished at $(date) with exit code $EXIT_CODE" | tee -a "$LOG_FILE"
+
+# Prune per-run collection logs older than 30 days. Runs here rather than as its own
+# scheduled job — collection fires many times a day, so the dir self-maintains.
+find "$LOGS_DIR" -name 'collection_*.log' -type f -mtime +30 -delete 2>/dev/null || true
 
 exit $EXIT_CODE

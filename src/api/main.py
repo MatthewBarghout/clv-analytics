@@ -1,6 +1,8 @@
 """FastAPI backend for CLV analytics dashboard."""
 import logging
 import os
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import statistics
 import time
 from datetime import datetime, timedelta, timezone
@@ -37,8 +39,21 @@ from src.models.database import BestEVPick, BettingOutcome, Bookmaker, ClosingLi
 # Load environment variables
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging — file handler lives in the project's logs/ dir, not /tmp, which
+# macOS purges out from under a long-running process.
+_LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            _LOG_DIR / "api.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        ),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
@@ -97,13 +112,13 @@ def _cache_set(key: str, value) -> None:
 
 
 @app.get("/api/health", response_model=HealthResponse)
-async def health_check():
+def health_check():
     """Health check endpoint."""
     return HealthResponse(status="healthy", timestamp=datetime.now(timezone.utc))
 
 
 @app.get("/api/stats", response_model=CLVStats)
-async def get_clv_stats():
+def get_clv_stats():
     """Get overall CLV statistics."""
     cached = _cache_get("clv_stats", ttl_seconds=300)
     if cached is not None:
@@ -196,7 +211,7 @@ async def get_clv_stats():
 
 
 @app.get("/api/games", response_model=List[GameWithCLV])
-async def get_games(limit: int = 50):
+def get_games(limit: int = 50):
     """Get list of games with CLV data."""
     db = get_db()
     calc = CLVCalculator()
@@ -318,7 +333,7 @@ async def get_games(limit: int = 50):
 
 
 @app.get("/api/clv-history", response_model=List[CLVHistoryPoint])
-async def get_clv_history(time_range: str = "30d"):
+def get_clv_history(time_range: str = "30d"):
     """Get CLV trend over time.
 
     Args:
@@ -410,7 +425,7 @@ async def get_clv_history(time_range: str = "30d"):
 
 
 @app.get("/api/bookmakers", response_model=List[BookmakerStats])
-async def get_bookmaker_stats():
+def get_bookmaker_stats():
     """Get statistics by bookmaker."""
     cached = _cache_get("bookmaker_stats", ttl_seconds=600)
     if cached is not None:
@@ -471,7 +486,7 @@ async def get_bookmaker_stats():
 
 
 @app.get("/api/games/{game_id}/snapshots", response_model=List[OddsSnapshotResponse])
-async def get_game_snapshots(game_id: int):
+def get_game_snapshots(game_id: int):
     """Get all odds snapshots for a specific game."""
     db = get_db()
 
@@ -508,7 +523,7 @@ async def get_game_snapshots(game_id: int):
 
 
 @app.get("/api/games/{game_id}/closing-lines", response_model=List[ClosingLineResponse])
-async def get_game_closing_lines(game_id: int):
+def get_game_closing_lines(game_id: int):
     """Get all closing lines for a specific game."""
     db = get_db()
 
@@ -543,7 +558,7 @@ async def get_game_closing_lines(game_id: int):
 
 
 @app.get("/api/games/{game_id}/analysis")
-async def get_game_analysis(game_id: int):
+def get_game_analysis(game_id: int):
     """Get detailed CLV analysis for a completed game."""
     db = get_db()
     calc = CLVCalculator()
@@ -652,7 +667,7 @@ async def get_game_analysis(game_id: int):
 
 
 @app.get("/api/daily-reports", response_model=List[DailyCLVReportResponse])
-async def get_daily_reports(limit: int = 30):
+def get_daily_reports(limit: int = 30):
     """Get daily CLV reports, most recent first."""
     db = get_db()
 
@@ -674,7 +689,7 @@ async def get_daily_reports(limit: int = 30):
 
 
 @app.get("/api/daily-reports/{report_date}", response_model=DailyCLVReportResponse)
-async def get_daily_report(report_date: str):
+def get_daily_report(report_date: str):
     """Get daily CLV report for a specific date (YYYY-MM-DD)."""
     db = get_db()
 
@@ -703,7 +718,7 @@ async def get_daily_report(report_date: str):
 
 
 @app.get("/api/daily-reports/{report_id}/opportunities")
-async def get_report_opportunities(report_id: int):
+def get_report_opportunities(report_id: int):
     """Get tracked opportunities with their results for a specific daily report."""
     db = get_db()
 
@@ -784,7 +799,7 @@ async def get_report_opportunities(report_id: int):
 
 
 @app.get("/api/bankroll-simulation")
-async def get_bankroll_simulation(
+def get_bankroll_simulation(
     bet_size: float = 100.0,
     starting_bankroll: float = 10000.0,
     strategy: str = "fixed",
@@ -1114,7 +1129,7 @@ async def get_bankroll_simulation(
 
 
 @app.get("/api/bankroll-simulation/breakdown")
-async def get_bankroll_breakdown(
+def get_bankroll_breakdown(
     group_by: str = "bookmaker",
     clv_bucket_size: float = 1.0,
 ):
@@ -1224,7 +1239,7 @@ async def get_bankroll_breakdown(
 
 
 @app.get("/api/games/{game_id}/score")
-async def get_game_score(game_id: int):
+def get_game_score(game_id: int):
     """Get the final score for a completed game."""
     db = get_db()
 
@@ -1329,7 +1344,7 @@ async def get_game_score(game_id: int):
 # ============================================================================
 
 @app.get("/api/user-bets")
-async def get_user_bets(status: str = None):
+def get_user_bets(status: str = None):
     """Get all user bets, optionally filtered by status."""
     db = get_db()
 
@@ -1370,7 +1385,7 @@ async def get_user_bets(status: str = None):
 
 
 @app.post("/api/user-bets")
-async def create_user_bet(
+def create_user_bet(
     game_description: str,
     game_date: str,
     bookmaker: str,
@@ -1423,7 +1438,7 @@ async def create_user_bet(
 
 
 @app.put("/api/user-bets/{bet_id}")
-async def update_user_bet(
+def update_user_bet(
     bet_id: int,
     result: str = None,
     closing_odds: int = None,
@@ -1501,7 +1516,7 @@ async def update_user_bet(
 
 
 @app.delete("/api/user-bets/{bet_id}")
-async def delete_user_bet(bet_id: int):
+def delete_user_bet(bet_id: int):
     """Delete a user bet."""
     db = get_db()
 
@@ -1526,7 +1541,7 @@ async def delete_user_bet(bet_id: int):
 
 
 @app.get("/api/user-bets/summary")
-async def get_user_bets_summary():
+def get_user_bets_summary():
     """Get summary stats for user bets."""
     db = get_db()
 
@@ -1580,7 +1595,7 @@ async def get_user_bets_summary():
 
 
 @app.get("/api/arb-opportunities")
-async def get_arb_opportunities(
+def get_arb_opportunities(
     min_spread: float = 0.0,
     source: str = None,
     limit: int = 100,
@@ -1637,7 +1652,7 @@ async def get_arb_opportunities(
 
 
 @app.get("/api/arb-history")
-async def get_arb_history(
+def get_arb_history(
     days: int = 7,
     source: str = None,
     min_spread: float = 1.0,
@@ -1691,7 +1706,7 @@ async def get_arb_history(
 
 
 @app.post("/api/arb/refresh")
-async def refresh_arb_opportunities():
+def refresh_arb_opportunities():
     """
     Manually trigger a fresh poll of Kalshi and Polymarket for arb opportunities.
 
@@ -1806,7 +1821,7 @@ def _run_arb_poll():
 
 
 @app.get("/api/paper-trades")
-async def get_paper_trades(
+def get_paper_trades(
     is_open: bool = None,
     strategy_tag: str = None,
     limit: int = 50,
@@ -1847,12 +1862,18 @@ async def get_paper_trades(
 
 
 @app.get("/api/paper-trades/stats")
-async def get_paper_trade_stats():
+def get_paper_trade_stats():
     """Aggregate stats for all paper trades."""
     db = get_db()
     try:
         all_trades = db.execute(select(PaperTrade)).scalars().all()
-        settled = [t for t in all_trades if not t.is_open and t.resolution_result]
+        # VOID trades were opened on signals the system has since learned to reject.
+        # They carry no P&L and must not count as losses against the win rate.
+        voided = [t for t in all_trades if t.resolution_result == "VOID"]
+        settled = [
+            t for t in all_trades
+            if not t.is_open and t.resolution_result and t.resolution_result != "VOID"
+        ]
         wins = [t for t in settled if t.resolution_result == "WIN"]
         total_pnl = sum(float(t.pnl) for t in settled if t.pnl is not None)
         win_rate = len(wins) / len(settled) * 100 if settled else 0.0
@@ -1883,6 +1904,7 @@ async def get_paper_trade_stats():
         return {
             "total_trades": len(all_trades),
             "open_trades": sum(1 for t in all_trades if t.is_open),
+            "voided_trades": len(voided),
             "win_rate": round(win_rate, 1),
             "total_pnl": round(total_pnl, 2),
             "avg_pnl": round(avg_pnl, 2),
@@ -1897,7 +1919,7 @@ async def get_paper_trade_stats():
 
 
 @app.get("/api/cross-platform-signals")
-async def get_cross_platform_signals(
+def get_cross_platform_signals(
     limit: int = 20,
     min_divergence: float = 0.05,
 ):

@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { GlassCard } from './GlassCard';
+import { fetchJSON } from '../api/client';
 
 interface GameAnalysisProps {
   gameId: number;
@@ -36,7 +37,6 @@ interface AnalysisData {
   positive_clv_percentage: number;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 export function GameAnalysis({ gameId }: GameAnalysisProps) {
   const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
@@ -49,11 +49,7 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
   const fetchAnalysis = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/games/${gameId}/analysis`);
-      if (res.ok) {
-        const data = await res.json();
-        setAnalysis(data);
-      }
+      setAnalysis(await fetchJSON<AnalysisData>(`/games/${gameId}/analysis`));
     } catch (err) {
       console.error('Error fetching analysis:', err);
     } finally {
@@ -90,19 +86,19 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
     <div className="space-y-6">
       {/* Summary */}
       <div>
-        <h3 className="text-xl font-bold text-white mb-4">📊 Game Analysis Summary</h3>
+        <h3 className="text-xl font-bold text-white mb-4">Game Analysis Summary</h3>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <GlassCard className="p-4">
             <div className="text-sm text-gray-400 mb-1">Total Opportunities</div>
             <div className="text-2xl font-bold text-blue-400">{analysis.total_opportunities}</div>
           </GlassCard>
-          <GlassCard className="p-4" gradient={analysis.avg_clv > 0 ? 'green' : 'red'}>
+          <GlassCard className="p-4" gradient={analysis.avg_clv > 0 ? 'pos' : 'neg'}>
             <div className="text-sm text-gray-400 mb-1">Average CLV</div>
             <div className={`text-2xl font-bold ${analysis.avg_clv > 0 ? 'text-green-400' : 'text-red-400'}`}>
               {analysis.avg_clv > 0 ? '+' : ''}{analysis.avg_clv.toFixed(2)}%
             </div>
           </GlassCard>
-          <GlassCard className="p-4" gradient="green">
+          <GlassCard className="p-4" gradient="pos">
             <div className="text-sm text-gray-400 mb-1">Positive CLV</div>
             <div className="text-2xl font-bold text-green-400">{analysis.positive_clv_count}</div>
           </GlassCard>
@@ -118,10 +114,10 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
       {/* Best Opportunities */}
       {analysis.best_opportunities.length > 0 && (
         <div>
-          <h3 className="text-xl font-bold text-white mb-4">🎯 Top 5 Best Opportunities</h3>
+          <h3 className="text-xl font-bold text-white mb-4">Top 5 Best Opportunities</h3>
           <div className="space-y-2">
             {analysis.best_opportunities.map((opp, idx) => (
-              <GlassCard key={idx} className="p-4" gradient={idx === 0 ? 'green' : undefined}>
+              <GlassCard key={idx} className="p-4" gradient={idx === 0 ? 'pos' : undefined}>
                 <div className="flex items-center justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
@@ -153,10 +149,10 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
       {/* Breakdown by Market Type */}
       {Object.keys(analysis.by_market).length > 0 && (
         <div>
-          <h3 className="text-xl font-bold text-white mb-4">📈 CLV by Market Type</h3>
+          <h3 className="text-xl font-bold text-white mb-4">CLV by Market Type</h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {Object.entries(analysis.by_market).map(([market, stats]) => (
-              <GlassCard key={market} className="p-4" gradient={stats.avg_clv > 0 ? 'green' : 'red'}>
+              <GlassCard key={market} className="p-4" gradient={stats.avg_clv > 0 ? 'pos' : 'neg'}>
                 <div className="text-sm text-gray-400 mb-2">{getMarketTypeName(market)}</div>
                 <div className={`text-2xl font-bold mb-1 ${stats.avg_clv > 0 ? 'text-green-400' : 'text-red-400'}`}>
                   {stats.avg_clv > 0 ? '+' : ''}{stats.avg_clv.toFixed(2)}%
@@ -171,7 +167,7 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
       {/* Breakdown by Bookmaker */}
       {Object.keys(analysis.by_bookmaker).length > 0 && (
         <div>
-          <h3 className="text-xl font-bold text-white mb-4">🏪 CLV by Bookmaker</h3>
+          <h3 className="text-xl font-bold text-white mb-4">CLV by Bookmaker</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {Object.entries(analysis.by_bookmaker)
               .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)
@@ -194,27 +190,27 @@ export function GameAnalysis({ gameId }: GameAnalysisProps) {
 
       {/* What We Learned */}
       <div>
-        <h3 className="text-xl font-bold text-white mb-4">💡 Key Insights</h3>
-        <GlassCard className="p-4" gradient="blue">
+        <h3 className="text-xl font-bold text-white mb-4">Key Insights</h3>
+        <GlassCard className="p-4" gradient="info">
           <ul className="space-y-2 text-sm text-gray-300">
             {analysis.avg_clv > 0 ? (
-              <li>✅ This game offered positive CLV opportunities on average ({analysis.avg_clv.toFixed(2)}%)</li>
+              <li className="text-pos">This game offered positive CLV opportunities on average ({analysis.avg_clv.toFixed(2)}%)</li>
             ) : (
-              <li>❌ This game had negative CLV on average ({analysis.avg_clv.toFixed(2)}%)</li>
+              <li className="text-neg">This game had negative CLV on average ({analysis.avg_clv.toFixed(2)}%)</li>
             )}
             <li>
-              📊 {analysis.positive_clv_percentage.toFixed(1)}% of opportunities had positive CLV
+              {analysis.positive_clv_percentage.toFixed(1)}% of opportunities had positive CLV
               ({analysis.positive_clv_count} out of {analysis.total_opportunities})
             </li>
             {analysis.best_opportunities.length > 0 && (
               <li>
-                🎯 Best opportunity was {analysis.best_opportunities[0].outcome} on {getMarketTypeName(analysis.best_opportunities[0].market_type)}
+                Best opportunity was {analysis.best_opportunities[0].outcome} on {getMarketTypeName(analysis.best_opportunities[0].market_type)}
                 {' '}at {analysis.best_opportunities[0].bookmaker} with {analysis.best_opportunities[0].clv.toFixed(2)}% CLV
               </li>
             )}
             {Object.keys(analysis.by_market).length > 0 && (
               <li>
-                🏆 Best market type: {Object.entries(analysis.by_market)
+                Best market type: {Object.entries(analysis.by_market)
                   .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0][0]
                   .toUpperCase()} with {Object.entries(analysis.by_market)
                   .sort(([, a], [, b]) => b.avg_clv - a.avg_clv)[0][1].avg_clv.toFixed(2)}% avg CLV

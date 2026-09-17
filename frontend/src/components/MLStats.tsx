@@ -10,6 +10,7 @@ import {
 } from 'recharts';
 import { GlassCard } from './GlassCard';
 import { AnimatedCounter } from './AnimatedCounter';
+import { CHART_COLORS, axisProps, gridProps, tooltipStyle } from '../charts/theme';
 
 interface MLModelStats {
   is_trained: boolean;
@@ -35,12 +36,6 @@ interface Props {
   featureImportance: FeatureImportance[];
 }
 
-const tooltipStyle = {
-  backgroundColor: '#1F2937',
-  border: '1px solid #374151',
-  borderRadius: '8px',
-  backdropFilter: 'blur(10px)',
-};
 
 export const MLStats: React.FC<Props> = React.memo(({ mlStats, featureImportance }) => {
   const topFeatures = useMemo(() => featureImportance.slice(0, 7), [featureImportance]);
@@ -49,7 +44,6 @@ export const MLStats: React.FC<Props> = React.memo(({ mlStats, featureImportance
     return (
       <GlassCard className="mb-8 border-yellow-500/30 bg-yellow-500/5">
         <div className="flex items-center gap-4">
-          <div className="text-4xl">⚠️</div>
           <div>
             <h3 className="text-lg font-semibold text-yellow-400 mb-1">ML Model Not Trained</h3>
             <p className="text-sm text-gray-400">
@@ -72,27 +66,27 @@ export const MLStats: React.FC<Props> = React.memo(({ mlStats, featureImportance
       </h2>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">Movement MAE</h3>
           <AnimatedCounter value={mlStats.movement_mae || 0} decimals={4} className="text-2xl font-bold text-purple-400" />
           <p className="text-xs text-gray-500 mt-1">Avg prediction error</p>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">Directional Accuracy</h3>
           <AnimatedCounter value={(mlStats.directional_accuracy || 0) * 100} decimals={1} suffix="%" className="text-2xl font-bold text-green-400" />
           <p className="text-xs text-gray-500 mt-1">Correct direction</p>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">Improvement</h3>
           <AnimatedCounter value={mlStats.improvement_vs_baseline || 0} decimals={1} suffix="%" className="text-2xl font-bold text-blue-400" />
           <p className="text-xs text-gray-500 mt-1">vs baseline</p>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">Precision</h3>
           <AnimatedCounter value={(mlStats.directional_precision || 0) * 100} decimals={1} suffix="%" className="text-2xl font-bold text-cyan-400" />
           <p className="text-xs text-gray-500 mt-1">Direction precision</p>
         </div>
-        <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+        <div className="bg-panel-raised rounded-lg p-4 border border-line">
           <h3 className="text-gray-400 text-xs font-medium mb-1 uppercase tracking-wider">Training Records</h3>
           <AnimatedCounter value={mlStats.training_records || 0} className="text-2xl font-bold text-orange-400" />
           <p className="text-xs text-gray-500 mt-1">Data points</p>
@@ -104,13 +98,13 @@ export const MLStats: React.FC<Props> = React.memo(({ mlStats, featureImportance
           <h3 className="text-lg font-semibold mb-4 text-gray-300">Feature Importance</h3>
           <ResponsiveContainer width="100%" height={300}>
             <BarChart data={topFeatures} layout="vertical" margin={{ top: 5, right: 30, left: 100, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
-              <XAxis type="number" stroke="#9CA3AF" tick={{ fill: '#9CA3AF' }} />
-              <YAxis type="category" dataKey="feature_name" stroke="#9CA3AF" tick={{ fill: '#9CA3AF' }} />
+              <CartesianGrid {...gridProps} />
+              <XAxis type="number" {...axisProps} />
+              <YAxis type="category" dataKey="feature_name" {...axisProps} />
               <Tooltip
                 contentStyle={tooltipStyle}
                 labelStyle={{ color: '#F3F4F6' }}
-                itemStyle={{ color: '#9CA3AF' }}
+                itemStyle={{ color: CHART_COLORS.tick }}
                 formatter={(value: number | undefined) => [
                   (value ? (value * 100).toFixed(2) : '0') + '%',
                   'Importance',

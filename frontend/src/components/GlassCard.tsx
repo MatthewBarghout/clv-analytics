@@ -1,38 +1,54 @@
 import React from 'react';
 
+/**
+ * The app's two card surfaces.
+ *
+ * `GlassCard` is the outer container; `Panel` is the smaller inner card that was
+ * previously hand-rolled as `bg-panel-raised rounded-lg p-4 border border-line` in
+ * 20 places, each drifting slightly. Both read from the tokens in index.css so
+ * the chrome is defined once.
+ */
+
 interface GlassCardProps {
   children: React.ReactNode;
   className?: string;
-  gradient?: 'green' | 'red' | 'blue' | 'purple';
+  gradient?: 'pos' | 'neg' | 'info' | 'warn';
 }
 
-export function GlassCard({ children, className = '', gradient }: GlassCardProps) {
-  const gradients = {
-    green: 'from-green-500/10 to-emerald-500/5',
-    red: 'from-red-500/10 to-rose-500/5',
-    blue: 'from-blue-500/10 to-cyan-500/5',
-    purple: 'from-purple-500/10 to-pink-500/5'
-  };
+const GRADIENTS: Record<NonNullable<GlassCardProps['gradient']>, string> = {
+  pos: 'from-pos/10 to-pos/5',
+  neg: 'from-neg/10 to-neg/5',
+  info: 'from-info/10 to-info/5',
+  warn: 'from-warn/10 to-warn/5',
+};
 
+export function GlassCard({ children, className = '', gradient }: GlassCardProps) {
   return (
     <div
-      className={`
-        relative backdrop-blur-xl bg-white/5
-        rounded-2xl p-6 border border-white/10
-        shadow-2xl shadow-black/20
-        transition-all duration-300
-        hover:shadow-3xl hover:border-white/20
-        ${gradient ? `bg-gradient-to-br ${gradients[gradient]}` : ''}
-        ${className}
-      `}
+      className={`relative rounded-xl p-6 bg-panel border border-line shadow-lg shadow-black/30 transition-colors duration-200 hover:border-line-strong ${
+        gradient ? `bg-gradient-to-br ${GRADIENTS[gradient]}` : ''
+      } ${className}`}
     >
-      {/* Subtle inner glow */}
-      <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-white/5 to-transparent pointer-events-none" />
+      {children}
+    </div>
+  );
+}
 
-      {/* Content */}
-      <div className="relative z-10">
-        {children}
-      </div>
+interface PanelProps {
+  children: React.ReactNode;
+  className?: string;
+  /** Tighter padding for dense rows such as stat tiles. */
+  dense?: boolean;
+}
+
+export function Panel({ children, className = '', dense = false }: PanelProps) {
+  return (
+    <div
+      className={`rounded-lg bg-panel-raised border border-line ${
+        dense ? 'p-3' : 'p-4'
+      } ${className}`}
+    >
+      {children}
     </div>
   );
 }
